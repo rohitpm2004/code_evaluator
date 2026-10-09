@@ -5,6 +5,8 @@ import fs from 'fs';
 import { cloneRepo, deleteRepo } from '../react/repoService.js';
 import { scoreFromTestResults } from './scoringService.js';
 import { generateBackendAIFeedback } from './feedbackService.js';
+import { getCachedEvaluation, setCachedEvaluation } from '../../services/evaluationCache.js';
+import { runInDockerSandbox } from '../../services/dockerSandboxService.js';
 
 let client = null;
 
@@ -28,7 +30,9 @@ function getClient() {
  */
 async function readProjectFiles(dir, fileList = []) {
   const IGNORED_DIRS = new Set(["node_modules", "dist", "build", ".git", ".next", "public", "assets", "coverage"]);
-  const ALLOWED_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".json", ".sql"]);
+  const ALLOWED_EXTENSIONS = new Set([
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".json", ".sql", ".env.example"
+  ]);
 
   let entries;
   try {
@@ -67,32 +71,122 @@ function compressCode(code) {
 }
 
 /**
- * Reads all relevant source files from the student project and returns
- * a concatenated string for AI analysis.
+ * Assigns priority tier to backend source files.
+ * Tier 1 (highest): Main entrypoints (server.js, app.js, index.js, src/server.*, etc.)
+ * Tier 2: Routes & API endpoints (routes/**, api/**, router/**)
+ * Tier 3: Controllers (controllers/**)
+ * Tier 4: Database models & schemas (models/**, schemas/**, prisma/**, db/**)
+ * Tier 5: Middleware & Security (middleware/**, middlewares/**, auth/**)
+ * Tier 6: Services, Utils, Config (services/**, utils/**, config/**, package.json, .sql)
+ * Tier 7 (lowest): Everything else
  */
-async function getProjectCodeString(projectPath) {
-  let files = await readProjectFiles(projectPath);
+function getBackendFilePriority(filePath) {
+  const norm = filePath.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(norm);
 
-  // Cap at 15 files to avoid token overflow
-  files = files.slice(0, 15);
+  // Tier 1: Main entrypoints
+  if (/^(server|app|index|main)\.(jsx?|tsx?|mjs|cjs)$/i.test(base)) return 1;
+  if (norm.includes("/src/server.") || norm.includes("/src/app.") || norm.includes("/src/index.")) return 1;
 
-  if (files.length === 0) {
-    return "";
+  // Tier 2: Routes
+  if (norm.includes("/routes/") || norm.includes("/route/") || norm.includes("/api/") || norm.includes("/routers/")) return 2;
+
+  // Tier 3: Controllers
+  if (norm.includes("/controllers/") || norm.includes("/controller/") || norm.includes("/handlers/")) return 3;
+
+  // Tier 4: Models & Database
+  if (norm.includes("/models/") || norm.includes("/model/") || norm.includes("/schemas/") || norm.includes("/schema/") || norm.includes("/prisma/") || norm.includes("/db/")) return 4;
+
+  // Tier 5: Middleware & Security
+  if (norm.includes("/middleware/") || norm.includes("/middlewares/") || norm.includes("/auth/")) return 5;
+
+  // Tier 6: Services, Utils, Config
+  if (norm.includes("/services/") || norm.includes("/service/") || norm.includes("/utils/") || norm.includes("/config/") || base === "package.json" || base.endsWith(".sql")) return 6;
+
+  // Tier 7: Everything else
+  return 7;
+}
+
+/**
+ * Reads relevant backend source files with priority ranking and generates a Source Manifest
+ * to prevent blind truncation while remaining within LLM token budget.
+ *
+ * @param {string} projectPath - Path to the cloned student repo
+ * @returns {Promise<{ codeString: string, manifest: { totalFiles: number, includedFiles: string[], omittedFiles: string[] }, unsupported: boolean }>}
+ */
+async function getBackendProjectCodeData(projectPath) {
+  const srcDir = path.join(projectPath, "src");
+  let allFiles = [];
+  try {
+    allFiles = await readProjectFiles(srcDir);
+  } catch {
+    // No src directory
   }
 
-  let codeStr = "";
-  for (const f of files) {
-    const relativePath = path.relative(projectPath, f);
+  const rootFiles = await readProjectFiles(projectPath);
+  const fileSet = new Set(allFiles);
+  for (const rf of rootFiles) {
+    fileSet.add(rf);
+  }
+  allFiles = Array.from(fileSet);
+
+  if (allFiles.length === 0) {
+    return {
+      codeString: "",
+      manifest: { totalFiles: 0, includedFiles: [], omittedFiles: [] },
+      unsupported: true,
+    };
+  }
+
+  // Sort files by priority tier first, then path name
+  allFiles.sort((a, b) => {
+    const pA = getBackendFilePriority(a);
+    const pB = getBackendFilePriority(b);
+    if (pA !== pB) return pA - pB;
+    return a.localeCompare(b);
+  });
+
+  const MAX_TOTAL_CHARS = 45000; // ~11,000 tokens for code
+  const MAX_PER_FILE_CHARS = 6000;
+
+  const includedFiles = [];
+  const omittedFiles = [];
+  let codeBody = "";
+
+  for (const f of allFiles) {
+    const relativePath = path.relative(projectPath, f).replace(/\\/g, "/");
     try {
       const content = await fs.promises.readFile(f, "utf8");
       const compressed = compressCode(content);
-      codeStr += `\n--- ${relativePath} ---\n${compressed.slice(0, 6000)}\n`;
+
+      if (codeBody.length + Math.min(compressed.length, MAX_PER_FILE_CHARS) <= MAX_TOTAL_CHARS) {
+        includedFiles.push(relativePath);
+        const fileContent = compressed.slice(0, MAX_PER_FILE_CHARS);
+        codeBody += `\n--- ${relativePath} ---\n${fileContent}\n`;
+      } else {
+        omittedFiles.push(relativePath);
+      }
     } catch {
-      // Skip unreadable files
+      omittedFiles.push(relativePath);
     }
   }
 
-  return codeStr;
+  let manifestHeader = `[SOURCE MANIFEST: Discovered ${allFiles.length} files. Included: ${includedFiles.length}. Omitted: ${omittedFiles.length}]\n`;
+  manifestHeader += `Included files: ${includedFiles.join(", ")}\n`;
+  if (omittedFiles.length > 0) {
+    manifestHeader += `Omitted files (token budget cap): ${omittedFiles.join(", ")}\n`;
+  }
+  manifestHeader += `========================================\n`;
+
+  return {
+    codeString: manifestHeader + codeBody,
+    manifest: {
+      totalFiles: allFiles.length,
+      includedFiles,
+      omittedFiles,
+    },
+    unsupported: false,
+  };
 }
 
 /**
@@ -115,7 +209,8 @@ export async function evaluateBackendProject(payload, jobId, testResults, logs, 
   if (testGrading) {
     logger.info(`Deterministic testResults found. Grading Backend project mathematically for Job ${jobId}`);
 
-    const status = testGrading.score >= maxScore * 0.5 ? "pass" : "fail";
+    const isPassed = testGrading.score >= maxScore * 0.5;
+    const status = isPassed ? "passed" : "failed";
     
     // Generate concise, clean feedback summary matching react/visual style
     const feedbackText = await generateBackendAIFeedback({
@@ -158,33 +253,46 @@ export async function evaluateBackendProject(payload, jobId, testResults, logs, 
       breakdown: unifiedBreakdown
     };
 
-    return {
+    const finalResult = {
       score: testGrading.score,
       rubric_breakdown: testGrading.rubric_breakdown,
       feedback: rubricFeedback,
       rubricFeedback: rubricFeedback,
       warnings: testResults?.warnings || [],
       execution_logs: logs || "",
-      status
+      status,
+      pass: isPassed,
+      is_passed: isPassed,
     };
+
+    return finalResult;
   }
 
   // 2. Fallback: AI-based code analysis (identical resilient flow to React & Visual)
   logger.info(`Test results absent or empty for Job ${jobId}. Falling back to AI code grading.`);
   
   let repoPath;
+  const warnings = [];
   try {
     let codeString = codeContext;
+    let manifest = null;
     if (!codeString) {
       repoPath = await cloneRepo(payload.repoUrl || payload.submission_link);
-      codeString = await getProjectCodeString(repoPath);
+      const codeData = await getBackendProjectCodeData(repoPath);
+      codeString = codeData.codeString;
+      manifest = codeData.manifest;
+      if (manifest?.omittedFiles?.length > 0) {
+        warnings.push(
+          `Evaluated top ${manifest.includedFiles.length} priority backend files. Omitted ${manifest.omittedFiles.length} secondary files (${manifest.omittedFiles.join(", ")}) due to token limits.`
+        );
+      }
     }
 
     if (!codeString) {
       logger.warn(`No source files found in student repo for Job ${jobId}`);
       const breakdown = {};
       const unifiedBreakdown = [];
-      const issues = ["No source files found in the repository."];
+      const issues = ["No source files or backend entrypoint found in the repository."];
       for (const c of rubric.criteria) {
         breakdown[c.name] = 0;
         unifiedBreakdown.push({
@@ -195,7 +303,7 @@ export async function evaluateBackendProject(payload, jobId, testResults, logs, 
         });
       }
       const rubricFeedback = {
-        summary: "No source files found in the repository.",
+        summary: "No source files or backend entrypoint found in the repository.",
         strengths: [],
         issues,
         breakdown: unifiedBreakdown
@@ -205,10 +313,22 @@ export async function evaluateBackendProject(payload, jobId, testResults, logs, 
         rubric_breakdown: breakdown,
         feedback: rubricFeedback,
         rubricFeedback: rubricFeedback,
-        warnings: ["No source files found in the repository."],
+        warnings: ["No backend source files or entrypoint found in the repository."],
         execution_logs: logs || "",
-        status: "fail"
+        status: "unsupported_project",
+        pass: false,
+        is_passed: false,
       };
+    }
+
+    // Check evaluation cache: If this exact codebase + rubric was already graded, return identical result
+    const skipCache = Boolean(payload.skipCache || payload.reEvaluate || payload.isReEvaluation);
+    if (!skipCache) {
+      const cached = await getCachedEvaluation("backend", rubric, codeString, logs, testResults);
+      if (cached) {
+        logger.info(`⚡ Returning cached Backend evaluation result for Job ${jobId}: score=${cached.score}/100`);
+        return cached;
+      }
     }
 
     const openai = getClient();
@@ -399,10 +519,10 @@ ${codeString}
 ## Rubric Criteria:
 ${missingList}
 
-Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
+Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
 {
   "scores": [
-    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
+    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
   ]
 }`;
         const retryResponse = await openai.chat.completions.create({
@@ -504,15 +624,47 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or
       breakdown: unifiedBreakdown
     };
 
-    return {
+    const isTestFailed = (logs || "").toLowerCase().includes("test_failed") ||
+      (logs || "").toLowerCase().includes("failed to compile") ||
+      (logs || "").toLowerCase().includes("error: cannot find module");
+    const isPassed = totalScore >= maxScore * 0.5;
+
+    let status;
+    if (isTestFailed && !isPassed) {
+      status = "test_failed";
+    } else if (isPassed) {
+      status = "passed";
+    } else {
+      status = "failed";
+    }
+
+    const finalResult = {
       score: totalScore,
       rubric_breakdown: breakdown,
       feedback: rubricFeedback,
       rubricFeedback: rubricFeedback,
-      warnings: [],
+      warnings,
       execution_logs: logs || "",
-      status: totalScore >= maxScore * 0.5 ? "pass" : "fail"
+      status,
+      pass: isPassed,
+      is_passed: isPassed,
     };
+
+    // Cache result for identical submissions
+    await setCachedEvaluation("backend", rubric, codeString, logs, testResults, finalResult);
+
+    try {
+      const logsDir = path.join(process.cwd(), "logs");
+      if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+      fs.writeFileSync(path.join(logsDir, "latest_backend_eval.json"), JSON.stringify({
+        jobId,
+        payload,
+        manifest,
+        finalResult
+      }, null, 2));
+    } catch {}
+
+    return finalResult;
 
   } catch (err) {
     logger.error(`AI scoring failed for Backend Project (Job: ${jobId}):`, err.message);
@@ -540,8 +692,57 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or
       rubricFeedback: rubricFeedback,
       warnings: [err.message],
       execution_logs: logs || "",
-      status: "fail"
+      status: "failed",
+      pass: false,
+      is_passed: false,
     };
+  } finally {
+    if (repoPath) {
+      await deleteRepo(repoPath);
+    }
+  }
+}
+
+/**
+ * Evaluates a Backend project locally using Docker Sandbox.
+ * Runs dependency installation and automated tests or syntax verification inside an isolated container.
+ */
+export async function evaluateBackendProjectWithDocker(payload, jobId) {
+  let repoPath;
+  try {
+    const repoUrl = payload.repoUrl || payload.submission_link;
+    logger.info(`🐳 Backend Docker evaluation started for job ${jobId}: ${repoUrl}`);
+
+    // Step 1: Clone the student's repo locally (or use local path)
+    repoPath = await cloneRepo(repoUrl);
+    logger.info(`Cloned backend repo to: ${repoPath}`);
+
+    // Step 2: Determine appropriate test or build command
+    const packageJsonPath = path.join(repoPath, "package.json");
+    let containerCmd = null;
+    if (fs.existsSync(packageJsonPath)) {
+      try {
+        const pkg = JSON.parse(fs.readFileSync(packageJsonPath, "utf-8"));
+        const testScript = pkg.scripts?.test || "";
+        if (testScript && !testScript.includes("no test specified")) {
+          containerCmd = "npm install --prefer-offline --no-audit --progress=false && npm test";
+        }
+      } catch {}
+    }
+
+    // Step 3: Run execution safely inside Docker container
+    const dockerResult = await runInDockerSandbox(repoPath, { command: containerCmd });
+
+    // Step 4: Evaluate backend project against rubric using real execution report
+    const dockerPayload = {
+      ...payload,
+      repoUrl: repoPath
+    };
+    const finalResult = await evaluateBackendProject(dockerPayload, jobId, null, dockerResult.testOutput);
+
+    logger.info(`✅ Backend Docker evaluation completed for job ${jobId}: score=${finalResult.score} (${dockerResult.durationMs}ms container run)`);
+
+    return finalResult;
   } finally {
     if (repoPath) {
       await deleteRepo(repoPath);

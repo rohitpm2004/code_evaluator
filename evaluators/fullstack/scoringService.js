@@ -142,6 +142,14 @@ export function scoreFromTestResults(rubric, testResults) {
     }
   }
 
+  const totalCriteria = criteria.length;
+  const matchedCriteriaCount = Object.values(categoryStats).filter(s => s.total > 0).length;
+
+  if (matchedCriteriaCount === 0 || matchedCriteriaCount < totalCriteria) {
+    logger.info(`Playwright test suite only matched ${matchedCriteriaCount}/${totalCriteria} criteria. Falling back to AI code grading.`);
+    return null;
+  }
+
   // Calculate scores
   for (const c of criteria) {
     const stats = categoryStats[c.name];

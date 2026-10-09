@@ -5,6 +5,9 @@ import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
 import { generateJSAIFeedback } from '../evaluators/js/aiFeedback.js';
+import { cloneRepo, deleteRepo } from '../evaluators/react/repoService.js';
+import { isDockerAvailable, runJsInDocker } from '../services/dockerSandboxService.js';
+import { webhookPubSub } from '../services/webhookPubSub.js';
 
 let jsWorker = null;
 
@@ -18,7 +21,7 @@ export async function initializeJsWorker() {
       'javascript-evaluation',
       async (job) => {
         try {
-          logger.info(`Starting JS evaluation via GitHub Actions: ${job.id}`);
+          logger.info(`Starting JS evaluation: ${job.id}`);
           const {
             submission,
             testCases,
@@ -28,67 +31,52 @@ export async function initializeJsWorker() {
             functions
           } = job.data;
 
-          const results = await withTimeout(
-            new Promise((resolve, reject) => {
-              const subscriber = redisConnection.getClient().duplicate();
-              let timeoutId;
-              
-              subscriber.subscribe(`github_webhook_${job.id}`, async (err) => {
-                if (err) {
-                  await subscriber.quit();
-                  return reject(err);
-                }
-                
-                timeoutId = setTimeout(async () => {
-                  await subscriber.quit();
-                  reject(new Error("GitHub Actions webhook timeout"));
-                }, config.timeout);
-                
-                try {
-                  const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
-                  const repoUrl = submission.repoUrl;
-                  const extraPayload = {
-                    testCases,
-                    entryFunction,
-                    evaluationMode,
-                    expectedLogs,
-                    functions
-                  };
-                  
-                  await triggerGraderWorkflow(repoUrl, job.id, webhookUrl, 'run-js-evaluation', extraPayload);
-                } catch (e) {
-                  clearTimeout(timeoutId);
-                  await subscriber.quit();
-                  return reject(e);
-                }
-              });
+          // Phase 0: Check if Docker Sandbox is enabled and available
+          const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
+          const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
 
-              subscriber.on('message', async (channel, message) => {
-                if (channel === `github_webhook_${job.id}`) {
-                  clearTimeout(timeoutId);
-                  await subscriber.quit();
-                  try {
-                    const payload = JSON.parse(message);
-                    if (payload.status === 'completed') {
-                      resolve(payload.evaluation || {
-                        passed: false,
-                        score: 0,
-                        error: "Invalid evaluation payload received from GitHub Actions"
-                      });
-                    } else {
-                      reject(new Error("GitHub Actions job failed or cancelled"));
-                    }
-                  } catch (parseErr) {
-                    reject(parseErr);
-                  }
+          let results;
+          if (canUseDocker) {
+            logger.info(`🐳 JS Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+            const repoPath = await cloneRepo(submission.repoUrl);
+            try {
+              results = await runJsInDocker(repoPath, { testCases, entryFunction, evaluationMode, expectedLogs, functions });
+            } finally {
+              await deleteRepo(repoPath);
+            }
+          } else {
+            logger.info(`☁️ JS Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
+            results = await withTimeout(
+              (async () => {
+                const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
+                const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
+                const repoUrl = submission.repoUrl;
+                const extraPayload = {
+                  testCases,
+                  entryFunction,
+                  evaluationMode,
+                  expectedLogs,
+                  functions
+                };
+                
+                await triggerGraderWorkflow(repoUrl, job.id, webhookUrl, 'run-js-evaluation', extraPayload);
+                const githubResult = await webhookPromise;
+                if (githubResult.status === 'completed') {
+                  return githubResult.evaluation || {
+                    passed: false,
+                    score: 0,
+                    error: "Invalid evaluation payload received from GitHub Actions"
+                  };
+                } else {
+                  throw new Error("GitHub Actions job failed or cancelled");
                 }
-              });
-            }),
-            config.timeout,
-            `js-eval ${job.id}`
-          );
+              })(),
+              config.timeout,
+              `js-eval ${job.id}`
+            );
+        }
           
-          let finalScore = 0;
+        let finalScore = 0;
           let passedCount = 0;
           let totalCount = 0;
 

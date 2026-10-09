@@ -184,7 +184,12 @@ class QueueManager {
       // GitHub Action never fires → score stays "hardcoded" from the last run).
       // Adding Date.now() ensures every call produces a fresh job.
       let jobId = payload.jobId;
-      if (!jobId) {
+      if (jobId) {
+        if (payload.reEvaluate || payload.isReEvaluation || payload.skipCache) {
+          const rand = crypto.randomBytes(4).toString('hex');
+          jobId = `${jobId}-${Date.now()}-${rand}`;
+        }
+      } else {
         const submissionData =
           payload.submission ||
           payload.submissions ||
@@ -206,8 +211,9 @@ class QueueManager {
           .update(idPayload)
           .digest('hex')
           .slice(0, 16);
-        // Prefix with timestamp to guarantee uniqueness across re-evaluations
-        jobId = `${type}-${Date.now()}-${hash}`;
+        // Prefix with timestamp and random entropy to guarantee uniqueness across batch/re-evaluations
+        const rand = crypto.randomBytes(4).toString('hex');
+        jobId = `${type}-${Date.now()}-${rand}-${hash}`;
       }
 
       // Add job to queue with deterministic jobId for deduplication

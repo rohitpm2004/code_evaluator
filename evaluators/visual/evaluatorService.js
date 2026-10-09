@@ -202,9 +202,13 @@ export async function evaluateStudentsWithVision({
       if (raw && raw.score !== undefined && !raw.error) {
         logger.info(`Evaluation cache hit for ${name} (assignment: ${assignmentId}, hash: ${sourceHash.slice(0, 8)})`);
         const cachedResult = JSON.parse(JSON.stringify(raw));
+        const originalName = cachedResult.name;
         cachedResult.name = name;
         cachedResult.studentId = studentId;
         if (cachedResult.feedback?.summary) {
+          if (originalName && originalName !== name) {
+            cachedResult.feedback.summary = cachedResult.feedback.summary.replaceAll(originalName, name);
+          }
           cachedResult.feedback.summary = cachedResult.feedback.summary.replace(/\b(Candidate|Student)\b/g, name);
         }
         return [cachedResult];
@@ -223,19 +227,21 @@ export async function evaluateStudentsWithVision({
   }
   EVALUATION_CACHE.set(evalCacheKey, inFlightPromise);
 
-  const { score: codeScore, breakdown: codeBreakdown } = await computeCodeScore(rubric, sourceText);
-
-  // Per-job artifact dir (V-16/V-25) — unique, outside the source tree, always cleaned up.
-  const workDir = await fs.mkdtemp(
-    path.join(os.tmpdir(), `visual-${jobId || studentId || "job"}-`)
-  );
-
-  const browserPool = await getBrowserPool();
+  let workDir = null;
+  let browserPool = null;
   let browser = null;
   let context = null;
   let server = null;
 
   try {
+    const { score: codeScore, breakdown: codeBreakdown } = await computeCodeScore(rubric, sourceText);
+
+    // Per-job artifact dir (V-16/V-25) — unique, outside the source tree, always cleaned up.
+    workDir = await fs.mkdtemp(
+      path.join(os.tmpdir(), `visual-${jobId || studentId || "job"}-`)
+    );
+
+    browserPool = await getBrowserPool();
     const started = await startStaticServer(student.basePath);
     server = started.server;
     const localUrl = started.url;
@@ -401,8 +407,8 @@ export async function evaluateStudentsWithVision({
           visualScore = clampScore(rawVisual, maxVisual);
           visualBreakdown = Array.isArray(parsed.breakdown) ? parsed.breakdown : [];
         } catch (err) {
-          logger.warn(`Visual scoring AI call failed (${err.message}) — using fallback score`);
-          visualScore = Math.round(maxVisual * 0.8);
+          logger.warn(`Visual scoring AI call failed (${err.message}) — setting visualScore to 0`);
+          visualScore = 0;
         }
       }
 
@@ -561,16 +567,17 @@ export async function evaluateStudentsWithVision({
   } finally {
     // Unconditional resource release (V-05/V-06/V-25)
     if (context) await context.close().catch(() => {});
-    if (browser) browserPool.return(browser);
+    if (browser && browserPool) browserPool.return(browser);
     if (server) server.close();
-    await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
-  }
+    if (workDir) await fs.rm(workDir, { recursive: true, force: true }).catch(() => {});
 
-  if (results.length > 0 && results[0].score !== undefined && !results[0].error && !results[0].blankPage) {
-    if (typeof resolveJob === 'function') resolveJob(results[0]);
-  } else {
-    EVALUATION_CACHE.delete(evalCacheKey);
-    if (typeof resolveJob === 'function') resolveJob(null);
+    // Settle in-flight cache promise unconditionally so concurrent/future jobs never hang
+    if (results.length > 0 && results[0].score !== undefined && !results[0].error && !results[0].blankPage) {
+      if (typeof resolveJob === 'function') resolveJob(results[0]);
+    } else {
+      EVALUATION_CACHE.delete(evalCacheKey);
+      if (typeof resolveJob === 'function') resolveJob(null);
+    }
   }
 
   return results;

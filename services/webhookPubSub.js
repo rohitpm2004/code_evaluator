@@ -43,43 +43,53 @@ class WebhookPubSub extends EventEmitter {
   async waitForWebhook(jobId, timeoutMs) {
     this.init(); // ensure subscriber is running
 
-    // Fast path: if the webhook already arrived before we subscribed
-    // (e.g. server restarted while GitHub Action was in flight), the
-    // webhookController stored it in Redis with a 5-min TTL.
-    // Check for it immediately so we don't have to wait for the full timeout.
     const redisClient = redisConnection.getClient();
     const cachedKey = `github_webhook_result_${jobId}`;
-    try {
-      const cached = await redisClient.get(cachedKey);
-      if (cached) {
-        logger.info(`WebhookPubSub: found pre-stored webhook result for ${jobId} (cache hit — skipping pub/sub wait)`);
-        await redisClient.del(cachedKey); // clean up so re-evaluations don't get stale data
-        return JSON.parse(cached);
-      }
-    } catch (err) {
-      logger.warn(`WebhookPubSub: Redis key check failed for ${jobId}: ${err.message} — falling back to pub/sub`);
-    }
+    const channel = `github_webhook_${jobId}`;
 
-    return new Promise((resolve, reject) => {
-      const channel = `github_webhook_${jobId}`;
+    return new Promise(async (resolve, reject) => {
+      let settled = false;
       let timeoutId;
-      
-      logger.info(`WebhookPubSub waitForWebhook setting up listener for ${channel}`);
-      
-      const handler = (payload) => {
-        logger.info(`WebhookPubSub waitForWebhook handler triggered for ${channel}`);
+
+      const cleanup = () => {
         clearTimeout(timeoutId);
         this.off(channel, handler);
+      };
+
+      const handler = (payload) => {
+        if (settled) return;
+        settled = true;
+        logger.info(`WebhookPubSub waitForWebhook handler triggered for ${channel}`);
+        cleanup();
+        redisClient.del(cachedKey).catch(() => {});
         resolve(payload);
       };
 
+      // 1. Attach pub/sub listener FIRST so we close any gap and never miss concurrent deliveries
+      logger.info(`WebhookPubSub waitForWebhook setting up listener for ${channel}`);
       this.on(channel, handler);
 
       timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
         logger.error(`WebhookPubSub waitForWebhook TIMEOUT for ${channel}`);
-        this.off(channel, handler);
         reject(new Error("GitHub Actions webhook timeout"));
       }, timeoutMs);
+
+      // 2. Fast path: check Redis for pre-stored webhook result (e.g. arrived before subscription)
+      try {
+        const cached = await redisClient.get(cachedKey);
+        if (cached && !settled) {
+          settled = true;
+          logger.info(`WebhookPubSub: found pre-stored webhook result for ${jobId} (cache hit — skipping pub/sub wait)`);
+          cleanup();
+          await redisClient.del(cachedKey).catch(() => {});
+          resolve(JSON.parse(cached));
+        }
+      } catch (err) {
+        logger.warn(`WebhookPubSub: Redis key check failed for ${jobId}: ${err.message} — continuing with pub/sub listener`);
+      }
     });
   }
 }

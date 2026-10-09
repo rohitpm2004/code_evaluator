@@ -5,6 +5,7 @@ import fs from 'fs';
 import { cloneRepo, deleteRepo } from '../react/repoService.js';
 import { scoreFromTestResults } from './scoringService.js';
 import { generateFullstackFeedback } from './feedbackService.js';
+import { runInDockerSandbox } from '../../services/dockerSandboxService.js';
 
 let client = null;
 
@@ -279,7 +280,7 @@ You MUST evaluate and return a score entry for ALL ${rubric.criteria.length} cri
 Output STRICTLY a JSON object (no markdown, no extra text):
 {
   "scores": [
-    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, or 1.0>, "reasoning": "<1-2 sentence concise explanation>" }
+    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<1-2 sentence concise explanation>" }
   ]
 }`;
 
@@ -418,10 +419,10 @@ ${codeString}
 ## Rubric Criteria:
 ${missingList}
 
-Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
+Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
 {
   "scores": [
-    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
+    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
   ]
 }`;
         const retryResponse = await openai.chat.completions.create({
@@ -567,6 +568,40 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or
       execution_logs: logs || "",
       status: "fail"
     };
+  } finally {
+    if (repoPath) {
+      await deleteRepo(repoPath);
+    }
+  }
+}
+
+/**
+ * Runs fullstack project build and test verification inside an isolated container,
+ * then scores the project using real container execution feedback.
+ */
+export async function evaluateFullstackProjectWithDocker(payload, jobId) {
+  let repoPath;
+  try {
+    const repoUrl = payload.repoUrl || payload.submission_link;
+    logger.info(`🐳 Fullstack Docker evaluation started for job ${jobId}: ${repoUrl}`);
+
+    // Step 1: Clone the student's repo locally (or use local path)
+    repoPath = await cloneRepo(repoUrl);
+    logger.info(`Cloned fullstack repo to: ${repoPath}`);
+
+    // Step 2: Run build / test safely inside local Docker container
+    const dockerResult = await runInDockerSandbox(repoPath);
+
+    // Step 3: Evaluate project against rubric using real execution report
+    const dockerPayload = {
+      ...payload,
+      repoUrl: repoPath
+    };
+    const finalResult = await evaluateFullstackProject(dockerPayload, jobId, null, dockerResult.testOutput);
+
+    logger.info(`✅ Fullstack Docker evaluation completed for job ${jobId}: score=${finalResult.score} (${dockerResult.durationMs}ms container run)`);
+
+    return finalResult;
   } finally {
     if (repoPath) {
       await deleteRepo(repoPath);

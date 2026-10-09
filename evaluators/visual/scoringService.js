@@ -1,4 +1,5 @@
 import { generateVisualAIFeedback } from "./feedbackService.js";
+import { getCachedEvaluation, setCachedEvaluation } from "../../services/evaluationCache.js";
 import logger from "../../config/logger.js";
 import fs from "fs/promises";
 import path from "path";
@@ -132,9 +133,10 @@ export function parseRubric(rubricData) {
 /**
  * Scores a Visual (HTML/CSS/JS) submission using AI-based code analysis.
  */
-export default async function scoreSubmission(rawRubric, projectPath, githubReport) {
+export default async function scoreSubmission(rawRubric, projectPath, githubReport, options = {}) {
   const warnings = [];
   const rubric = parseRubric(rawRubric);
+  const skipCache = Boolean(options?.skipCache || options?.reEvaluate || options?.isReEvaluation);
 
   const codeString = await getProjectCodeString(projectPath);
 
@@ -177,6 +179,15 @@ export default async function scoreSubmission(rawRubric, projectPath, githubRepo
       execution_logs: githubReport || "",
       status: "fail",
     };
+  }
+
+  // Check evaluation cache: If this exact codebase + rubric was already graded, return identical result
+  if (!skipCache) {
+    const cached = await getCachedEvaluation("visual", rubric, codeString, githubReport);
+    if (cached) {
+      logger.info(`⚡ Returning cached Visual evaluation result: score=${cached.score}/100`);
+      return cached;
+    }
   }
 
   const criteriaList = rubric.criteria
@@ -363,10 +374,10 @@ ${codeString}
 ## Rubric Criteria:
 ${missingList}
 
-Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
+Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.2, or 0.0). Return STRICTLY a JSON object:
 {
   "scores": [
-    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
+    { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
   ]
 }`;
           const retryResponse = await groq.chat.completions.create({
@@ -499,7 +510,7 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or
     breakdown: unifiedBreakdown
   };
 
-  return {
+  const finalResult = {
     score: totalScore,
     rubric_breakdown: breakdown,
     feedback: rubricFeedback,
@@ -508,4 +519,9 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.8, 0.5, 0.2, or
     execution_logs: githubReport || "",
     status,
   };
+
+  // Cache result for identical submissions
+  await setCachedEvaluation("visual", rubric, codeString, githubReport, null, finalResult);
+
+  return finalResult;
 }

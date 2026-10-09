@@ -44,10 +44,23 @@ async function runStateChangeCheck(page, check) {
     const afterBtn = ((await btn.textContent()) || "").trim();
     if (beforeBtn && afterBtn && beforeBtn !== afterBtn) return true;
 
-    if (beforeClock !== null) {
+    const isClockCheck = 
+      (targetSelector || "").toLowerCase().includes("clock") || 
+      (targetSelector || "").toLowerCase().includes("time") || 
+      (check.selector || "").toLowerCase().includes("clock") || 
+      (check.selector || "").toLowerCase().includes("format");
+
+    if (isClockCheck && beforeClock !== null) {
       const clockAgain = (await resolveElement(page, CLOCK_SELECTOR)) || clockEl;
       const afterClock = clockAgain ? ((await clockAgain.textContent()) || "").trim() : null;
-      if (afterClock !== null && beforeClock !== afterClock) return true;
+      if (afterClock !== null) {
+        // Only pass if the clock format itself changed (e.g. 12h/24h toggle, AM/PM presence),
+        // NOT merely because seconds ticked forward
+        const hasAmPmBefore = /am|pm/i.test(beforeClock);
+        const hasAmPmAfter = /am|pm/i.test(afterClock);
+        if (hasAmPmBefore !== hasAmPmAfter) return true;
+        if (check.expected && afterClock.toLowerCase().includes(check.expected.toLowerCase())) return true;
+      }
     }
   }
 

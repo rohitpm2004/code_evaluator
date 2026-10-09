@@ -4,8 +4,12 @@ import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
-import { evaluateBackendProject } from '../evaluators/backend/evaluatorService.js';
+import { evaluateBackendProject, evaluateBackendProjectWithDocker } from '../evaluators/backend/evaluatorService.js';
+import { isDockerAvailable } from '../services/dockerSandboxService.js';
 import { webhookPubSub } from '../services/webhookPubSub.js';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 let backendWorker = null;
 
@@ -23,11 +27,44 @@ export async function initializeBackendWorker() {
           
           const results = await withTimeout(
             (async () => {
-              if (job.data.ideFiles) {
-                logger.info(`Backend Job ${job.id} is an IDE submission. Skipping GitHub Actions.`);
-                const githubCodeContext = job.data.ideFiles.map(f => `--- ${f.name} ---\n${f.content}`).join('\n\n');
-                return await evaluateBackendProject(job.data, job.id, null, null, githubCodeContext);
+              const ideFiles = job.data.ideFiles || job.data.submission?.ideFiles;
+              if (ideFiles && Array.isArray(ideFiles) && ideFiles.length > 0) {
+                logger.info(`Backend Job ${job.id} is an IDE submission. Materializing ${ideFiles.length} files into temp sandbox.`);
+                const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'backend-ide-'));
+                try {
+                  for (const file of ideFiles) {
+                    const relativeFilePath = file.path || file.name;
+                    if (relativeFilePath && typeof file.content === 'string') {
+                      const safeRelativePath = path.normalize(relativeFilePath).replace(/^(\.\.[\/\\])+/, '');
+                      const fullFilePath = path.resolve(tempDir, safeRelativePath);
+                      if (!fullFilePath.startsWith(path.resolve(tempDir))) {
+                        logger.warn(`Security: Skipping suspicious file path outside sandbox: ${relativeFilePath}`);
+                        continue;
+                      }
+                      await fs.mkdir(path.dirname(fullFilePath), { recursive: true });
+                      await fs.writeFile(fullFilePath, file.content, 'utf8');
+                    }
+                  }
+                  const idePayload = {
+                    ...job.data,
+                    repoUrl: tempDir
+                  };
+                  return await evaluateBackendProject(idePayload, job.id, null, "IDE Submission - Files verified locally.");
+                } finally {
+                  await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+                }
               }
+
+              // Phase 0: Check if Docker Sandbox is enabled and available
+              const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
+              const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
+
+              if (canUseDocker) {
+                logger.info(`🐳 Backend Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+                return await evaluateBackendProjectWithDocker(job.data, job.id);
+              }
+
+              logger.info(`☁️ Backend Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
 
               // Phase 1: Wait for webhook & Dispatch to GitHub Actions
               // We set up the listener FIRST to avoid race conditions if GitHub returns instantly
@@ -65,6 +102,9 @@ export async function initializeBackendWorker() {
           return { success: true, results, result: results };
         } catch (err) {
           logger.error(`Backend Job ${job.id} failed`, err);
+          if (!err.failedReason) {
+            err.failedReason = `[infrastructure_failed] ${err.message}`;
+          }
           throw err;
         }
       },

@@ -5,6 +5,7 @@ import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
 import { evaluateVisualProject } from '../evaluators/visual/evaluatorService.js';
+import { isDockerAvailable } from '../services/dockerSandboxService.js';
 import { webhookPubSub } from '../services/webhookPubSub.js';
 import fs from 'fs/promises';
 import os from 'os';
@@ -57,6 +58,29 @@ export async function initializeVisualWorker() {
                    await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
                 }
               }
+
+              // Phase 0: Check if Docker Sandbox is enabled and available
+              const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
+              const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
+
+              if (canUseDocker) {
+                logger.info(`🐳 Visual Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+                const submission = job.data.submission || job.data;
+                const repoUrl = submission.repoUrl || submission.submission_link;
+                const payload = {
+                  repoUrl,
+                  rubric: job.data.rubric || job.data.rubricText,
+                  assignmentId: job.data.assignmentId,
+                  expectedUrl: job.data.expectedUrl,
+                  studentId: submission?.studentId || job.data.studentId,
+                  studentName: submission?.studentName || job.data.studentName || submission?.name,
+                  entryFile: job.data.entryFile || submission?.entryFile,
+                  skipCache: job.data.skipCache || job.data.reEvaluate || job.data.isReEvaluation || false
+                };
+                return await evaluateVisualProject(payload, job.id, "Local Execution - Visual and DOM evaluation.");
+              }
+
+              logger.info(`☁️ Visual Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
 
               // Phase 1: Wait for webhook & Dispatch to GitHub Actions
               const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);

@@ -6,6 +6,8 @@ import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
 import { webhookPubSub } from '../services/webhookPubSub.js';
 import { generatePythonAIFeedback } from '../evaluators/python/aiFeedback.js';
+import { cloneRepo, deleteRepo } from '../evaluators/react/repoService.js';
+import { isDockerAvailable, runPythonInDocker } from '../services/dockerSandboxService.js';
 
 let pythonWorker = null;
 
@@ -19,29 +21,45 @@ export async function initializePythonWorker() {
       'python-evaluation',
       async (job) => {
           try {
-            logger.info(`Starting Python evaluation via GitHub Actions: ${job.id}`);
+            logger.info(`Starting Python evaluation: ${job.id}`);
             const { submission, testCases, evaluationMode, entryFunction, expectedLogs } = job.data;
             const repoUrl = submission.repoUrl;
-            
-            const results = await withTimeout(
-              (async () => {
-                const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
-                
-                const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
-                const extraPayload = { testCases, evaluationMode, entryFunction, expectedLogs };
-                await triggerGraderWorkflow(repoUrl, job.id, webhookUrl, 'run-python-evaluation', extraPayload);
-                
-                const githubResult = await webhookPromise;
-                
-                if (githubResult.status === 'completed') {
-                  return githubResult.results || githubResult.evaluation || [];
-                } else {
-                  throw new Error("GitHub Actions job failed or cancelled");
-                }
-              })(),
-              config.timeout,
-              `python-eval ${job.id}`
-            );
+
+            // Phase 0: Check if Docker Sandbox is enabled and available
+            const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
+            const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
+
+            let results;
+            if (canUseDocker) {
+              logger.info(`🐳 Python Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+              const repoPath = await cloneRepo(repoUrl);
+              try {
+                results = await runPythonInDocker(repoPath, { testCases, entryFunction, evaluationMode });
+              } finally {
+                await deleteRepo(repoPath);
+              }
+            } else {
+              logger.info(`☁️ Python Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
+              results = await withTimeout(
+                (async () => {
+                  const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
+                  
+                  const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
+                  const extraPayload = { testCases, evaluationMode, entryFunction, expectedLogs };
+                  await triggerGraderWorkflow(repoUrl, job.id, webhookUrl, 'run-python-evaluation', extraPayload);
+                  
+                  const githubResult = await webhookPromise;
+                  
+                  if (githubResult.status === 'completed') {
+                    return githubResult.results || githubResult.evaluation || [];
+                  } else {
+                    throw new Error("GitHub Actions job failed or cancelled");
+                  }
+                })(),
+                config.timeout,
+                `python-eval ${job.id}`
+              );
+            }
             
             let finalScore = 0;
             let passedCount = 0;

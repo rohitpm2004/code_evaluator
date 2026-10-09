@@ -35,9 +35,10 @@ function pickEntryHtml(htmlFiles, rootDir, entryFile) {
 
 export async function scanStudentFolders(rootDir, entryFile = null) {
 
-  const htmlFiles = await globby(['**/*.html'], { cwd: rootDir, absolute: true });
-  const cssFiles = await globby(['**/*.css'], { cwd: rootDir, absolute: true });
-  const jsFiles = await globby(['**/*.js'], { cwd: rootDir, absolute: true });
+  const ignorePatterns = ['!**/node_modules/**', '!**/.git/**', '!**/dist/**', '!**/build/**'];
+  const htmlFiles = await globby(['**/*.html', ...ignorePatterns], { cwd: rootDir, absolute: true });
+  const cssFiles = await globby(['**/*.css', ...ignorePatterns], { cwd: rootDir, absolute: true });
+  const jsFiles = await globby(['**/*.js', ...ignorePatterns], { cwd: rootDir, absolute: true });
 
   const flags = [];
   if (htmlFiles.length === 0) flags.push('Missing HTML');

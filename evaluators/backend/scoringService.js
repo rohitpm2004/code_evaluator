@@ -92,13 +92,70 @@ export const evaluateResults = (rubric, testResults) => {
 };
 
 /**
+ * Matches an assertion title to a rubric criterion using a resilient multi-tier strategy.
+ */
+function matchAssertionToCriterion(title, criteria) {
+  const normTitle = (title || "").toLowerCase();
+
+  // Tier 1: Explicit tag, e.g. "[User Registration]" or "@criterion:User Registration"
+  for (const c of criteria) {
+    const normName = (c.name || "").toLowerCase();
+    if (normTitle.includes(`[${normName}]`) || normTitle.includes(`@criterion:${normName}`)) {
+      return c.name;
+    }
+  }
+
+  // Sort criteria by name length descending so more specific names match first
+  const sortedByLength = [...criteria].sort((a, b) => (b.name || "").length - (a.name || "").length);
+
+  // Tier 2: Exact word or prefix match of criterion name
+  for (const c of sortedByLength) {
+    const normName = (c.name || "").trim().toLowerCase();
+    if (!normName) continue;
+    if (normTitle.startsWith(normName)) {
+      return c.name;
+    }
+    // Only match as whole words, avoiding substring false positives (e.g. "auth" inside "author")
+    const escaped = normName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const regex = new RegExp(`(^|[^a-z0-9])${escaped}([^a-z0-9]|$)`, 'i');
+    if (regex.test(normTitle)) {
+      return c.name;
+    }
+  }
+
+  // Tier 3: Keyword matching from criterion name and description
+  let bestMatch = null;
+  let maxScore = 0;
+  for (const c of criteria) {
+    const words = `${c.name} ${c.description || ""}`
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, " ")
+      .split(/\s+/)
+      .filter(w => w.length > 3 && !["with", "from", "that", "this", "should", "must", "when", "test"].includes(w));
+
+    let count = 0;
+    for (const w of words) {
+      if (normTitle.includes(w)) count++;
+    }
+    if (count > maxScore && count >= 2) {
+      maxScore = count;
+      bestMatch = c.name;
+    }
+  }
+
+  return bestMatch;
+}
+
+/**
  * Helper to compute evaluation score from Jest JSON report.
  */
 export function scoreFromTestResults(rubric, testResults) {
   if (!testResults || testResults.error || !Array.isArray(testResults.testResults)) {
     return null;
   }
-  const assertions = testResults.testResults?.[0]?.assertionResults || [];
+  const assertions = Array.isArray(testResults.testResults)
+    ? testResults.testResults.flatMap(suite => suite.assertionResults || [])
+    : (Array.isArray(testResults.assertionResults) ? testResults.assertionResults : []);
   if (assertions.length === 0) {
     return null;
   }
@@ -108,7 +165,7 @@ export function scoreFromTestResults(rubric, testResults) {
   const multipliers = {};
   let totalScore = 0;
 
-  // Group tests by rubric name prefix
+  // Group tests by rubric name prefix or keywords
   const categoryStats = {};
   const criteria = rubric.criteria || [];
   for (const c of criteria) {
@@ -120,45 +177,42 @@ export function scoreFromTestResults(rubric, testResults) {
     const status = assertion.status; // "passed" or "failed"
     
     // Find matching rubric
-    let matchedCriterion = null;
-    for (const c of criteria) {
-      if (title.toLowerCase().startsWith(c.name.toLowerCase())) {
-        matchedCriterion = c.name;
-        break;
-      }
-    }
+    const matchedCriterion = matchAssertionToCriterion(title, criteria);
 
-    if (matchedCriterion) {
+    if (matchedCriterion && categoryStats[matchedCriterion]) {
       categoryStats[matchedCriterion].total++;
       if (status === "passed") {
         categoryStats[matchedCriterion].passed++;
       } else {
         const cleanedError = (assertion.failureMessages?.[0] || "Test assertion failed")
-          .split('\n')[0] // Only get the first line of the error to keep it simple and clean
+          .split('\n')[0] // Only get the first line of the error to keep it clean
           .replace(/\x1B\[\d+m/g, ""); // Strip ANSI colors
         categoryStats[matchedCriterion].failedDetails.push(cleanedError);
       }
     }
   }
+  
+  const passedAssertions = assertions.filter(a => a.status === "passed").length;
+  const overallPassRatio = assertions.length > 0 ? passedAssertions / assertions.length : 0;
+  const matchedCriteriaCount = Object.values(categoryStats).filter(s => s.total > 0).length;
 
-  // Calculate scores
+  if (matchedCriteriaCount < criteria.length) {
+    logger.info(`Jest test suite covers ${matchedCriteriaCount}/${criteria.length} criteria. Falling back to AI code analysis so all criteria are evaluated on actual code evidence.`);
+    return null;
+  }
+
+  // Calculate scores for fully matched criteria
   for (const c of criteria) {
     const stats = categoryStats[c.name];
-    if (stats && stats.total > 0) {
-      const multiplier = stats.passed / stats.total;
-      const score = Math.round(multiplier * c.weight);
-      breakdown[c.name] = score;
-      multipliers[c.name] = Math.round(multiplier * 10) / 10;
-      
-      if (stats.failedDetails.length === 0) {
-        reasons[c.name] = `Passed all ${stats.total} unit tests.`;
-      } else {
-        reasons[c.name] = `Failed ${stats.failedDetails.length}/${stats.total} tests. Errors: ${stats.failedDetails.join('; ')}`;
-      }
+    const multiplier = stats.passed / stats.total;
+    const score = Math.round(multiplier * c.weight);
+    breakdown[c.name] = score;
+    multipliers[c.name] = Math.round(multiplier * 10) / 10;
+    
+    if (stats.failedDetails.length === 0) {
+      reasons[c.name] = `Passed all ${stats.total} unit tests.`;
     } else {
-      breakdown[c.name] = 0;
-      multipliers[c.name] = 0.0;
-      reasons[c.name] = "No tests found or executed for this criterion.";
+      reasons[c.name] = `Failed ${stats.failedDetails.length}/${stats.total} tests. Errors: ${stats.failedDetails.join('; ')}`;
     }
     totalScore += breakdown[c.name];
   }

@@ -1,4 +1,5 @@
 import { generateAIFeedback } from "./utils/aiFeedback.js";
+import { getCachedEvaluation, setCachedEvaluation } from "../../services/evaluationCache.js";
 import logger from "../../config/logger.js";
 import fs from "fs/promises";
 import path from "path";
@@ -21,12 +22,15 @@ function getGroqClient() {
 }
 
 /**
- * Recursively reads .js, .jsx, .ts, .tsx files from a directory,
- * ignoring node_modules, dist, build, .git, and .css to save tokens.
+ * Recursively reads source and asset files from a directory,
+ * ignoring node_modules, dist, build, and .git.
  */
 async function readProjectFiles(dir, fileList = []) {
-  const IGNORED_DIRS = new Set(["node_modules", "dist", "build", ".git", ".next", "public", "assets"]);
-  const ALLOWED_EXTENSIONS = new Set([".js", ".jsx", ".ts", ".tsx", ".css"]);
+  const IGNORED_DIRS = new Set(["node_modules", "dist", "build", ".git", ".next"]);
+  const ALLOWED_EXTENSIONS = new Set([
+    ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json",
+    ".jpg", ".jpeg", ".png", ".svg", ".webp", ".gif", ".ico"
+  ]);
 
   let entries;
   try {
@@ -64,47 +68,127 @@ function compressCode(code) {
 }
 
 /**
- * Reads all relevant source files from the student project and returns
- * a concatenated string for AI analysis.
+ * Assigns priority tier to source files.
+ * Tier 1 (highest): Entrypoints (App.jsx, App.tsx, main.jsx, index.jsx, etc.)
+ * Tier 2: Components (src/components/**, *.jsx, *.tsx)
+ * Tier 3: Hooks & State (src/hooks/**, src/context/**, src/store/**, src/redux/**)
+ * Tier 4: Utils & Services (src/utils/**, src/services/**, src/api/**, src/helpers/**)
+ * Tier 5 (lowest): Styles & configs (.css, .js)
+ */
+function getFilePriority(filePath) {
+  const norm = filePath.replace(/\\/g, "/").toLowerCase();
+  const base = path.basename(norm);
+
+  // Tier 1: Main entrypoints
+  if (/^(app|main|index)\.(jsx?|tsx?)$/i.test(base)) return 1;
+  if (norm.includes("/src/app.") || norm.includes("/src/main.") || norm.includes("/src/index.")) return 1;
+
+  // Tier 2: Components
+  if (norm.includes("/components/") || norm.includes("/views/") || norm.includes("/pages/") || norm.includes("/containers/")) return 2;
+  if (/\.(jsx|tsx)$/i.test(base)) return 2;
+
+  // Tier 3: Hooks, Context, State
+  if (norm.includes("/hooks/") || norm.includes("/context/") || norm.includes("/store/") || norm.includes("/redux/") || norm.includes("/state/")) return 3;
+
+  // Tier 4: Utils, Services, API, helpers
+  if (norm.includes("/utils/") || norm.includes("/services/") || norm.includes("/api/") || norm.includes("/helpers/")) return 4;
+
+  // Tier 5: Everything else (.css, config, etc.)
+  return 5;
+}
+
+/**
+ * Reads project files with priority ranking and generates a Source Manifest
+ * to prevent blind truncation while remaining within LLM token budget.
  *
  * @param {string} projectPath - Path to the cloned student repo
- * @returns {Promise<string>} - Concatenated compressed code string
+ * @returns {Promise<{ codeString: string, manifest: { totalFiles: number, includedFiles: string[], omittedFiles: string[] }, unsupported: boolean }>}
  */
-async function getProjectCodeString(projectPath) {
-  // Try src/ first, then fall back to root
+async function getProjectCodeData(projectPath) {
   const srcDir = path.join(projectPath, "src");
-  let files = [];
+  let allFiles = [];
   try {
-    files = await readProjectFiles(srcDir);
+    allFiles = await readProjectFiles(srcDir);
   } catch {
-    // No src/ directory, try root
+    // No src directory
   }
 
-  if (files.length === 0) {
-    files = await readProjectFiles(projectPath);
+  if (allFiles.length === 0) {
+    allFiles = await readProjectFiles(projectPath);
   }
 
-  // Cap at 15 files to avoid token overflow
-  files = files.slice(0, 15);
-
-  if (files.length === 0) {
-    return "";
+  if (allFiles.length === 0) {
+    return {
+      codeString: "",
+      manifest: { totalFiles: 0, includedFiles: [], omittedFiles: [] },
+      unsupported: true,
+    };
   }
 
-  let codeStr = "";
-  for (const f of files) {
-    const relativePath = path.relative(projectPath, f);
+  // Sort files by priority tier first, then alphabetical path
+  allFiles.sort((a, b) => {
+    const pA = getFilePriority(a);
+    const pB = getFilePriority(b);
+    if (pA !== pB) return pA - pB;
+    return a.localeCompare(b);
+  });
+
+  const MAX_TOTAL_CHARS = 45000; // ~11,000 tokens for code
+  const MAX_PER_FILE_CHARS = 6000;
+
+  const includedFiles = [];
+  const omittedFiles = [];
+  let codeBody = "";
+  let assetCount = 0;
+  const MAX_ASSETS_LISTED = 10;
+
+  for (const f of allFiles) {
+    const relativePath = path.relative(projectPath, f).replace(/\\/g, "/");
+    const ext = path.extname(f).toLowerCase();
+
+    if (ASSET_EXTS.has(ext)) {
+      if (assetCount < MAX_ASSETS_LISTED) {
+        includedFiles.push(relativePath);
+        codeBody += `\n--- ${relativePath} ---\n[Binary Asset / Image File Present in Repository]\n`;
+        assetCount++;
+      } else {
+        omittedFiles.push(relativePath);
+      }
+      continue;
+    }
+
     try {
       const content = await fs.readFile(f, "utf8");
       const compressed = compressCode(content);
-      // Cap each file at 6000 compressed chars to prevent mid-function truncation
-      codeStr += `\n--- ${relativePath} ---\n${compressed.slice(0, 6000)}\n`;
+
+      if (codeBody.length + Math.min(compressed.length, MAX_PER_FILE_CHARS) <= MAX_TOTAL_CHARS) {
+        includedFiles.push(relativePath);
+        const fileContent = compressed.slice(0, MAX_PER_FILE_CHARS);
+        codeBody += `\n--- ${relativePath} ---\n${fileContent}\n`;
+      } else {
+        omittedFiles.push(relativePath);
+      }
     } catch {
-      // Skip unreadable files
+      omittedFiles.push(relativePath);
     }
   }
 
-  return codeStr;
+  let manifestHeader = `[SOURCE MANIFEST: Discovered ${allFiles.length} files. Included: ${includedFiles.length}. Omitted: ${omittedFiles.length}]\n`;
+  manifestHeader += `Included files: ${includedFiles.join(", ")}\n`;
+  if (omittedFiles.length > 0) {
+    manifestHeader += `Omitted files (token budget cap): ${omittedFiles.join(", ")}\n`;
+  }
+  manifestHeader += `========================================\n`;
+
+  return {
+    codeString: manifestHeader + codeBody,
+    manifest: {
+      totalFiles: allFiles.length,
+      includedFiles,
+      omittedFiles,
+    },
+    unsupported: false,
+  };
 }
 
 /**
@@ -156,6 +240,17 @@ function scoreFromTestResults(rubric, testResults) {
     }
   }
 
+  const totalCriteria = rubric.criteria.length;
+  const matchedCriteriaCount = Object.values(categoryStats).filter(s => s.total > 0).length;
+
+  // If no test assertions (or fewer than all criteria) matched the rubric criteria,
+  // automated unit tests are not configured for this specific assignment.
+  // Fall back to AI code evaluation so the student's actual code is graded against the rubric!
+  if (matchedCriteriaCount === 0 || matchedCriteriaCount < totalCriteria) {
+    logger.info(`Test suite only matched ${matchedCriteriaCount}/${totalCriteria} criteria. Falling back to AI code grading.`);
+    return null;
+  }
+
   // Calculate scores
   for (const c of rubric.criteria) {
     const stats = categoryStats[c.name];
@@ -197,13 +292,14 @@ function scoreFromTestResults(rubric, testResults) {
  * @param {Object} testResults - Test suite results JSON
  * @returns {Promise<Object>}  - Standard evaluation output
  */
-export default async function scoreSubmission(rubric, projectPath, githubReport, testResults) {
+export default async function scoreSubmission(rubric, projectPath, githubReport, testResults, options = {}) {
   const warnings = [];
+  const skipCache = Boolean(options?.skipCache || options?.reEvaluate || options?.isReEvaluation);
 
-  // Step 1: Read the student's code (compressed for tokens)
-  const codeString = await getProjectCodeString(projectPath);
+  // Step 1: Read the student's code with priority ranking & manifest
+  const { codeString, manifest, unsupported } = await getProjectCodeData(projectPath);
 
-  if (!codeString) {
+  if (unsupported || !codeString) {
     logger.warn("No source files found in student repo.");
     const breakdown = {};
     for (const c of rubric.criteria) {
@@ -212,17 +308,34 @@ export default async function scoreSubmission(rubric, projectPath, githubReport,
     const feedback = await generateAIFeedback({
       rubric_breakdown: breakdown,
       score: 0,
-      warnings: ["No source files found in the repository."],
+      warnings: ["No source files or React entrypoint found in the repository."],
       execution_logs: githubReport || "",
     });
     return {
       score: 0,
       rubric_breakdown: breakdown,
       feedback,
-      warnings: ["No source files found in the repository."],
+      warnings: ["No source files or React entrypoint found in the repository."],
       execution_logs: githubReport || "",
-      status: "fail",
+      status: "unsupported_project",
+      pass: false,
+      is_passed: false,
     };
+  }
+
+  if (manifest.omittedFiles.length > 0) {
+    warnings.push(
+      `Evaluated top ${manifest.includedFiles.length} priority source files. Omitted ${manifest.omittedFiles.length} secondary files (${manifest.omittedFiles.join(", ")}) due to token limits.`
+    );
+  }
+
+  // Check evaluation cache: If this exact codebase + rubric was already graded, return identical result
+  if (!skipCache) {
+    const cached = await getCachedEvaluation("react", rubric, codeString, githubReport, testResults);
+    if (cached) {
+      logger.info(`⚡ Returning cached React evaluation result: score=${cached.score}/100`);
+      return cached;
+    }
   }
 
   // Check if we can grade via Vitest test results mathematically (Option A)
@@ -258,15 +371,13 @@ export default async function scoreSubmission(rubric, projectPath, githubReport,
       logger.error("Groq client unavailable — OPENAI_API_KEY is not set.");
       throw new Error("AI grading client unavailable. Please check your API keys.");
     } else {
+      const assignmentTitle = rubric.title || rubric.assignmentTitle || "React Application";
+      const assignmentContext = rubric.description || rubric.assignmentDescription || "";
+
       const prompt = `You are an expert React instructor grading a student's assignment.
 
-## Assignment Requirements:
-This is a Todo List application. Students must:
-- Create an App.jsx parent component that renders a Todo child component
-- Use useState for tasks (array of objects with id, text, completed) and newTask (string)
-- Implement handleChange (input updates), handleAdd (adds task), handleCheck (toggles completed), handleDelete (removes task)
-- Dynamically render tasks with .map(), apply 'check' CSS class for completed items
-
+## Assignment: ${assignmentTitle}
+${assignmentContext ? `## Assignment Requirements & Context:\n${assignmentContext}\n` : ""}
 ## GitHub Actions Build/Linter Report:
 ${githubReport || "No build report available."}
 
@@ -277,27 +388,22 @@ ${codeString}
 ${criteriaList}
 
 ## Grading Instructions:
-You must be an extremely strict, objective, and unforgiving grader. Students must only receive marks for implementing the EXACT requirements of the Todo List assignment.
+You must be an objective, thorough instructor. Read the source code carefully to determine if the functionality requested in the rubric criteria actually exists.
+Check for proper component architecture, props passing, useState state management, event handler functions, and JSX rendering.
 
 CRITICAL RULES:
-1. ASSIGNMENT RELEVANCE CHECK: Check if the submission is actually a Todo List application.
-   - If the student submitted a completely different project (e.g. an Authentication page, a counter, a routing project, or a calculator), they MUST receive 0 marks for ALL criteria (Project Setup can get max 2 marks for basic React setup, all other criteria must be strictly 0).
-   - Do NOT give partial credit for "demonstrating state management" or "setting up components" using unrelated code (e.g., AuthContext, login forms, etc.). If the Todo app features are absent, the score is 0.
+1. ASSIGNMENT RELEVANCE CHECK:
+   - Verify that the submission actually attempts the assignment defined in the rubric criteria.
+   - If the student submitted a completely unrelated project (e.g. an empty template, an authentication page when an image feed was requested, or a calculator), they MUST receive 0 marks for all criteria (Project Setup can get max 2 marks for basic React setup, all other criteria must be strictly 0).
+   - Do NOT give credit for code that does not implement the required features.
 
-2. CRITERION SPECIFICS:
-    - 'Project Setup & Architecture' (Max 15): If 'todo.jsx' component is missing, or not rendered as a child of 'App.jsx', award max 2 marks.
-    - 'State Management' (Max 20): Specifically look for 'tasks' state (array of objects) and 'newTask' state (string). If these exact states are missing, award 0.
-    - 'Input Handling' (Max 25): Look for 'handleChange' and 'handleAdd'. If missing, award 0. If they don't prevent empty inputs, deduct 5 marks.
-    - 'Task Completion & Deletion' (Max 25): Look for 'handleCheck' and 'handleDelete' functions. If both are missing, award 0. If one is missing, award max 10.
-    - 'UI Structure & CSS Styling' (Max 15): Look for '.map()' rendering tasks, checkbox toggle, and conditional application of the 'check' class (e.g. className={task.completed ? 'check' : ''}). Check the CSS files for '.check' styling (e.g. text-decoration: line-through). If the class is missing from JSX or CSS, award max 5 marks.
-
-3. BUILD FAILURE RULE:
-   - If the Build Report says "Build: Failed" or "failed to compile", they can STILL get partial credit for criteria that are fully correct in the source code (Setup, State, Input, Completion/Deletion).
-   - However, "UI Structure & CSS Styling" must be capped at max 5 marks if the build failed, as we cannot verify dynamic rendering at runtime.
+2. BUILD FAILURE RULE:
+   - If the Build Report says "Build: Failed" or "failed to compile", students can STILL get partial credit for criteria that are fully correct in the source code (Setup, Component Structure, State, Handler Logic).
+   - However, criteria requiring runtime visual/rendering verification must be capped at max 5 marks if the build failed.
 
 Assign a discrete score multiplier for EACH criterion based strictly on verified code evidence:
 - 1.0 = Fully meets all exact requirements for this criterion.
-- 0.9 = Mostly correct with only minor gaps or formatting issues (e.g. missing empty-input check, or minor linter warnings).
+- 0.9 = Mostly correct with only minor gaps or formatting issues.
 - 0.8 = Good implementation but missing one specific sub-feature.
 - 0.5 = Partial implementation of the exact feature (~50% of required functionality present).
 - 0.2 = Bare minimum skeleton of the exact feature.
@@ -307,8 +413,11 @@ CRITICAL SCORING RULE:
 Use ONLY the discrete multipliers: 1.0, 0.9, 0.8, 0.5, 0.2, or 0.0.
 Do NOT use intermediate or arbitrary decimal values like 0.85, 0.92, 0.74, etc.
 
+SKELETON vs PARTIAL CLARIFICATION:
+If a criterion requires components, sub-components, or props wiring, but the code only contains an empty wrapper or placeholder text (such as "under construction" or empty JSX) with NO child component imports or prop passings, assign strictly 0.2 (skeleton) or 0.0 (unattempted), NEVER 0.5. Reserve 0.5 only when actual components and partial props/logic are genuinely written.
+
 For EACH criterion write a detailed 2-3 sentence reasoning that:
-1. States specifically what was FOUND in the source code files (cite actual code, function/state names, or lines).
+1. States specifically what was FOUND in the source code files (cite actual code, component/function/state names, or props).
 2. States specifically what is MISSING or WRONG compared to the rubric requirements.
 3. Mentions if the build failed and how it affected that specific criterion.
 
@@ -538,10 +647,22 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
 }
 
   const maxScore = rubric.criteria.reduce((sum, c) => sum + c.weight, 0);
-  const status = totalScore >= maxScore * 0.5 ? "pass" : "fail";
+  const isBuildFailed =
+    (githubReport || "").toLowerCase().includes("build: failed") ||
+    (githubReport || "").toLowerCase().includes("failed to compile");
+  const isPassed = totalScore >= maxScore * 0.5;
+
+  let status;
+  if (isBuildFailed && !isPassed) {
+    status = "build_failed";
+  } else if (isPassed) {
+    status = "passed";
+  } else {
+    status = "failed";
+  }
 
   // Step 4: Generate human-readable AI feedback (now with full per-criterion context)
-  logger.info(`Generating feedback for total score: ${totalScore}/${maxScore}`);
+  logger.info(`Generating feedback for total score: ${totalScore}/${maxScore} (status: ${status})`);
   const feedbackText = await generateAIFeedback({
     rubric_breakdown: breakdown,
     rubric_criteria: rubric.criteria,
@@ -584,7 +705,7 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
     breakdown: unifiedBreakdown
   };
 
-  return {
+  const finalResult = {
     score: totalScore,
     rubric_breakdown: breakdown,
     feedback: rubricFeedback,
@@ -592,5 +713,12 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
     warnings,
     execution_logs: githubReport || "",
     status,
+    pass: isPassed,
+    is_passed: isPassed,
   };
+
+  // Cache result for identical submissions
+  await setCachedEvaluation("react", rubric, codeString, githubReport, testResults, finalResult);
+
+  return finalResult;
 }

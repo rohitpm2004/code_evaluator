@@ -521,10 +521,14 @@ function renderResult(ret) {
       html += `<div class="score"><span class="big">${esc(round1(it.score))}${it.maxTotal != null ? ` / ${esc(round1(it.maxTotal))}` : ""}</span>${pct != null ? `<span class="pct">${pct}%</span>` : ""}</div>`;
       if (pct != null) html += `<div class="bar"><span style="width:${Math.max(0, Math.min(100, pct))}%"></span></div>`;
     }
-    // React evaluator's status field ("pass"/"fail") — cheap, generic badge;
-    // no other evaluator currently sets this key so it can't collide.
-    if (it.status === "pass" || it.status === "fail") {
-      html += `<div class="chip ${it.status === "pass" ? "completed" : "failed"}" style="display:inline-block;margin:4px 0 8px">${it.status === "pass" ? "✅ Pass" : "❌ Fail"}</div>`;
+    // Evaluator status badge ("passed", "failed", "build_failed", "unsupported_project")
+    if (it.status) {
+      const isPassed = it.status === "pass" || it.status === "passed";
+      const isBuildFailed = it.status === "build_failed";
+      const isUnsupported = it.status === "unsupported_project";
+      const badgeClass = isPassed ? "completed" : "failed";
+      const badgeLabel = isPassed ? "✅ Pass" : isBuildFailed ? "⚠️ Build Failed" : isUnsupported ? "⚠️ Unsupported Project" : "❌ Fail";
+      html += `<div class="chip ${badgeClass}" style="display:inline-block;margin:4px 0 8px">${badgeLabel}</div>`;
     }
 
     html += breakdownTable(it);

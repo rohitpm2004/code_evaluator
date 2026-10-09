@@ -4,8 +4,12 @@ import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
-import { evaluateFullstackProject } from "../evaluators/fullstack/evaluatorService.js";
+import { evaluateFullstackProject, evaluateFullstackProjectWithDocker } from "../evaluators/fullstack/evaluatorService.js";
+import { isDockerAvailable } from '../services/dockerSandboxService.js';
 import { webhookPubSub } from '../services/webhookPubSub.js';
+import fs from 'fs/promises';
+import os from 'os';
+import path from 'path';
 
 let fullstackWorker = null;
 
@@ -20,6 +24,47 @@ export async function initializeFullstackWorker() {
       async (job) => {
         try {
           logger.info(`Starting Fullstack evaluation: ${job.id}`);
+
+          const ideFiles = job.data.ideFiles || job.data.submission?.ideFiles;
+          if (ideFiles && Array.isArray(ideFiles) && ideFiles.length > 0) {
+            logger.info(`Fullstack Job ${job.id} is an IDE submission. Materializing ${ideFiles.length} files into temp sandbox.`);
+            const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), 'fullstack-ide-'));
+            try {
+              for (const file of ideFiles) {
+                const relativeFilePath = file.path || file.name;
+                if (relativeFilePath && typeof file.content === 'string') {
+                  const safeRelativePath = path.normalize(relativeFilePath).replace(/^(\.\.[\/\\])+/, '');
+                  const fullFilePath = path.resolve(tempDir, safeRelativePath);
+                  if (!fullFilePath.startsWith(path.resolve(tempDir))) {
+                    logger.warn(`Security: Skipping suspicious file path outside sandbox: ${relativeFilePath}`);
+                    continue;
+                  }
+                  await fs.mkdir(path.dirname(fullFilePath), { recursive: true });
+                  await fs.writeFile(fullFilePath, file.content, 'utf8');
+                }
+              }
+              const idePayload = {
+                ...job.data,
+                repoUrl: tempDir
+              };
+              const results = await evaluateFullstackProject(idePayload, job.id, null, "IDE Submission - Files verified locally.");
+              return { success: true, results, result: results };
+            } finally {
+              await fs.rm(tempDir, { recursive: true, force: true }).catch(() => {});
+            }
+          }
+
+          // Phase 0: Check if Docker Sandbox is enabled and available
+          const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
+          const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
+
+          if (canUseDocker) {
+            logger.info(`🐳 Fullstack Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+            const results = await evaluateFullstackProjectWithDocker(job.data, job.id);
+            return { success: true, results, result: results };
+          }
+
+          logger.info(`☁️ Fullstack Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
           
           // Phase 1: Dispatch to GitHub Actions
           const githubResult = await withTimeout(

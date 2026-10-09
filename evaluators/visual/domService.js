@@ -131,31 +131,11 @@ export async function resolveElement(page, selector) {
     } catch {}
   }
 
-  // 3. Semantic fallback based on tag or role
-  const lower = rawSel.toLowerCase();
-  if (lower.includes('btn') || lower.includes('button')) {
+  // 3. Specific semantic fallback: search for button, input, or element containing the token's text or aria-label
+  for (const token of tokens) {
+    if (token.length < 3) continue;
     try {
-      const el = await page.$('button, input[type="button"], input[type="submit"], [role="button"], a.btn');
-      if (el) return el;
-    } catch {}
-  } else if (lower.includes('input') || lower.includes('text') || lower.includes('search')) {
-    try {
-      const el = await page.$('input, textarea');
-      if (el) return el;
-    } catch {}
-  } else if (lower.includes('card') || lower.includes('container') || lower.includes('wrapper') || lower.includes('box')) {
-    try {
-      const el = await page.$('main, section, .card, .container, .wrapper, .box, div[class*="container" i], div[class*="card" i]');
-      if (el) return el;
-    } catch {}
-  } else if (lower.includes('header') || lower.includes('heading') || lower.includes('title')) {
-    try {
-      const el = await page.$('h1, h2, h3, header, .title, .heading');
-      if (el) return el;
-    } catch {}
-  } else if (lower.includes('display') || lower.includes('screen') || lower.includes('output') || lower.includes('result')) {
-    try {
-      const el = await page.$('output, [id*="display" i], [class*="display" i], [id*="screen" i], [class*="screen" i], [id*="result" i], [class*="result" i]');
+      const el = await page.$(`button:has-text("${token}"), [aria-label*="${token}" i], [placeholder*="${token}" i], [title*="${token}" i]`);
       if (el) return el;
     } catch {}
   }
@@ -300,7 +280,7 @@ async function evaluateCheck(page, check) {
     }
 
     default:
-      return true;
+      return false;
   }
 }
 
