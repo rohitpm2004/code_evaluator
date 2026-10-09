@@ -70,15 +70,19 @@ jobs:
               sudo npm install -g pm2
             fi
 
+            # Fix ownership of PM2 and app directories in case created by root
+            sudo chown -R $(whoami):$(whoami) /home/$(whoami)/.pm2 "$APP_DIR" || true
+            mkdir -p "$APP_DIR/logs"
+
             # Reload or start server using PM2
             echo "🔄 Starting / Reloading application with PM2..."
-            if pm2 list | grep -q "central-evaluator"; then
-              pm2 reload central-evaluator --update-env
+            if pm2 describe central-evaluator > /dev/null 2>&1; then
+              pm2 reload ecosystem.config.cjs --env production || pm2 reload central-evaluator --update-env
             else
-              pm2 start server.js --name "central-evaluator" --time
+              pm2 start ecosystem.config.cjs --env production || pm2 start server.js --name "central-evaluator" --time
             fi
 
-            pm2 save
+            pm2 save || true
 
             echo "✅ Deployment completed successfully!"
-            pm2 status central-evaluator
+            pm2 status
