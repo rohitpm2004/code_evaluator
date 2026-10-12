@@ -127,7 +127,7 @@ Return STRICT JSON only matching this format:
   ]
 }`;
 
-    const model = process.env.OPENAI_MODEL || "deepseek-v4-flash";
+    const model = process.env.OPENAI_MODEL || "deepseek-chat";
     const res = await openai.chat.completions.create({
       model,
       temperature: 0,
@@ -358,7 +358,7 @@ export async function evaluateStudentsWithVision({
       if (maxVisual > 0) {
         try {
           const prompt = buildVisionPrompt(rubric, domResults, behaviorResults);
-          const model = process.env.OPENAI_MODEL || "deepseek-v4-flash";
+          const model = process.env.OPENAI_MODEL || "deepseek-chat";
           const isVisionModel = !model.includes("deepseek");
 
           let messages;

@@ -1,5 +1,5 @@
 import { Worker } from 'bullmq';
-import redisConnection from '../config/redis.js';
+import redisConnection, { redisConfig } from '../config/redis.js';
 import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
@@ -106,12 +106,15 @@ export async function initializeReactWorker() {
         }
       },
       {
-        connection: redisConnection.getClient(),
+        connection: redisConfig,
+        prefix: process.env.QUEUE_PREFIX || 'local',
         concurrency: config.concurrency,
+        drainDelay: 5,
         settings: {
-          maxStalledCount: 2,
-          lockDuration: 30000,
-          lockRenewTime: 15000
+          maxStalledCount: 3,
+          stalledInterval: 10000,
+          lockDuration: 60000,
+          lockRenewTime: 20000
         }
       }
     );
@@ -128,6 +131,10 @@ export async function initializeReactWorker() {
         error: err.message,
         attempts: job.attemptsMade
       });
+    });
+
+    reactWorker.on('error', (err) => {
+      logger.error('React Worker internal error:', err);
     });
 
     logger.info('React Worker initialized');

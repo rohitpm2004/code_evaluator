@@ -246,7 +246,7 @@ Output STRICTLY a JSON object (no markdown, no extra text):
       logger.info("Sending code to Groq AI for visual rubric scoring...");
 
       const response = await groq.chat.completions.create({
-        model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+        model: process.env.OPENAI_MODEL || "deepseek-chat",
         messages: [{ role: "user", content: prompt }],
         max_tokens: 3000,
         temperature: 0.0,
@@ -381,7 +381,7 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
   ]
 }`;
           const retryResponse = await groq.chat.completions.create({
-            model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+            model: process.env.OPENAI_MODEL || "deepseek-chat",
             messages: [{ role: "user", content: retryPrompt }],
             max_tokens: 1500,
             temperature: 0.0,

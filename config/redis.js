@@ -13,6 +13,7 @@ const redisConfig = {
   password: process.env.REDIS_PASSWORD || undefined,
 
   connectTimeout: 30000,
+  keepAlive: 10000,
   // V-13: no commandTimeout — BullMQ workers issue long blocking commands
   // (BZPOPMIN/BRPOPLPUSH); a command timeout would abort them.
   // Connection options
@@ -107,9 +108,15 @@ class RedisConnection {
     }
     return this.client;
   }
+
+  // Dedicated duplicate client for BullMQ workers to prevent blocking command contention
+  getWorkerClient() {
+    const main = this.getClient();
+    return main.duplicate();
+  }
 }
 
 const redisConnection = new RedisConnection();
 
 export default redisConnection;
-export { RedisConnection };
+export { RedisConnection, redisConfig };

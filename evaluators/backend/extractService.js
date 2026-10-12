@@ -69,6 +69,14 @@ export function parseGithubTreeUrl(url) {
     return buildGithubRef(owner, repo, branch, dir === "." ? null : dir);
   }
 
+  // Direct file URL fallback: e.g. https://github.com/owner/repo/something.js
+  const directFileMatch = /^https?:\/\/github\.com\/([^/]+)\/([^/]+)\/(.+\.[a-z0-9]+)$/i.exec(trimmed);
+  if (directFileMatch) {
+    const [, owner, repo, filePath] = directFileMatch;
+    const dir = path.dirname(filePath);
+    return buildGithubRef(owner, repo, null, dir === "." ? null : dir);
+  }
+
   return null;
 }
 

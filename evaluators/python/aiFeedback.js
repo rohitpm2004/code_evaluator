@@ -82,7 +82,7 @@ async function fetchStudentCode(jobData) {
   }
 }
 
-async function fetchWithTimeout(url, timeoutMs = 4000) {
+async function fetchWithTimeout(url, timeoutMs = 25000) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
@@ -178,7 +178,7 @@ ${studentCode}
 
   try {
     const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 250,
       temperature: 0.0,

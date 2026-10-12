@@ -29,6 +29,27 @@ function getClient() {
 }
 
 /**
+ * Retries DeepSeek / OpenAI calls with backoff to handle concurrent rate limits (429)
+ */
+async function callDeepSeekWithRetry(openaiClient, params, maxRetries = 3) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await openaiClient.chat.completions.create(params);
+    } catch (err) {
+      attempt++;
+      if (attempt < maxRetries) {
+        const delay = (attempt * 1500) + Math.floor(Math.random() * 500);
+        logger.warn(`[ReactFeedback] AI API rate-limit/error (${err.message}). Retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+/**
  * Generates AI-assisted feedback for a student's React submission.
  *
  * @param {Object} params
@@ -113,8 +134,8 @@ ${truncatedCode ? `## Student Code Excerpt:\n\`\`\`\n${truncatedCode}\n\`\`\`\n`
 `.trim();
 
   try {
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+    const response = await callDeepSeekWithRetry(openai, {
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       temperature: 0.0,
@@ -260,8 +281,8 @@ Output STRICTLY a JSON object:
 Do NOT include any markdown or text besides the raw JSON object.
 `.trim();
 
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+    const response = await callDeepSeekWithRetry(openai, {
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 150,
       temperature: 0.0,

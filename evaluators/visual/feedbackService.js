@@ -101,7 +101,7 @@ ${truncatedCode ? `## Student Code Excerpt:\n\`\`\`\n${truncatedCode}\n\`\`\`\n`
 
   try {
     const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       temperature: 0.0,

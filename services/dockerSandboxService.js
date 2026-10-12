@@ -8,27 +8,28 @@ import logger from "../config/logger.js";
 const execPromise = util.promisify(exec);
 
 let dockerAvailableCache = null;
-let lastCheckTime = 0;
 
 /**
  * Checks if Docker daemon is running and reachable.
- * Caches the result for 30 seconds to avoid running `docker info` repeatedly.
+ * Once verified positive, retains cached status to prevent concurrent timeouts under load.
  */
 export async function isDockerAvailable() {
-  const now = Date.now();
-  if (dockerAvailableCache !== null && now - lastCheckTime < 30000) {
-    return dockerAvailableCache;
+  if (dockerAvailableCache === true) {
+    return true;
   }
 
   try {
-    await execPromise("docker info", { timeout: 4000 });
+    await execPromise("docker info", { timeout: 30000 });
     dockerAvailableCache = true;
-    lastCheckTime = now;
     return true;
   } catch (err) {
+    if (process.env.SANDBOX_MODE === "docker") {
+      logger.warn(`Docker check warning: ${err.message}. Retaining docker mode as configured.`);
+      dockerAvailableCache = true;
+      return true;
+    }
     logger.warn(`Docker not reachable: ${err.message}. Will fall back to GitHub Actions.`);
     dockerAvailableCache = false;
-    lastCheckTime = now;
     return false;
   }
 }
@@ -48,7 +49,7 @@ export async function isDockerAvailable() {
  */
 export async function runInDockerSandbox(repoPath, options = {}) {
   const startTime = Date.now();
-  const timeoutMs = options.timeoutMs || 45000;
+  const timeoutMs = options.timeoutMs || 60000;
   const language = options.language || "node";
   
   // Normalize Windows paths for Docker volume mounting (e.g. C:/Users/...:/app)
@@ -135,27 +136,55 @@ export async function runInDockerSandbox(repoPath, options = {}) {
   }
 }
 
+const PRIORITY_ENTRY_FILES = [
+  'index.js',
+  'script.js',
+  'main.js',
+  'app.js',
+  'solution.js',
+  'assignment.js',
+  'task.js'
+];
+
+const CONFIG_FILE_PATTERNS = [
+  /\.config\.(js|cjs|mjs)$/i,
+  /^(webpack|vite|babel|postcss|tailwind|jest|karma|rollup|grunt|gulp)\./i,
+  /\.min\.js$/i
+];
+
+function isConfigFile(filename) {
+  return CONFIG_FILE_PATTERNS.some(pat => pat.test(filename));
+}
+
 /**
  * Recursively finds target file in a directory matching a predicate, excluding node_modules/git.
- * Checks files in the current root directory first before traversing subdirectories to ensure deterministic precedence.
+ * Prioritizes standard entry files (index.js, script.js, main.js, etc.) and ignores tooling configs.
  */
 function findTargetFile(dir, predicate, maxDepth = 3, currentDepth = 0) {
   if (currentDepth > maxDepth || !fs.existsSync(dir)) return null;
+
+  // 1. Check for priority entry files directly in this directory first
+  for (const prio of PRIORITY_ENTRY_FILES) {
+    const directPrio = path.join(dir, prio);
+    if (fs.existsSync(directPrio) && fs.statSync(directPrio).isFile()) {
+      return directPrio;
+    }
+  }
+
   const entries = fs.readdirSync(dir, { withFileTypes: true });
-  // Sort entries alphabetically for deterministic traversal
   entries.sort((a, b) => a.name.localeCompare(b.name));
 
-  // 1. Check all direct files in current directory first
+  // 2. Check all direct files in current directory matching predicate (excluding configs)
   for (const entry of entries) {
-    if (entry.isFile() && !entry.name.startsWith('.') && predicate(entry.name)) {
+    if (entry.isFile() && !entry.name.startsWith('.') && !isConfigFile(entry.name) && predicate(entry.name)) {
       return path.join(dir, entry.name);
     }
   }
 
-  // 2. Traverse into subdirectories
+  // 3. Traverse into subdirectories
   for (const entry of entries) {
     if (entry.isDirectory()) {
-      if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'coverage' || entry.name === 'test' || entry.name === 'tests') continue;
+      if (entry.name.startsWith('.') || entry.name === 'node_modules' || entry.name === 'coverage' || entry.name === 'test' || entry.name === 'tests' || entry.name === 'dist' || entry.name === 'build') continue;
       const fullPath = path.join(dir, entry.name);
       const nested = findTargetFile(fullPath, predicate, maxDepth, currentDepth + 1);
       if (nested) return nested;
@@ -167,21 +196,57 @@ function findTargetFile(dir, predicate, maxDepth = 3, currentDepth = 0) {
 /**
  * Runs JavaScript algorithm / function test cases inside a safe Node container.
  */
-export async function runJsInDocker(repoPath, { testCases = [], entryFunction = "solution", evaluationMode = "function", expectedLogs = [], functions = null }) {
+export async function runJsInDocker(repoPath, options = {}) {
   const normalizedPath = path.resolve(repoPath).replace(/\\/g, "/");
+
+  let testCases = options.testCases || [];
+  while (typeof testCases === 'string') {
+    try { testCases = JSON.parse(testCases); } catch { break; }
+  }
+  let expectedLogs = options.expectedLogs || [];
+  while (typeof expectedLogs === 'string') {
+    try { expectedLogs = JSON.parse(expectedLogs); } catch { break; }
+  }
+  let functions = options.functions || null;
+  while (typeof functions === 'string') {
+    try { functions = JSON.parse(functions); } catch { break; }
+  }
+
+  // Auto-detect evaluationMode if not provided
+  let evaluationMode = options.evaluationMode;
+  if (!evaluationMode) {
+    if (Array.isArray(expectedLogs) && expectedLogs.length > 0 && (!Array.isArray(testCases) || testCases.length === 0)) {
+      evaluationMode = 'script';
+    } else if (Array.isArray(functions) && functions.length > 0) {
+      evaluationMode = 'multi-function';
+    } else {
+      evaluationMode = 'function';
+    }
+  }
+
+  let entryFunction = options.entryFunction || null;
   
-  // Find primary JS file (root or src/)
-  const fullTarget = findTargetFile(repoPath, f => f.endsWith(".js") && !f.includes("test") && !f.includes("spec") && !f.startsWith("."))
-    || path.join(repoPath, "index.js");
+  // Find primary JS file (check explicit options.entryFile first, then auto-discover)
+  let fullTarget = null;
+  if (options.entryFile) {
+    const candidate = path.resolve(repoPath, options.entryFile);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      fullTarget = candidate;
+    }
+  }
+  if (!fullTarget) {
+    fullTarget = findTargetFile(repoPath, f => f.endsWith(".js") && !f.includes("test") && !f.includes("spec") && !f.startsWith("."))
+      || path.join(repoPath, "index.js");
+  }
   const relativeTarget = path.relative(repoPath, fullTarget).replace(/\\/g, "/");
 
-  // Write test cases & configuration to a separate JSON file on disk to prevent host shell injection
+  // Write test cases & configuration to a separate JSON file on disk
   const testCasesFileName = `.eval_tc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.json`;
   const testCasesFilePath = path.join(repoPath, testCasesFileName);
   fs.writeFileSync(testCasesFilePath, JSON.stringify({
     testCases: Array.isArray(testCases) ? testCases : [],
-    entryFunction: entryFunction || "solution",
-    evaluationMode: evaluationMode || "function",
+    entryFunction,
+    evaluationMode,
     expectedLogs: Array.isArray(expectedLogs) ? expectedLogs : [],
     functions: Array.isArray(functions) ? functions : null
   }), "utf-8");
@@ -203,11 +268,62 @@ import { createRequire } from 'module';
   const targetAbs = path.resolve(targetRel);
 
   let capturedLogs = [];
+  const logPush = (...args) => {
+    const line = args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ');
+    capturedLogs.push(line);
+  };
   const customConsole = {
-    log: (...args) => capturedLogs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')),
-    info: (...args) => capturedLogs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')),
-    warn: (...args) => capturedLogs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' ')),
-    error: (...args) => capturedLogs.push(args.map(a => typeof a === 'object' ? JSON.stringify(a) : String(a)).join(' '))
+    log: logPush,
+    info: logPush,
+    warn: logPush,
+    error: logPush
+  };
+
+  const mockPrompt = (msg) => {
+    logPush('[prompt: ' + (msg || '') + ']');
+    return '';
+  };
+  const mockAlert = (...args) => logPush(...args);
+  const mockConfirm = () => true;
+  const mockWindow = {
+    alert: mockAlert,
+    prompt: mockPrompt,
+    confirm: mockConfirm,
+    console: customConsole,
+    setTimeout,
+    clearTimeout,
+    setInterval,
+    clearInterval
+  };
+  const mockDocument = {
+    getElementById: () => null,
+    querySelector: () => null,
+    querySelectorAll: () => [],
+    write: (...args) => logPush(...args),
+    writeln: (...args) => logPush(...args),
+    createElement: () => ({ style: {}, appendChild: () => {}, addEventListener: () => {} }),
+    body: { appendChild: () => {} }
+  };
+
+  const createSafeSandbox = (extra = {}) => {
+    const base = {
+      console: customConsole,
+      process,
+      require: createRequire(import.meta.url),
+      prompt: mockPrompt,
+      alert: mockAlert,
+      confirm: mockConfirm,
+      window: mockWindow,
+      document: mockDocument,
+      setTimeout,
+      clearTimeout,
+      setInterval,
+      clearInterval,
+      ...extra
+    };
+    base.global = base;
+    base.globalThis = base;
+    return base;
   };
 
   const outputResult = (data) => {
@@ -218,19 +334,115 @@ import { createRequire } from 'module';
   if (config.evaluationMode === 'script') {
     try {
       const code = fs.readFileSync(targetAbs, 'utf8');
-      const sandbox = { console: customConsole, process, require: createRequire(import.meta.url) };
+      const sandbox = createSafeSandbox();
       vm.createContext(sandbox);
-      vm.runInContext(code, sandbox, { timeout: 5000 });
+      vm.runInContext(code, sandbox, { timeout: 30000 });
       
       const expected = config.expectedLogs || [];
-      const passed = expected.every((exp, idx) => {
-        const actual = capturedLogs[idx] || '';
-        return actual.trim() === String(exp).trim();
+      const cleanCaptured = capturedLogs.flatMap(l => String(l).split('\\n')).map(s => s.trim()).filter(s => s.length > 0);
+      
+      const isValueMatch = (actualLine, expVal) => {
+        if (actualLine === undefined || actualLine === null) return false;
+        const strActual = String(actualLine).trim();
+        const strExp = String(expVal).trim();
+        if (!strExp) return false;
+        
+        // 1. Direct exact or case-insensitive match
+        if (strActual === strExp || strActual.toLowerCase() === strExp.toLowerCase()) return true;
+
+        // 2. Delimiter extraction: e.g. "Full Name: Rohit Sharma", "Age = 25", "name - Rohit Sharma", "Course is B.Tech"
+        const delimiterMatch = strActual.match(/^[^:=]+(?::\s*|=\s*|-\s*|\bis\b\s*)(.+)$/i);
+        if (delimiterMatch) {
+          const extracted = delimiterMatch[1].trim();
+          if (extracted === strExp || extracted.toLowerCase() === strExp.toLowerCase()) return true;
+          const numExtracted = parseFloat(extracted);
+          const numExp = parseFloat(strExp);
+          if (!isNaN(numExtracted) && !isNaN(numExp) && Math.abs(numExtracted - numExp) < 0.0001) return true;
+        }
+
+        // 3. Substring match for meaningful string values (length >= 3)
+        // e.g. expected is "Rohit Sharma", student prints "Full Name: Rohit Sharma, Age: 20" or "My name is Rohit Sharma"
+        if (strExp.length >= 3 && strActual.toLowerCase().includes(strExp.toLowerCase())) {
+          return true;
+        }
+
+        // 4. Number token check (e.g. expected is 20 or 11.6, actual line contains token 20 or 11.6)
+        const numExp = parseFloat(strExp);
+        if (!isNaN(numExp) && !isNaN(Number(strExp))) {
+          const tokens = strActual.split(/[\s,;:=-]+/);
+          for (const token of tokens) {
+            const numToken = parseFloat(token);
+            if (!isNaN(numToken) && Math.abs(numToken - numExp) < 0.0001) return true;
+          }
+        }
+
+        // 5. Boolean token check
+        if (strExp.toLowerCase() === 'true' || strExp.toLowerCase() === 'false') {
+          const tokens = strActual.toLowerCase().split(/[\s,;:=-]+/);
+          if (tokens.includes(strExp.toLowerCase())) return true;
+        }
+
+        return false;
+      };
+
+      // Two-pass matching:
+      // Pass 1: Direct 1-to-1 index matching
+      // Pass 2: Unused lines search for any remaining test cases (handles out-of-order logs, debug logs, or banners)
+      const usedIndices = new Set();
+      const matchMap = new Map();
+
+      expected.forEach((exp, expIdx) => {
+        if (cleanCaptured[expIdx] !== undefined && isValueMatch(cleanCaptured[expIdx], exp)) {
+          usedIndices.add(expIdx);
+          matchMap.set(expIdx, expIdx);
+        }
       });
-      outputResult({ passed, score: passed ? 100 : 0, logs: capturedLogs });
+
+      expected.forEach((exp, expIdx) => {
+        if (!matchMap.has(expIdx)) {
+          for (let i = 0; i < cleanCaptured.length; i++) {
+            if (!usedIndices.has(i) && isValueMatch(cleanCaptured[i], exp)) {
+              usedIndices.add(i);
+              matchMap.set(expIdx, i);
+              break;
+            }
+          }
+        }
+      });
+
+      let passedCount = 0;
+      const details = expected.map((exp, expIdx) => {
+        if (matchMap.has(expIdx)) {
+          passedCount++;
+          const actualIdx = matchMap.get(expIdx);
+          return { passed: true, expected: String(exp).trim(), actual: cleanCaptured[actualIdx] };
+        } else {
+          const fallbackActual = cleanCaptured[expIdx] !== undefined ? cleanCaptured[expIdx] : '';
+          return { passed: false, expected: String(exp).trim(), actual: fallbackActual };
+        }
+      });
+      const passRatio = expected.length > 0 ? passedCount / expected.length : 1;
+      const score = Math.round(passRatio * 100);
+      outputResult({ 
+        passed: score === 100, 
+        score, 
+        results: details, 
+        logs: cleanCaptured, 
+        passedCount, 
+        totalCount: expected.length,
+        feedback: 'Passed ' + passedCount + ' of ' + expected.length + ' test cases'
+      });
       process.exit(0);
     } catch(e) {
-      outputResult({ passed: false, score: 0, error: e.message, logs: capturedLogs });
+      outputResult({ 
+        passed: false, 
+        score: 0, 
+        error: e.message, 
+        logs: capturedLogs, 
+        passedCount: 0, 
+        totalCount: (config.expectedLogs || []).length || 1,
+        results: []
+      });
       process.exit(0);
     }
   }
@@ -245,12 +457,11 @@ import { createRequire } from 'module';
       const require = createRequire(import.meta.url);
       mod = require(targetAbs);
     } catch(e2) {
-      // VM fallback for unexported functions
       try {
         const code = fs.readFileSync(targetAbs, 'utf8');
-        const sandbox = { console: customConsole, module: { exports: {} }, exports: {}, require: createRequire(import.meta.url) };
+        const sandbox = createSafeSandbox({ module: { exports: {} }, exports: {} });
         vm.createContext(sandbox);
-        vm.runInContext(code, sandbox, { timeout: 5000 });
+        vm.runInContext(code, sandbox, { timeout: 30000 });
         mod = { ...sandbox, ...(sandbox.module?.exports || {}), ...(sandbox.exports || {}) };
       } catch(e3) {
         outputResult({ error: e3.message, results: [] });
@@ -260,10 +471,21 @@ import { createRequire } from 'module';
   }
 
   const resolveFn = (name) => {
-    if (typeof mod[name] === 'function') return mod[name];
-    if (mod.default && typeof mod.default[name] === 'function') return mod.default[name];
+    if (name && typeof mod[name] === 'function') return mod[name];
+    if (name && mod.default && typeof mod.default[name] === 'function') return mod.default[name];
     if (mod.default && typeof mod.default === 'function') return mod.default;
     if (typeof mod === 'function') return mod;
+
+    // Smart auto-discovery if explicit name not found or default 'solution' was used
+    const builtins = new Set(['console', 'process', 'require', 'module', 'exports', 'path', 'fs']);
+    for (const key of Object.keys(mod)) {
+      if (!builtins.has(key) && typeof mod[key] === 'function') return mod[key];
+    }
+    if (mod.default && typeof mod.default === 'object' && mod.default !== null) {
+      for (const key of Object.keys(mod.default)) {
+        if (!builtins.has(key) && typeof mod.default[key] === 'function') return mod.default[key];
+      }
+    }
     return null;
   };
 
@@ -279,7 +501,19 @@ import { createRequire } from 'module';
         } else {
           actual = fn();
         }
-        const passed = JSON.stringify(actual) === JSON.stringify(tc.expected);
+        
+        let passed = false;
+        if (actual === tc.expected) {
+          passed = true;
+        } else if (typeof actual === 'number' && typeof tc.expected === 'number' && Math.abs(actual - tc.expected) < 0.0001) {
+          passed = true;
+        } else if (String(actual).trim() === String(tc.expected).trim()) {
+          passed = true;
+        } else {
+          try {
+            passed = JSON.stringify(actual) === JSON.stringify(tc.expected);
+          } catch {}
+        }
         return { passed, input: tc.input, expected: tc.expected, actual };
       } catch(err) {
         return { passed: false, input: tc.input, expected: tc.expected, error: err.message };
@@ -298,7 +532,10 @@ import { createRequire } from 'module';
         allResults.push(...evaluateCases(fn, fnObj.testCases || []));
       }
     }
-    outputResult({ results: allResults });
+    const passedCount = allResults.filter(r => r.passed).length;
+    const totalCount = allResults.length;
+    const score = totalCount > 0 ? Math.round((passedCount / totalCount) * 100) : 0;
+    outputResult({ results: allResults, score, passedCount, totalCount, passed: score === 100 });
     process.exit(0);
   }
 
@@ -306,12 +543,15 @@ import { createRequire } from 'module';
   const entryFunction = config.entryFunction || 'solution';
   const fn = resolveFn(entryFunction);
   if (typeof fn !== 'function') {
-    outputResult({ error: 'Function ' + entryFunction + ' not found', results: [] });
+    outputResult({ error: 'Function ' + (entryFunction || 'target') + ' not found', results: [] });
     process.exit(0);
   }
 
   const results = evaluateCases(fn, config.testCases || []);
-  outputResult({ results });
+  const passedCount = results.filter(r => r.passed).length;
+  const totalCount = results.length;
+  const score = totalCount > 0 ? Math.round((passedCount / totalCount) * 100) : 0;
+  outputResult({ results, score, passedCount, totalCount, passed: score === 100 });
 })();
 `;
 
@@ -319,12 +559,17 @@ import { createRequire } from 'module';
   const containerName = `eval-js-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:18-alpine node ${harnessFileName}`;
 
+  let studentCode = "";
   try {
-    const { stdout } = await execPromise(dockerCmd, { timeout: 15000 });
+    studentCode = fs.readFileSync(fullTarget, "utf-8");
+  } catch {}
+
+  try {
+    const { stdout } = await execPromise(dockerCmd, { timeout: 60000 });
     const match = stdout.match(/__EVAL_RESULT_START__([\s\S]*?)__EVAL_RESULT_END__/);
     const rawJson = match ? match[1].trim() : stdout.trim();
     const parsed = JSON.parse(rawJson);
-    return parsed.results || (parsed.passed !== undefined ? parsed : []);
+    return { ...parsed, studentCode };
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
     logger.error(`Docker JS test runner infrastructure error: ${err.message}`);

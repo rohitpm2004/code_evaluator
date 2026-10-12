@@ -22,6 +22,27 @@ function getClient() {
 }
 
 /**
+ * Retries DeepSeek / OpenAI calls with backoff to handle concurrent rate limits (429)
+ */
+async function callDeepSeekWithRetry(openaiClient, params, maxRetries = 3) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await openaiClient.chat.completions.create(params);
+    } catch (err) {
+      attempt++;
+      if (attempt < maxRetries) {
+        const delay = (attempt * 1500) + Math.floor(Math.random() * 500);
+        logger.warn(`[BackendFeedback] AI API rate-limit/error (${err.message}). Retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+/**
  * Generates AI-assisted feedback specifically tailored for Node.js & Express Backend submissions.
  *
  * @param {Object} params
@@ -94,8 +115,8 @@ ${truncatedCode ? `## Student Backend Source Code:\n\`\`\`javascript\n${truncate
 `.trim();
 
   try {
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+    const response = await callDeepSeekWithRetry(openai, {
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 300,
       temperature: 0.0,
@@ -205,7 +226,7 @@ Your response:
   try {
     const chatCompletion = await openai.chat.completions.create({
       messages: [{ role: 'user', content: prompt }],
-      model: process.env.OPENAI_MODEL || 'deepseek-v4-flash',
+      model: process.env.OPENAI_MODEL || 'deepseek-chat',
       max_tokens: 300,
       temperature: 0.0,
       seed: 42,

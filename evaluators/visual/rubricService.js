@@ -128,7 +128,7 @@ Rubric:
 ${text}
 `;
 
-  const model = process.env.OPENAI_MODEL || "deepseek-v4-flash";
+  const model = process.env.OPENAI_MODEL || "deepseek-chat";
   const response = await getOpenAI().chat.completions.create({
     model,
     temperature: 0,

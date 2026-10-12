@@ -112,7 +112,7 @@ Return STRICT JSON only: { "tier": "excellent" | "good" | "fair" | "poor", "reas
 ${sourceText}
 </student_source_code>`;
 
-  const model = process.env.OPENAI_MODEL || "deepseek-v4-flash";
+  const model = process.env.OPENAI_MODEL || "deepseek-chat";
   const res = await getOpenAI().chat.completions.create({
     model,
     temperature: 0,

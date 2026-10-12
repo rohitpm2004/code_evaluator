@@ -21,16 +21,43 @@ function getGroqClient() {
   return client;
 }
 
+const ASSET_EXTS = new Set([
+  ".jpg", ".jpeg", ".png", ".svg", ".webp", ".gif", ".ico"
+]);
+
+const CODE_EXTS = new Set([
+  ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json"
+]);
+
+const ALLOWED_EXTENSIONS = new Set([...CODE_EXTS, ...ASSET_EXTS]);
+
+/**
+ * Retries DeepSeek / OpenAI calls with backoff to handle concurrent rate limits (429)
+ */
+async function callDeepSeekWithRetry(openaiClient, params, maxRetries = 3) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await openaiClient.chat.completions.create(params);
+    } catch (err) {
+      attempt++;
+      if (attempt < maxRetries) {
+        const delay = (attempt * 1500) + Math.floor(Math.random() * 500);
+        logger.warn(`AI API rate-limit/error (${err.message}). Retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 /**
  * Recursively reads source and asset files from a directory,
  * ignoring node_modules, dist, build, and .git.
  */
 async function readProjectFiles(dir, fileList = []) {
   const IGNORED_DIRS = new Set(["node_modules", "dist", "build", ".git", ".next"]);
-  const ALLOWED_EXTENSIONS = new Set([
-    ".js", ".jsx", ".ts", ".tsx", ".css", ".html", ".json",
-    ".jpg", ".jpeg", ".png", ".svg", ".webp", ".gif", ".ico"
-  ]);
 
   let entries;
   try {
@@ -347,7 +374,7 @@ export default async function scoreSubmission(rubric, projectPath, githubReport,
   let gradedByTests = false;
 
   if (testGrading) {
-    logger.info("Deterministic testResults found. Grading React Todo mathematically based on Vitest outcomes.");
+    logger.info("Deterministic testResults found. Grading React project mathematically based on Vitest outcomes.");
     breakdown = testGrading.rubric_breakdown;
     reasons = testGrading.reasons;
     multipliers = testGrading.multipliers;
@@ -431,8 +458,8 @@ Output STRICTLY a JSON object (no markdown, no extra text):
     try {
       logger.info("Sending code to Groq AI for rubric-based scoring...");
 
-      const response = await groq.chat.completions.create({
-        model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+      const response = await callDeepSeekWithRetry(groq, {
+        model: process.env.OPENAI_MODEL || "deepseek-chat",
         messages: [{ role: "user", content: prompt }],
         max_tokens: 3000,
         temperature: 0.0,
@@ -572,8 +599,8 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
     { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<2-3 sentence explanation>" }
   ]
 }`;
-          const retryResponse = await groq.chat.completions.create({
-            model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+          const retryResponse = await callDeepSeekWithRetry(groq, {
+            model: process.env.OPENAI_MODEL || "deepseek-chat",
             messages: [{ role: "user", content: retryPrompt }],
             max_tokens: 1500,
             temperature: 0.0,

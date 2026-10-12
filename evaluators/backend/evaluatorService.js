@@ -25,6 +25,27 @@ function getClient() {
 }
 
 /**
+ * Retries DeepSeek / OpenAI calls with backoff to handle concurrent rate limits (429)
+ */
+async function callDeepSeekWithRetry(openaiClient, params, maxRetries = 3) {
+  let attempt = 0;
+  while (attempt < maxRetries) {
+    try {
+      return await openaiClient.chat.completions.create(params);
+    } catch (err) {
+      attempt++;
+      if (attempt < maxRetries) {
+        const delay = (attempt * 1500) + Math.floor(Math.random() * 500);
+        logger.warn(`[BackendEval] AI API rate-limit/error (${err.message}). Retrying in ${delay}ms (attempt ${attempt}/${maxRetries})...`);
+        await new Promise(r => setTimeout(r, delay));
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+/**
  * Recursively reads relevant backend source files from a directory,
  * ignoring node_modules, dist, build, .git, etc.
  */
@@ -386,8 +407,8 @@ Output STRICTLY a JSON object (no markdown, no extra text):
 
     logger.info(`Sending code to AI for backend rubric scoring (Job: ${jobId})...`);
 
-    const response = await openai.chat.completions.create({
-      model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+    const response = await callDeepSeekWithRetry(openai, {
+      model: process.env.OPENAI_MODEL || "deepseek-chat",
       messages: [{ role: "user", content: prompt }],
       max_tokens: 3000,
       temperature: 0.0,
@@ -525,8 +546,8 @@ Grade each criterion strictly using discrete multipliers (1.0, 0.9, 0.8, 0.5, 0.
     { "name": "<exact criterion name>", "multiplier": <number 0.0, 0.2, 0.5, 0.8, 0.9, or 1.0>, "reasoning": "<1-2 sentence explanation>" }
   ]
 }`;
-        const retryResponse = await openai.chat.completions.create({
-          model: process.env.OPENAI_MODEL || "deepseek-v4-flash",
+        const retryResponse = await callDeepSeekWithRetry(openai, {
+          model: process.env.OPENAI_MODEL || "deepseek-chat",
           messages: [{ role: "user", content: retryPrompt }],
           max_tokens: 1500,
           temperature: 0.0,

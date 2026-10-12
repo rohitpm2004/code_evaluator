@@ -1,10 +1,10 @@
 import { Worker } from 'bullmq';
-import redisConnection from '../config/redis.js';
+import redisConnection, { redisConfig } from '../config/redis.js';
 import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { triggerGraderWorkflow } from '../services/githubActionService.js';
 import { withTimeout } from '../evaluators/react/utils/timeout.js';
-import { generateJSAIFeedback } from '../evaluators/js/aiFeedback.js';
+import { generateJSAIFeedback, evaluateJSRubric, fetchStudentCode } from '../evaluators/js/aiFeedback.js';
 import { cloneRepo, deleteRepo } from '../evaluators/react/repoService.js';
 import { isDockerAvailable, runJsInDocker } from '../services/dockerSandboxService.js';
 import { webhookPubSub } from '../services/webhookPubSub.js';
@@ -26,6 +26,7 @@ export async function initializeJsWorker() {
             submission,
             testCases,
             entryFunction,
+            entryFile,
             evaluationMode,
             expectedLogs,
             functions
@@ -40,7 +41,7 @@ export async function initializeJsWorker() {
             logger.info(`🐳 JS Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
             const repoPath = await cloneRepo(submission.repoUrl);
             try {
-              results = await runJsInDocker(repoPath, { testCases, entryFunction, evaluationMode, expectedLogs, functions });
+              results = await runJsInDocker(repoPath, { testCases, entryFunction, entryFile, evaluationMode, expectedLogs, functions });
             } finally {
               await deleteRepo(repoPath);
             }
@@ -54,6 +55,7 @@ export async function initializeJsWorker() {
                 const extraPayload = {
                   testCases,
                   entryFunction,
+                  entryFile,
                   evaluationMode,
                   expectedLogs,
                   functions
@@ -80,11 +82,16 @@ export async function initializeJsWorker() {
           let passedCount = 0;
           let totalCount = 0;
 
-          // GitHub Actions sends back evaluation as either:
-          //   - An object  { passed, score, feedback }  (script mode)
-          //   - An array   [{ passed, score }, ...]     (function mode, one entry per test case)
-          // Handle both shapes so we never silently return 0.
-          if (Array.isArray(results)) {
+          // Handle both structured object ({ passedCount, totalCount, score, results }) and legacy array shapes
+          if (typeof results?.passedCount === 'number' && typeof results?.totalCount === 'number') {
+            passedCount = results.passedCount;
+            totalCount = results.totalCount;
+            finalScore = typeof results?.score === 'number' ? results.score : (totalCount > 0 ? (passedCount / totalCount) * 100 : 0);
+          } else if (Array.isArray(results?.results)) {
+            totalCount = results.results.length;
+            passedCount = results.results.filter(r => r.passed).length;
+            finalScore = typeof results?.score === 'number' ? results.score : (totalCount > 0 ? (passedCount / totalCount) * 100 : 0);
+          } else if (Array.isArray(results)) {
             // function mode — array of per-test-case results (legacy fallback)
             totalCount = results.length;
             passedCount = results.filter(r => r.passed).length;
@@ -111,9 +118,10 @@ export async function initializeJsWorker() {
           const globalPassRatio = finalScore / 100;
 
           let rubric = null;
-          if (job.data.rubricText && job.data.rubricText !== 'Standard evaluation') {
+          const rawRubric = job.data.rubric || job.data.rubricText;
+          if (rawRubric && rawRubric !== 'Standard evaluation') {
             try {
-              let r = job.data.rubricText;
+              let r = rawRubric;
               while (typeof r === 'string') {
                 r = JSON.parse(r);
               }
@@ -123,46 +131,54 @@ export async function initializeJsWorker() {
                 rubric = r;
               }
             } catch(e) {
-               logger.warn(`Failed to parse rubricText for JS Job ${job.id}: ${e.message}`);
+               logger.warn(`Failed to parse rubric for JS Job ${job.id}: ${e.message}`);
             }
           }
 
           const breakdown = [];
           const strengths = [];
           const issues = [];
-
-          if (rubric && rubric.criteria && rubric.criteria.length > 0) {
-            finalScore = 0; // Recalculate based on rubric weights
-            for (const c of rubric.criteria) {
-               const maxPts = typeof c.weight === 'number' ? c.weight : (typeof c.score === 'number' ? c.score : 0);
-               const awardedPts = Math.round(maxPts * globalPassRatio);
-               finalScore += awardedPts;
-
-               const reason = totalCount > 0 
-                  ? `Passed ${passedCount}/${totalCount} test cases.` 
-                  : "No test cases run.";
-
-               breakdown.push({
-                 item: c.name,
-                 awarded: awardedPts,
-                 max: maxPts,
-                 reason
-               });
-
-               if (globalPassRatio >= 1.0) {
-                 strengths.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
-               } else if (globalPassRatio >= 0.5) {
-                 strengths.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
-                 issues.push(`[${c.name}] Missed some test cases. (earned ${awardedPts}/${maxPts} marks)`);
-               } else {
-                 issues.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
-               }
+          let studentCode = results?.studentCode || job.data?.submission?.code || '';
+          if (!studentCode || typeof studentCode !== 'string' || studentCode.trim().length < 10) {
+            try {
+              const fetched = await fetchStudentCode(job.data);
+              if (fetched && typeof fetched === 'string' && fetched.trim().length >= 10 && !fetched.startsWith("Code could not")) {
+                studentCode = fetched;
+              }
+            } catch (e) {
+              logger.warn(`Failed to fetch student code fallback for job ${job.id}: ${e.message}`);
             }
           }
 
-          logger.info(`JS Job ${job.id} completed via GitHub Actions. Generating AI feedback...`);
-          
-          const summaryStr = await generateJSAIFeedback(job.data, results, finalScore, breakdown, rubric);
+          let summaryStr = null;
+          if (rubric && rubric.criteria && rubric.criteria.length > 0) {
+            const rubricResult = await evaluateJSRubric(studentCode, rubric, {
+              score: finalScore,
+              passedCount,
+              totalCount,
+              results: results?.results || results,
+              feedback: results?.feedback
+            }, job.id, job.data);
+
+            if (rubricResult) {
+              finalScore = rubricResult.finalScore;
+              breakdown.push(...rubricResult.breakdown);
+              strengths.push(...rubricResult.strengths);
+              issues.push(...rubricResult.issues);
+              if (rubricResult.summary) {
+                summaryStr = rubricResult.summary;
+              }
+            }
+          }
+
+          // Only generate standalone feedback if rubric evaluation didn't already provide a summary
+          if (!summaryStr) {
+            logger.info(`JS Job ${job.id}: Generating standalone AI feedback...`);
+            if (!job.data.submission) job.data.submission = {};
+            if (studentCode) job.data.submission.code = studentCode;
+
+            summaryStr = await generateJSAIFeedback(job.data, results, finalScore, breakdown, rubric);
+          }
           
           const aiFeedbackString = {
             summary: summaryStr,
@@ -178,7 +194,7 @@ export async function initializeJsWorker() {
             evaluation: {
               score: finalScore,
               feedback: aiFeedbackString,
-              details: results
+              details: results?.results || results
             }
           };
         } catch (err) {
@@ -187,17 +203,24 @@ export async function initializeJsWorker() {
         }
       },
       {
-        connection: redisConnection.getClient(),
-        concurrency: config.concurrency,
+        connection: redisConfig,
+        prefix: process.env.QUEUE_PREFIX || 'local',
+        concurrency: Math.max(config.concurrency || 4, 4),
+        drainDelay: 5,
         settings: {
-          maxStalledCount: 2,
-          lockDuration: 30000,
-          lockRenewTime: 15000
+          maxStalledCount: 3,
+          stalledInterval: 10000,
+          lockDuration: 60000,
+          lockRenewTime: 20000
         }
       }
     );
 
     // Event handlers
+    jsWorker.on('active', (job) => {
+      logger.info(`JS Job active: ${job.id}`);
+    });
+
     jsWorker.on('completed', (job, result) => {
       logger.info(`JS Job ${job.id} completed`, {
         duration: job.finishedOn - job.processedOn
@@ -209,6 +232,10 @@ export async function initializeJsWorker() {
         error: err.message,
         attempts: job.attemptsMade
       });
+    });
+
+    jsWorker.on('error', (err) => {
+      logger.error('JS Worker internal error:', err);
     });
 
     logger.info('JavaScript Worker initialized');

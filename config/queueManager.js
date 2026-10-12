@@ -10,7 +10,7 @@
 
 import crypto from 'crypto';
 import { Queue } from 'bullmq';
-import redisConnection from '../config/redis.js';
+import redisConnection, { redisConfig } from '../config/redis.js';
 import logger from './logger.js';
 
 /**
@@ -50,7 +50,7 @@ const QUEUE_CONFIG = {
   
   javascript: {
     jobName: 'javascript-job',
-    concurrency: 5,
+    concurrency: parseInt(process.env.JS_CONCURRENCY) || 4,
     timeout: 180000,      // 3 minutes (accounts for Render cold-start ~50s + GitHub Actions ~13s + AI feedback)
     description: 'JavaScript Evaluation'
   },
@@ -94,13 +94,11 @@ class QueueManager {
     try {
       logger.info('Initializing Queue Manager...');
 
-      // Get Redis client
-      const redisClient = redisConnection.getClient();
-
-      // Create each queue
+      // Create each queue using redisConfig for robust isolated connections
       for (const [type, config] of Object.entries(QUEUE_CONFIG)) {
         this.queues[type] = new Queue(type + '-evaluation', {
-          connection: redisClient,
+          connection: redisConfig,
+          prefix: process.env.QUEUE_PREFIX || 'local',
           
           // Default job options
           defaultJobOptions: {
@@ -217,15 +215,23 @@ class QueueManager {
       }
 
       // Add job to queue with deterministic jobId for deduplication
+      const jobOptions = {
+        jobId: String(jobId),
+        removeOnComplete: { count: 100 },
+        removeOnFail: { count: 100 }
+      };
+
+      // Only assign explicit positive numeric priority if explicitly requested.
+      // Omit priority otherwise so BullMQ pushes jobs to standard FIFO wait list
+      // without stalling behind prioritized ZSET markers.
+      if (typeof payload.priority === 'number' && payload.priority > 0) {
+        jobOptions.priority = payload.priority;
+      }
+
       const job = await queue.add(
         config.jobName,
         payload,
-        {
-          jobId: String(jobId),
-          priority: payload.priority || 10,   // Default priority
-          removeOnComplete: { count: 100 },
-          removeOnFail: { count: 100 }
-        }
+        jobOptions
       );
 
       logger.info(`Job added: ${type}/${job.id}`, {
@@ -298,7 +304,7 @@ class QueueManager {
   async getQueueStats(type) {
     try {
       const queue = this.queues[type];
-      const counts = await queue.getJobCounts();
+      const counts = await queue.getJobCounts('waiting', 'active', 'completed', 'failed', 'delayed', 'paused', 'prioritized');
 
       return {
         evaluator: type,
@@ -309,7 +315,8 @@ class QueueManager {
           completed: counts.completed || 0,
           failed: counts.failed || 0,
           delayed: counts.delayed || 0,
-          paused: counts.paused || 0
+          paused: counts.paused || 0,
+          prioritized: counts.prioritized || 0
         },
         timestamp: new Date().toISOString()
       };

@@ -33,6 +33,8 @@ export async function routeEvaluation(payload) {
           payload.testCases,
         entryFunction:
           payload.entryFunction,
+        entryFile:
+          payload.entryFile,
         functions:
           payload.functions,
         evaluationMode:
