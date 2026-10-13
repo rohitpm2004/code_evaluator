@@ -72,10 +72,14 @@ def check_dual_tolerance(actual: float, expected: float, abs_tol: float = 0.05, 
     threshold = max(abs_tol, rel_tol * abs(expected))
     return diff <= threshold
 
-def is_hardcoded_cheat(formula_str: str) -> bool:
+def is_hardcoded_cheat(formula_str: str, defined_names: Optional[set] = None) -> bool:
     """
     Checks if a formula is actually a cheat/static literal:
-    e.g., '=128450', '="128450"', '=100000+28450' without any cell/range references.
+    e.g., '=128450', '="128450"', '=100000+28450' without any cell/range references or functions.
+    Permits:
+    - Standard functions: =SUM(A1:A5), =DATE(2024, 1, 1)
+    - Zero-arg functions: =TODAY(), =NOW(), =PI(), =RAND()
+    - Named ranges / defined names: e.g. =Tax_Rate * Subtotal
     """
     if not isinstance(formula_str, str) or not formula_str.startswith("="):
         return True # Not even a formula
@@ -88,10 +92,28 @@ def is_hardcoded_cheat(formula_str: str) -> bool:
     if re.fullmatch(r'["\'].*["\']', expr):
         return True
 
-    # Token check: does it contain at least one cell reference like A1, $B$12, Sheet!C4?
+    # Permit standard zero-argument functions and boolean constants
+    zero_arg_functions = r'^(TODAY|NOW|PI|RAND|RANDBETWEEN|TRUE|FALSE)\s*\('
+    if re.search(zero_arg_functions, expr, re.IGNORECASE):
+        return False
+
+    # Check for cell references like A1, $B$12, Sheet!C4
     cell_ref_pattern = r'(\$?[A-Za-z]{1,3}\$?[0-9]{1,7})'
-    if not re.search(cell_ref_pattern, expr):
-        # A formula with no cell references is hardcoded math, e.g. =100+200
+    has_cell_ref = bool(re.search(cell_ref_pattern, expr))
+
+    # Check for any valid Excel function call: e.g. SUM(, DATE(, IF(
+    has_function_call = bool(re.search(r'[A-Za-z_][A-Za-z0-9_\.]*\s*\(', expr))
+
+    # Check for defined names / named ranges if provided
+    has_named_range = False
+    if defined_names:
+        for name in defined_names:
+            if re.search(r'\b' + re.escape(name) + r'\b', expr, re.IGNORECASE):
+                has_named_range = True
+                break
+
+    if not has_cell_ref and not has_function_call and not has_named_range:
+        # A formula with no cell references, no function calls, and no named ranges is hardcoded math, e.g. =100+200
         return True
 
     return False
@@ -263,6 +285,15 @@ def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
 def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[str, Any]) -> Dict[str, Any]:
     wb_orig = openpyxl.load_workbook(original_path, data_only=False)
     wb_recalc = openpyxl.load_workbook(recalculated_path, data_only=True)
+
+    defined_name_set = set()
+    try:
+        if hasattr(wb_orig, 'defined_names') and wb_orig.defined_names:
+            for dn in wb_orig.defined_names.definedName:
+                if dn.name:
+                    defined_name_set.add(dn.name)
+    except Exception:
+        pass
 
     rubric = spec.get("rubric", {})
     criteria = rubric.get("criteria", [])
@@ -513,7 +544,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     for fn in func_matches:
                         detected_formulas.add(fn)
 
-                    if forbidden_constants and is_hardcoded_cheat(formula_str):
+                    if forbidden_constants and is_hardcoded_cheat(formula_str, defined_names=defined_name_set):
                         failures.append(f"{coord}: Anti-cheat triggered: formula '{formula_str}' contains no cell references.")
                         continue
 
@@ -1068,7 +1099,14 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         "reason": f"Table data is complete. All {total_table_cells} table cells are populated."
                     })
             else:
-                fraction = 0.7  # Partial credit if unmapped
+                fraction = 0.0
+                needs_review = True
+                assertion_results.append({
+                    "criterion": c_name,
+                    "type": "unmapped_rubric",
+                    "passed": False,
+                    "reason": f"No automated test assertion or keyword rule mapped for criterion '{c_name}'. Flagged for instructor manual review."
+                })
 
         awarded = round(fraction * weight, 2)
         rubric_breakdown[c_name] = awarded

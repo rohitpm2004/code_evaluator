@@ -684,15 +684,25 @@ export async function runExcelInDocker(workspaceDir, options = {}) {
   const normalizedPath = path.resolve(workspaceDir).replace(/\\/g, "/");
   const containerName = `eval-excel-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dockerImage = process.env.EXCEL_SANDBOX_IMAGE || "eval-excel-sandbox";
+  const reportFilePath = path.join(workspaceDir, "report.json");
 
-  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json"`;
+  // Redirect recalculate.py stdout to /dev/null to prevent stdout pollution, and write runner report to report.json
+  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof > /dev/null && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json > /workspace/report.json"`;
 
   logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
   try {
     const { stdout } = await execPromise(dockerCmd, { timeout: timeoutMs });
+    if (fs.existsSync(reportFilePath)) {
+      const content = fs.readFileSync(reportFilePath, 'utf8');
+      return JSON.parse(content.trim());
+    }
     return JSON.parse(stdout.trim());
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
     throw new Error(`Docker Excel execution failed: ${err.message}`);
+  } finally {
+    try {
+      if (fs.existsSync(reportFilePath)) fs.unlinkSync(reportFilePath);
+    } catch {}
   }
 }

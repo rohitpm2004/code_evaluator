@@ -2,7 +2,7 @@ import { Worker } from 'bullmq';
 import redisConnection, { redisConfig } from '../config/redis.js';
 import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
-import { withTimeout } from '../evaluators/react/utils/timeout.js';
+import { withTimeout } from '../utils/timeout.js';
 import { evaluateExcelSubmission } from '../evaluators/excel/evaluatorService.js';
 
 let excelWorker = null;

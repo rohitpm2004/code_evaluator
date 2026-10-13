@@ -177,7 +177,10 @@ async function validateExcelPayload(payload) {
     if (lower.includes('onedrive') || lower.includes('1drv.ms') || lower.includes('sharepoint.com')) return true;
     if (lower.includes('format=xlsx')) return true;
     const clean = lower.split('?')[0];
-    if (clean.endsWith('.xlsx') || clean.endsWith('.xls') || clean.endsWith('.xlsm')) return true;
+    if (clean.endsWith('.xls')) {
+      throw new ValidationError('Legacy Excel (.xls) format is not supported. Please export or convert your spreadsheet to modern OpenXML (.xlsx).');
+    }
+    if (clean.endsWith('.xlsx') || clean.endsWith('.xlsm')) return true;
     return false;
   };
 

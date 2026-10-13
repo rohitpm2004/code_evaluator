@@ -26,10 +26,5 @@ __pycache__/
 *.pyd
 .pytest_cache/
 
-# Excel test scripts & benchmarks
-scripts/benchmark-excel-queue.mjs
-scripts/download-sample-sheets.js
-scripts/run-excel-golden-suite.mjs
-scripts/test-excel-engine.js
 
 DEPLOY.md
