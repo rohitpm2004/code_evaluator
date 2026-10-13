@@ -169,6 +169,50 @@ function validateFullstackPayload(payload) {
   validateRubricCriteria(rubric);
 }
 
+async function validateExcelPayload(payload) {
+  const isUrlValidSpreadsheet = (url) => {
+    if (!url || typeof url !== 'string') return false;
+    const lower = url.trim().toLowerCase();
+    if (lower.includes('docs.google.com/spreadsheets') || lower.includes('sheets.google.com')) return true;
+    if (lower.includes('onedrive') || lower.includes('1drv.ms') || lower.includes('sharepoint.com')) return true;
+    if (lower.includes('format=xlsx')) return true;
+    const clean = lower.split('?')[0];
+    if (clean.endsWith('.xlsx') || clean.endsWith('.xls') || clean.endsWith('.xlsm')) return true;
+    return false;
+  };
+
+  const urlsToCheck = [];
+
+  if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
+    for (const s of payload.submissions) {
+      const u = s.fileUrl || s.submission_file_url || s.filePath || s.submission_link || s.repoUrl;
+      if (!u || !isUrlValidSpreadsheet(u)) {
+        throw new ValidationError(`Invalid file type in batch: Each submission must be a valid .xlsx file or Google Sheets / Excel link. Received: "${u || 'none'}"`);
+      }
+      urlsToCheck.push(u);
+    }
+  } else {
+    const fileUrl = payload.fileUrl || payload.submission_file_url || payload.filePath || payload.submission_link || payload.repoUrl;
+    if (!fileUrl || typeof fileUrl !== 'string' || !fileUrl.trim()) {
+      throw new ValidationError('fileUrl or filePath is required for excel evaluation');
+    }
+    if (!isUrlValidSpreadsheet(fileUrl)) {
+      throw new ValidationError('Invalid file type: Excel evaluator accepts .xlsx workbooks and Google Sheets / Excel links.');
+    }
+    urlsToCheck.push(fileUrl);
+  }
+
+  for (const u of urlsToCheck) {
+    if (u.startsWith('http://') || u.startsWith('https://')) {
+      await assertSafeUrl(u);
+    }
+  }
+
+  if (payload.rubric) {
+    validateRubricCriteria(payload.rubric);
+  }
+}
+
 export async function evaluate(req, res) {
   try {
     const payload = req.body || {};
@@ -192,6 +236,8 @@ export async function evaluate(req, res) {
       validateJavascriptPayload(payload);
     } else if (payload.type === 'fullstack') {
       validateFullstackPayload(payload);
+    } else if (payload.type === 'excel') {
+      await validateExcelPayload(payload);
     }
 
     const jobs = await routeEvaluation(payload);

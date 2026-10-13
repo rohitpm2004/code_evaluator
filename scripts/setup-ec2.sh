@@ -54,7 +54,12 @@ echo "📥 Pre-pulling sandbox Docker images..."
 sudo docker pull node:18-alpine || true
 sudo docker pull python:3.11-alpine || true
 
-# 7. Create application directory
+# 7. Install Python dependencies and LibreOffice for host evaluation
+echo "🐍 Installing Python3, openpyxl, and LibreOffice Calc..."
+sudo apt-get install -y python3 python3-pip libreoffice-calc fonts-dejavu-core
+pip3 install openpyxl pandas || true
+
+# 8. Create application directory
 APP_DIR="/home/$USER/central-evaluator"
 mkdir -p "$APP_DIR"
 mkdir -p "$APP_DIR/logs"

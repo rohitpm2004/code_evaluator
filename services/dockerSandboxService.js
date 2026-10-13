@@ -23,12 +23,7 @@ export async function isDockerAvailable() {
     dockerAvailableCache = true;
     return true;
   } catch (err) {
-    if (process.env.SANDBOX_MODE === "docker") {
-      logger.warn(`Docker check warning: ${err.message}. Retaining docker mode as configured.`);
-      dockerAvailableCache = true;
-      return true;
-    }
-    logger.warn(`Docker not reachable: ${err.message}. Will fall back to GitHub Actions.`);
+    logger.warn(`Docker not reachable: ${err.message}. Falling back to local execution.`);
     dockerAvailableCache = false;
     return false;
   }
@@ -678,5 +673,26 @@ output_result({'results': results})
   } finally {
     try { fs.unlinkSync(harnessFilePath); } catch {}
     try { fs.unlinkSync(testCasesFilePath); } catch {}
+  }
+}
+
+/**
+ * Runs Excel workbook recalculation & assertion evaluation inside Docker sandbox.
+ */
+export async function runExcelInDocker(workspaceDir, options = {}) {
+  const timeoutMs = options.timeoutMs || 45000;
+  const normalizedPath = path.resolve(workspaceDir).replace(/\\/g, "/");
+  const containerName = `eval-excel-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const dockerImage = process.env.EXCEL_SANDBOX_IMAGE || "eval-excel-sandbox";
+
+  const dockerCmd = `docker run --name ${containerName} --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json"`;
+
+  logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
+  try {
+    const { stdout } = await execPromise(dockerCmd, { timeout: timeoutMs });
+    return JSON.parse(stdout.trim());
+  } catch (err) {
+    execPromise(`docker rm -f ${containerName}`).catch(() => {});
+    throw new Error(`Docker Excel execution failed: ${err.message}`);
   }
 }

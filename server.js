@@ -27,6 +27,7 @@ import { initializeBackendWorker, stopBackendWorker } from './workers/backendWor
 import { initializeReactWorker, stopReactWorker } from './workers/reactWorker.js';
 import { initializePythonWorker, stopPythonWorker } from './workers/pythonWorker.js';
 import { initializeFullstackWorker, stopFullstackWorker } from './workers/fullstackWorker.js';
+import { initializeExcelWorker, stopExcelWorker } from './workers/excelWorker.js';
 
 import { requireApiKey, evaluateRateLimiter } from './middleware/auth.js';
 import webhookRouter from './router/webhookRouter.js';
@@ -75,6 +76,9 @@ async function startServer() {
 
     await initializeFullstackWorker();
     logger.info('✅ Fullstack worker initialized');
+
+    await initializeExcelWorker();
+    logger.info('✅ Excel worker initialized');
 
     // 4. API routes (V-04: rate limit + API-key auth)
     app.post('/evaluate', evaluateRateLimiter, requireApiKey, evaluate);
@@ -192,6 +196,7 @@ async function shutdown(signal) {
     await stopReactWorker();
     await stopPythonWorker();
     await stopFullstackWorker();
+    await stopExcelWorker();
     await queueManager.disconnect();
     logger.info('Shutdown complete');
     process.exit(0);

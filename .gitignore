@@ -16,5 +16,20 @@ evaluators/visual/final_scores.json
 
 # local test/screenshot output
 manual-test-output/
+test/
+*.xlsx
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Excel test scripts & benchmarks
+scripts/benchmark-excel-queue.mjs
+scripts/download-sample-sheets.js
+scripts/run-excel-golden-suite.mjs
+scripts/test-excel-engine.js
 
 DEPLOY.md

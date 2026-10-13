@@ -67,6 +67,13 @@ const QUEUE_CONFIG = {
     concurrency: 2,       // Combines multiple evaluations
     timeout: 300000,      // 5 minutes
     description: 'Full Stack Evaluation'
+  },
+
+  excel: {
+    jobName: 'excel-job',
+    concurrency: parseInt(process.env.EXCEL_CONCURRENCY) || 3,
+    timeout: 120000,      // 2 minutes
+    description: 'Excel Spreadsheet Evaluation'
   }
 };
 
@@ -94,36 +101,29 @@ class QueueManager {
     try {
       logger.info('Initializing Queue Manager...');
 
-      // Create each queue using redisConfig for robust isolated connections
+      // Use shared Redis connection across all queues to minimize client connections
+      const sharedConnection = redisConnection.connect();
+
       for (const [type, config] of Object.entries(QUEUE_CONFIG)) {
         this.queues[type] = new Queue(type + '-evaluation', {
-          connection: redisConfig,
+          connection: sharedConnection,
           prefix: process.env.QUEUE_PREFIX || 'local',
           
           // Default job options
           defaultJobOptions: {
-            // Retry failed jobs
             attempts: 3,
             backoff: {
               type: 'exponential',
-              delay: 2000  // Start with 2 sec, exponential increase
+              delay: 2000
             },
-
-            // NOTE (V-08): BullMQ v5 removed the per-job `timeout` option — it was
-            // a no-op. Real timeouts are now enforced inside the worker via
-            // withTimeout(config.timeout).
-
-            // Remove completed jobs after 1 hour
             removeOnComplete: {
               age: 3600
             },
-            
-            // Keep failed jobs for debugging (remove after 7 days)
             removeOnFail: false
           }
         });
 
-        // Add event listeners
+        // Add error listener
         this.setupQueueListeners(type);
 
         logger.info(`Queue created: ${type}-evaluation (concurrency: ${config.concurrency})`);
@@ -147,16 +147,6 @@ class QueueManager {
     // Error handling
     queue.on('error', (err) => {
       logger.error(`Queue error (${type}):`, err);
-    });
-
-    // Stalled job (took too long)
-    queue.on('stalled', (jobId) => {
-      logger.warn(`Job stalled: ${type}/${jobId}`);
-    });
-
-    // Job waiting
-    queue.on('waiting', (job) => {
-      logger.info(`Job waiting: ${type}/${job.id}`);
     });
   }
 

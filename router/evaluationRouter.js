@@ -16,7 +16,7 @@ export async function routeEvaluation(payload) {
     // logger.info(`Job routed: ${type}`, { jobId: job.id });
     // return job;
     if (
-  ['javascript', 'visual', 'python'].includes(type) &&
+  ['javascript', 'visual', 'python', 'excel'].includes(type) &&
   payload.submissions
 ) {
 
@@ -29,6 +29,10 @@ export async function routeEvaluation(payload) {
         type,
       {
         submission,
+        fileUrl:
+          submission.fileUrl || submission.submission_file_url || submission.filePath || submission.submission_link || submission.repoUrl,
+        submissionId:
+          submission.submissionId || submission.id,
         testCases:
           payload.testCases,
         entryFunction:
