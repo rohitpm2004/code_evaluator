@@ -46,6 +46,9 @@ app.use(express.json({ limit: process.env.MAX_BODY_SIZE || '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Startup sequence
+/**
+ * Connect Redis, initialize queues and workers, register API routes, and start the HTTP server.
+ */
 async function startServer() {
   try {
     logger.info('🚀 Starting evaluator system...');
@@ -178,6 +181,9 @@ process.on('uncaughtException', (err) => {
 // then close queues/Redis. A hard-exit timer guards against a hung close
 // so we never leak zombie Chromium processes across a deploy.
 let shuttingDown = false;
+/**
+ * Drain workers and disconnect queues on shutdown, with a deadline that forces process exit.
+ */
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;

@@ -8,6 +8,9 @@ import logger from '../config/logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
+/**
+ * Verify Excel payload rejection and queue registration, logging the observed results.
+ */
 async function runTests() {
   console.log('🧪 Starting Excel Evaluator End-to-End Verification Tests...\n');
 

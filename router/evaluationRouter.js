@@ -2,6 +2,10 @@ import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { ValidationError } from '../controller/evaluatorController.js';
 
+/**
+ * Enqueue an evaluation payload or supported batch and return the created job or jobs.
+ * @throws {ValidationError} When the evaluator type is not registered.
+ */
 export async function routeEvaluation(payload) {
   const { type } = payload;
 

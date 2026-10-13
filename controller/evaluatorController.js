@@ -169,7 +169,14 @@ function validateFullstackPayload(payload) {
   validateRubricCriteria(rubric);
 }
 
+/**
+ * Validate single or batch Excel file references, remote URLs, and optional rubric criteria.
+ * @throws {ValidationError} When a required file reference or its format is invalid.
+ */
 async function validateExcelPayload(payload) {
+  /**
+   * Recognize supported workbook paths and spreadsheet links; reject legacy .xls files.
+   */
   const isUrlValidSpreadsheet = (url) => {
     if (!url || typeof url !== 'string') return false;
     const lower = url.trim().toLowerCase();
@@ -216,6 +223,9 @@ async function validateExcelPayload(payload) {
   }
 }
 
+/**
+ * Validate an evaluation request, enqueue its submissions, and respond with job IDs or errors.
+ */
 export async function evaluate(req, res) {
   try {
     const payload = req.body || {};

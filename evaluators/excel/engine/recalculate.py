@@ -95,6 +95,10 @@ def fallback_copy(input_file, output_file):
     return True, "Recalculation fallback: Copied original workbook (using existing cached XML values)."
 
 def main():
+    """Recalculate the input workbook from CLI arguments and emit JSON status.
+
+    Fall back to copying cached values if recalculation fails and clean up any temporary profile.
+    """
     parser = argparse.ArgumentParser(description="LibreOffice Headless Recalculation Adapter")
     parser.add_argument("--input", required=True, help="Path to original input .xlsx file")
     parser.add_argument("--output", required=True, help="Path to write recalculated .xlsx file")

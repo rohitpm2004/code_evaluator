@@ -3,6 +3,9 @@ import logger from "../../config/logger.js";
 
 let client = null;
 
+/**
+ * Return the cached AI client, create it when configured, or return null without an API key.
+ */
 function getClient() {
   if (client) return client;
 

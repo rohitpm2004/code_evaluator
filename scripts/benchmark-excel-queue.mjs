@@ -19,6 +19,9 @@ const queue = new Queue(queueName, {
   prefix
 });
 
+/**
+ * Enqueue a burst of Excel fixture jobs, wait for the queue to drain, and return throughput metrics.
+ */
 async function runBenchmark(jobCount = 100) {
   console.log(`\n▶ Starting Load Benchmark: ${jobCount} Submissions Burst...`);
 
@@ -106,6 +109,9 @@ async function runBenchmark(jobCount = 100) {
   };
 }
 
+/**
+ * Run the benchmark with the CLI job count and close the queue before exiting.
+ */
 async function main() {
   try {
     const args = process.argv.slice(2);

@@ -32,6 +32,7 @@ except ImportError:
         from engine.recalculate import recalculate_via_cli
     except ImportError:
         def recalculate_via_cli(in_f, out_f, prof_d, timeout_sec=20):
+            """Copy the workbook and report unavailable recalculation when adapter imports fail."""
             shutil.copy2(in_f, out_f)
             return False, "recalculate_via_cli not available"
 
@@ -283,6 +284,10 @@ def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
     return info
 
 def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[str, Any]) -> Dict[str, Any]:
+    """Inspect original workbook features and recalculated values against the test spec.
+
+    Return rubric scores, assertion evidence, detected features, warnings, and review status.
+    """
     wb_orig = openpyxl.load_workbook(original_path, data_only=False)
     wb_recalc = openpyxl.load_workbook(recalculated_path, data_only=True)
 
@@ -1132,6 +1137,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     }
 
 def main():
+    """Read workbook paths and a JSON spec from CLI arguments, then emit a report or error as JSON."""
     parser = argparse.ArgumentParser(description="Dual-Workbook Assertion Inspector")
     parser.add_argument("--original", required=True, help="Path to original student .xlsx")
     parser.add_argument("--recalculated", required=True, help="Path to recalculated .xlsx")

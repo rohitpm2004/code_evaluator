@@ -20,6 +20,9 @@ console.log('================================================================\n'
 let passCount = 0;
 let failCount = 0;
 
+/**
+ * Log a named assertion result and increment the suite pass or fail counter.
+ */
 function assert(condition, testName, details = '') {
   if (condition) {
     console.log(`✅ PASS: ${testName}`);
@@ -30,6 +33,9 @@ function assert(condition, testName, details = '') {
   }
 }
 
+/**
+ * Check Excel ingestion and queue configuration, generate fixtures, and verify golden scoring scenarios.
+ */
 async function run() {
   // -------------------------------------------------------------
   // TEST SUITE 1: API & Security Validation
@@ -275,6 +281,9 @@ print("All 15 golden fixtures generated successfully.")
     console.error('Failed to generate fixtures:', genErr.message);
   }
 
+  /**
+   * Run the Python inspector with a temporary JSON specification, return its report, and remove the spec.
+   */
   async function runRunner(orig, recalc, specObj) {
     const tmpSpec = path.join(os.tmpdir(), `test-spec-${Date.now()}-${Math.random().toString(36).substring(7)}.json`);
     await fsp.writeFile(tmpSpec, JSON.stringify(specObj), 'utf8');

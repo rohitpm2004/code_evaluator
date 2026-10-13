@@ -7,6 +7,9 @@ import { evaluateExcelSubmission } from '../evaluators/excel/evaluatorService.js
 
 let excelWorker = null;
 
+/**
+ * Create and return the Excel queue worker with configured concurrency and evaluation timeouts.
+ */
 export async function initializeExcelWorker() {
   try {
     logger.info('Initializing Excel Worker...');
@@ -70,6 +73,9 @@ export async function initializeExcelWorker() {
   }
 }
 
+/**
+ * Wait for the Excel worker to close and clear the stored worker reference.
+ */
 export async function stopExcelWorker() {
   if (excelWorker) {
     logger.info('Stopping Excel Worker...');
@@ -79,6 +85,9 @@ export async function stopExcelWorker() {
   }
 }
 
+/**
+ * Return the current Excel worker, or null before initialization or after shutdown.
+ */
 export function getExcelWorker() {
   return excelWorker;
 }

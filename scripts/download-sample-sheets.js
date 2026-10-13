@@ -24,6 +24,9 @@ const sheets = [
   }
 ];
 
+/**
+ * Download the configured sample workbooks to targetDir, logging individual download failures.
+ */
 async function downloadSheets() {
   console.log('Downloading sample sheets to:', targetDir);
   for (const s of sheets) {
