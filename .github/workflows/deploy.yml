@@ -37,11 +37,12 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Pull latest changes
-            echo "📥 Pulling latest changes from branch main..."
+            # Pull latest changes from selected branch
+            DEPLOY_BRANCH="${{ github.ref_name }}"
+            echo "📥 Pulling latest changes from branch $DEPLOY_BRANCH..."
             git fetch --all
-            git checkout main
-            git reset --hard origin/main
+            git checkout "$DEPLOY_BRANCH"
+            git reset --hard "origin/$DEPLOY_BRANCH"
 
             # Inject / update .env file if provided in GitHub Secrets
             if [ -n "${{ secrets.ENV_FILE }}" ]; then
