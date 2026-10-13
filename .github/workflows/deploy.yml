@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feat/excel-evaluator-engine
   workflow_dispatch:
 
 jobs:
@@ -55,9 +56,10 @@ jobs:
             npm ci --omit=dev || npm install --omit=dev
 
             # Install Python dependencies for Excel dual-workbook evaluation
-            echo "🐍 Installing Python dependencies (openpyxl)..."
+            echo "🐍 Installing Python dependencies (openpyxl, pandas)..."
+            sudo apt-get update -y && sudo apt-get install -y python3-openpyxl python3-pandas || true
             if command -v pip3 &> /dev/null; then
-              pip3 install -r requirements.txt || true
+              pip3 install -r requirements.txt --break-system-packages || pip3 install -r requirements.txt || true
             elif command -v pip &> /dev/null; then
               pip install -r requirements.txt || true
             fi

@@ -685,7 +685,7 @@ export async function runExcelInDocker(workspaceDir, options = {}) {
   const containerName = `eval-excel-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const dockerImage = process.env.EXCEL_SANDBOX_IMAGE || "eval-excel-sandbox";
 
-  const dockerCmd = `docker run --name ${containerName} --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json"`;
+  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json"`;
 
   logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
   try {
