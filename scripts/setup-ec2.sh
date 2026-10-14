@@ -53,6 +53,10 @@ sudo systemctl restart docker
 echo "📥 Pre-pulling sandbox Docker images..."
 sudo docker pull node:20-slim || true
 sudo docker pull python:3.11-alpine || true
+if [ -f "docker/Dockerfile.excel" ]; then
+  echo "📊 Building Excel isolated sandbox container..."
+  sudo docker build -f docker/Dockerfile.excel -t eval-excel-sandbox . || true
+fi
 
 # 7. Install Python dependencies and LibreOffice for host evaluation
 echo "🐍 Installing Python3, openpyxl, and LibreOffice Calc..."

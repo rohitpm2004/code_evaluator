@@ -296,17 +296,14 @@ export async function evaluateExcelSubmission(jobData, jobId) {
         logger.info(`🐳 Excel Job ${jobId}: Using Docker sandbox container.`);
         report = await runExcelInDocker(tempWorkspace);
       } catch (dockerErr) {
-        logger.error(`Docker Excel execution encountered error: ${dockerErr.message}.`);
-        if (process.env.NODE_ENV === "production") {
-          throw new Error(`Docker Excel execution failed in production: ${dockerErr.message}`);
+        logger.error(`Docker Excel execution encountered error: ${dockerErr.message}. Falling back to local engine.`);
+        try {
+          report = await runLocalExcelEngine(originalFile, recalculatedFile, specFile, profileDir);
+        } catch (localErr) {
+          throw new Error(`Docker Excel execution failed (${dockerErr.message}) and local fallback failed (${localErr.message}). Build the image with 'docker build -t eval-excel-sandbox -f docker/Dockerfile.excel .'`);
         }
-        logger.warn(`Non-production environment: Falling back to local engine.`);
-        report = await runLocalExcelEngine(originalFile, recalculatedFile, specFile, profileDir);
       }
     } else {
-      if (process.env.NODE_ENV === "production" && sandboxMode === "docker") {
-        throw new Error("Docker is not available on production server. Cannot evaluate Excel workbook safely.");
-      }
       logger.info(`💻 Excel Job ${jobId}: Running via local engine.`);
       report = await runLocalExcelEngine(originalFile, recalculatedFile, specFile, profileDir);
     }

@@ -520,6 +520,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             accepted_funcs = [f.upper() for f in tc.get("acceptedFunctions", [])]
             forbidden_constants = tc.get("forbiddenConstants", True)
             must_be_formula = tc.get("mustBeFormula", True)
+            require_absolute = tc.get("requireAbsoluteReferences", False)
 
             cells_to_check = []
             if ":" in range_str:
@@ -551,6 +552,10 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
                     if forbidden_constants and is_hardcoded_cheat(formula_str, defined_names=defined_name_set):
                         failures.append(f"{coord}: Anti-cheat triggered: formula '{formula_str}' contains no cell references.")
+                        continue
+
+                    if require_absolute and "$" not in formula_str:
+                        failures.append(f"{coord}: Formula '{formula_str}' does not use absolute cell references ($).")
                         continue
 
                     if accepted_funcs:
@@ -640,14 +645,25 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         failures.append(f"{coord}: Cell is empty; expected entered data.")
                         continue
 
-                # Number format / currency check
+                # Number format / currency / decimal check
                 if req_format is not None:
                     fmt = str(cell.number_format or "")
                     val_str = str(cell.value or "")
-                    if str(req_format).lower() == "currency":
+                    fmt_lower = str(req_format).lower()
+                    if fmt_lower == "currency":
                         is_curr = any(sym in fmt for sym in ["$", "₹", "€", "£", "¥", "Rs", "INR", "USD", "EUR"]) or "[$" in fmt or "0.00" in fmt or any(sym in val_str for sym in ["$", "₹", "€", "£", "¥", "Rs"])
                         if not is_curr:
                             failures.append(f"{coord}: Number format '{fmt}' is not a currency format.")
+                            continue
+                    elif fmt_lower in ["decimal", "decimals", "0.00"]:
+                        is_decimal = "0.00" in fmt or ".0" in fmt or (isinstance(cell.value, float) and round(cell.value, 2) == cell.value)
+                        if not is_decimal:
+                            failures.append(f"{coord}: Number format '{fmt}' is not a two-decimal format.")
+                            continue
+                    elif fmt_lower in ["percent", "percentage", "%"]:
+                        is_pct = "%" in fmt or "%" in val_str
+                        if not is_pct:
+                            failures.append(f"{coord}: Number format '{fmt}' is not a percentage format.")
                             continue
 
                 passed_cells += 1
