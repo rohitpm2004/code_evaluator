@@ -51,7 +51,7 @@ sudo systemctl restart docker
 
 # 6. Pre-pull Docker sandbox images for instant evaluations
 echo "📥 Pre-pulling sandbox Docker images..."
-sudo docker pull node:18-alpine || true
+sudo docker pull node:20-slim || true
 sudo docker pull python:3.11-alpine || true
 
 # 7. Install Python dependencies and LibreOffice for host evaluation

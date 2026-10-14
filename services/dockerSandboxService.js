@@ -51,8 +51,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
   const normalizedPath = path.resolve(repoPath).replace(/\\/g, "/");
 
   let containerCmd = options.command;
-  let dockerImage = "node:18-alpine";
-  let cacheVolume = "central-eval-npm-cache:/root/.npm";
+  let dockerImage = options.image || (language === "python" ? "python:3.11-alpine" : (process.env.NODE_SANDBOX_IMAGE || "node:20-slim"));
+  let cacheVolume = language === "python" ? "central-eval-pip-cache:/root/.cache/pip" : "central-eval-npm-cache:/root/.npm";
 
   if (language === "python") {
     dockerImage = "python:3.11-alpine";
@@ -78,8 +78,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
       }
 
       containerCmd = hasBuildScript
-        ? "npm install --prefer-offline --no-audit --progress=false && npm run build"
-        : "npm install --prefer-offline --no-audit --progress=false";
+        ? "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false && npm run build"
+        : "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false";
     }
   }
 
@@ -552,7 +552,7 @@ import { createRequire } from 'module';
 
   fs.writeFileSync(harnessFilePath, harnessCode, "utf-8");
   const containerName = `eval-js-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:18-alpine node ${harnessFileName}`;
+  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:20-slim node ${harnessFileName}`;
 
   let studentCode = "";
   try {

@@ -71,7 +71,7 @@ jobs:
             # Pre-pull Docker sandbox images and build Excel sandbox container
             if command -v docker &> /dev/null; then
               echo "🐳 Pre-pulling Docker sandbox runner images..."
-              docker pull node:18-alpine || true
+              docker pull node:20-slim || true
               docker pull python:3.11-alpine || true
               echo "📊 Building Excel isolated sandbox container..."
               docker build -f docker/Dockerfile.excel -t eval-excel-sandbox . || true
