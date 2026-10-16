@@ -687,7 +687,8 @@ export async function runExcelInDocker(workspaceDir, options = {}) {
   const reportFilePath = path.join(workspaceDir, "report.json");
 
   // Redirect recalculate.py stdout to /dev/null to prevent stdout pollution, and write runner report to report.json
-  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c "python3 /sandbox/recalculate.py --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof > /dev/null && python3 /sandbox/excel_runner.py --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json > /workspace/report.json"`;
+  // Prioritize /workspace/ engine scripts if mounted from host workspace
+  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh -c 'RECALC=/sandbox/recalculate.py; [ -f /workspace/recalculate.py ] && RECALC=/workspace/recalculate.py; RUNNER=/sandbox/excel_runner.py; [ -f /workspace/excel_runner.py ] && RUNNER=/workspace/excel_runner.py; python3 "$RECALC" --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof > /dev/null && python3 "$RUNNER" --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json > /workspace/report.json'`;
 
   logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
   try {

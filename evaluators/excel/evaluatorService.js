@@ -240,6 +240,20 @@ export async function evaluateExcelSubmission(jobData, jobId) {
   const specFile = path.join(tempWorkspace, "test_spec.json");
   const profileDir = path.join(tempWorkspace, "lo_profile");
 
+  // Ensure Docker sandbox runs latest host engine scripts without requiring image rebuild
+  try {
+    const engineRunnerSrc = path.resolve(__dirname, "engine/excel_runner.py");
+    const engineRecalcSrc = path.resolve(__dirname, "engine/recalculate.py");
+    if (fs.existsSync(engineRunnerSrc)) {
+      await fsp.copyFile(engineRunnerSrc, path.join(tempWorkspace, "excel_runner.py"));
+    }
+    if (fs.existsSync(engineRecalcSrc)) {
+      await fsp.copyFile(engineRecalcSrc, path.join(tempWorkspace, "recalculate.py"));
+    }
+  } catch (copyErr) {
+    logger.warn(`Failed to copy engine scripts to temp workspace: ${copyErr.message}`);
+  }
+
   try {
     // Phase 1: Download or copy immutable original file
     if (fileUrl) {
