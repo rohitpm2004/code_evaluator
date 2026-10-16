@@ -1,3 +1,4 @@
+import os from 'os';
 import { Worker } from 'bullmq';
 import redisConnection, { redisConfig } from '../config/redis.js';
 import queueManager from '../config/queueManager.js';
@@ -19,6 +20,16 @@ export async function initializeExcelWorker() {
       timeout: 60000,
       attempts: 2
     };
+
+    // P2 Resilience Safeguard: Limit concurrency to os.cpus().length or max 5 concurrent workers
+    // to prevent memory spikes from parallel openpyxl / LibreOffice recalculation processes.
+    const cpuCount = os.cpus()?.length || 2;
+    const maxSafeConcurrency = Math.min(Math.max(1, cpuCount), 5);
+    const envConcurrency = parseInt(process.env.EXCEL_CONCURRENCY, 10);
+    const targetConcurrency = !isNaN(envConcurrency) ? envConcurrency : (config.concurrency || 2);
+    const effectiveConcurrency = Math.min(Math.max(1, targetConcurrency), maxSafeConcurrency);
+
+    logger.info(`Excel Worker concurrency set to ${effectiveConcurrency} (detected cores: ${cpuCount}, max safe cap: 5)`);
 
     excelWorker = new Worker(
       'excel-evaluation',
@@ -42,7 +53,7 @@ export async function initializeExcelWorker() {
       {
         connection: redisConfig,
         prefix: process.env.QUEUE_PREFIX || 'local',
-        concurrency: config.concurrency || 2,
+        concurrency: effectiveConcurrency,
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,

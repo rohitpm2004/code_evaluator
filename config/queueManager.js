@@ -8,6 +8,7 @@
  * - Redis connection
  */
 
+import os from 'os';
 import crypto from 'crypto';
 import { Queue } from 'bullmq';
 import redisConnection, { redisConfig } from '../config/redis.js';
@@ -71,7 +72,7 @@ const QUEUE_CONFIG = {
 
   excel: {
     jobName: 'excel-job',
-    concurrency: parseInt(process.env.EXCEL_CONCURRENCY) || 3,
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 2), Math.min(os.cpus()?.length || 2, 5)),
     timeout: 120000,      // 2 minutes
     description: 'Excel Spreadsheet Evaluation'
   }
