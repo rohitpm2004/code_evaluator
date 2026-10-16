@@ -51,10 +51,19 @@ sudo systemctl restart docker
 
 # 6. Pre-pull Docker sandbox images for instant evaluations
 echo "📥 Pre-pulling sandbox Docker images..."
-sudo docker pull node:18-alpine || true
+sudo docker pull node:20-slim || true
 sudo docker pull python:3.11-alpine || true
+if [ -f "docker/Dockerfile.excel" ]; then
+  echo "📊 Building Excel isolated sandbox container..."
+  sudo docker build -f docker/Dockerfile.excel -t eval-excel-sandbox . || true
+fi
 
-# 7. Create application directory
+# 7. Install Python dependencies and LibreOffice for host evaluation
+echo "🐍 Installing Python3, openpyxl, and LibreOffice Calc..."
+sudo apt-get install -y python3 python3-pip python3-openpyxl python3-pandas libreoffice-calc fonts-dejavu-core
+pip3 install openpyxl pandas --break-system-packages || pip3 install openpyxl pandas || true
+
+# 8. Create application directory
 APP_DIR="/home/$USER/central-evaluator"
 mkdir -p "$APP_DIR"
 mkdir -p "$APP_DIR/logs"

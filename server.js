@@ -27,6 +27,7 @@ import { initializeBackendWorker, stopBackendWorker } from './workers/backendWor
 import { initializeReactWorker, stopReactWorker } from './workers/reactWorker.js';
 import { initializePythonWorker, stopPythonWorker } from './workers/pythonWorker.js';
 import { initializeFullstackWorker, stopFullstackWorker } from './workers/fullstackWorker.js';
+import { initializeExcelWorker, stopExcelWorker } from './workers/excelWorker.js';
 
 import { requireApiKey, evaluateRateLimiter } from './middleware/auth.js';
 import webhookRouter from './router/webhookRouter.js';
@@ -45,6 +46,9 @@ app.use(express.json({ limit: process.env.MAX_BODY_SIZE || '2mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Startup sequence
+/**
+ * Connect Redis, initialize queues and workers, register API routes, and start the HTTP server.
+ */
 async function startServer() {
   try {
     logger.info('🚀 Starting evaluator system...');
@@ -75,6 +79,9 @@ async function startServer() {
 
     await initializeFullstackWorker();
     logger.info('✅ Fullstack worker initialized');
+
+    await initializeExcelWorker();
+    logger.info('✅ Excel worker initialized');
 
     // 4. API routes (V-04: rate limit + API-key auth)
     app.post('/evaluate', evaluateRateLimiter, requireApiKey, evaluate);
@@ -174,6 +181,9 @@ process.on('uncaughtException', (err) => {
 // then close queues/Redis. A hard-exit timer guards against a hung close
 // so we never leak zombie Chromium processes across a deploy.
 let shuttingDown = false;
+/**
+ * Drain workers and disconnect queues on shutdown, with a deadline that forces process exit.
+ */
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -192,6 +202,7 @@ async function shutdown(signal) {
     await stopReactWorker();
     await stopPythonWorker();
     await stopFullstackWorker();
+    await stopExcelWorker();
     await queueManager.disconnect();
     logger.info('Shutdown complete');
     process.exit(0);
