@@ -13,6 +13,7 @@ import redisConnection from './config/redis.js';
 if (process.env.BASE_URL) {
   process.env.BASE_URL = process.env.BASE_URL.trim();
 }
+// Reload trigger for fullstack evaluator root preservation fix
 
 // Initialize workers
 // NOTE: visual + javascript + backend are started for this deploy (backend

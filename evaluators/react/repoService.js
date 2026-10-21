@@ -19,7 +19,7 @@ const TEMP_DIR = path.join(process.cwd(), 'temp');
  * @param {string} repoUrl - Remote URL or local directory path
  * @returns {Promise<string>} - Absolute path to the project root
  */
-export async function cloneRepo(repoUrl) {
+export async function cloneRepo(repoUrl, options = {}) {
   if (!repoUrl) {
     throw new Error('repoUrl or local project path is required');
   }
@@ -62,19 +62,29 @@ export async function cloneRepo(repoUrl) {
   }
 
   // 4. Auto-detect subfolder if root has no package.json/src, but a subfolder does (Monorepo detection)
+  // CRITICAL: If options.preserveRoot is true, OR if there are multiple subprojects (e.g. backend AND frontend),
+  // NEVER narrow down to a single subfolder, because fullstack evaluators require the whole repo.
   const hasRootPackage = fs.existsSync(path.join(repoPath, 'package.json'));
   const hasRootSrc = fs.existsSync(path.join(repoPath, 'src'));
 
-  if (!hasRootPackage && !hasRootSrc) {
-    const entries = fs.readdirSync(repoPath, { withFileTypes: true });
-    for (const entry of entries) {
-      if (entry.isDirectory() && !entry.name.startsWith('.')) {
-        const subCandidate = path.join(repoPath, entry.name);
-        if (fs.existsSync(path.join(subCandidate, 'package.json')) || fs.existsSync(path.join(subCandidate, 'src'))) {
-          logger.info(`Auto-detected React project inside monorepo subfolder: ${entry.name}`);
-          return subCandidate;
-        }
-      }
+  if (!hasRootPackage && !hasRootSrc && !options.preserveRoot) {
+    const entries = fs.readdirSync(repoPath, { withFileTypes: true }).filter((e) => e.isDirectory() && !e.name.startsWith('.'));
+    const subprojects = entries.filter((entry) => {
+      const subCandidate = path.join(repoPath, entry.name);
+      return (
+        fs.existsSync(path.join(subCandidate, 'package.json')) ||
+        fs.existsSync(path.join(subCandidate, 'src')) ||
+        fs.existsSync(path.join(subCandidate, 'server.js')) ||
+        fs.existsSync(path.join(subCandidate, 'app.js'))
+      );
+    });
+
+    // Only narrow if there is exactly ONE candidate subfolder (e.g. repo/client or repo/frontend only).
+    // If there are multiple (e.g. backend + frontend), preserve the root so both are evaluated!
+    if (subprojects.length === 1) {
+      const targetSub = path.join(repoPath, subprojects[0].name);
+      logger.info(`Auto-detected single project subfolder inside monorepo: ${subprojects[0].name}`);
+      return targetSub;
     }
   }
 
