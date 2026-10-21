@@ -1,0 +1,24 @@
+# Dedicated Isolated Sandbox for Excel Sheet Evaluation
+# Image: eval-excel-sandbox
+
+FROM python:3.11-slim
+
+# Install LibreOffice Calc, Python UNO bridge, and font libraries
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libreoffice-calc \
+    python3-uno \
+    fonts-dejavu-core \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /sandbox
+
+# Install openpyxl and pandas
+RUN pip install --no-cache-dir openpyxl pandas
+
+# Copy evaluation scripts
+COPY evaluators/excel/engine/recalculate.py /sandbox/recalculate.py
+COPY evaluators/excel/engine/excel_runner.py /sandbox/excel_runner.py
+
+RUN chmod +x /sandbox/recalculate.py /sandbox/excel_runner.py
+
+CMD ["python3"]
