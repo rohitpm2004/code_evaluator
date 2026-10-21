@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - main
+      - feat/excel-evaluator-engine
   workflow_dispatch:
 
 jobs:
@@ -37,11 +38,12 @@ jobs:
 
             cd "$APP_DIR"
 
-            # Pull latest changes
-            echo "📥 Pulling latest changes from branch main..."
+            # Pull latest changes from selected branch
+            DEPLOY_BRANCH="${{ github.ref_name }}"
+            echo "📥 Pulling latest changes from branch $DEPLOY_BRANCH..."
             git fetch --all
-            git checkout main
-            git reset --hard origin/main
+            git checkout "$DEPLOY_BRANCH"
+            git reset --hard "origin/$DEPLOY_BRANCH"
 
             # Inject / update .env file if provided in GitHub Secrets
             if [ -n "${{ secrets.ENV_FILE }}" ]; then
@@ -49,19 +51,30 @@ jobs:
               echo "${{ secrets.ENV_FILE }}" > .env
             fi
 
-            # Install dependencies
+            # Install Node dependencies
             echo "📦 Installing production dependencies..."
             npm ci --omit=dev || npm install --omit=dev
+
+            # Install Python dependencies for Excel dual-workbook evaluation
+            echo "🐍 Installing Python dependencies (openpyxl, pandas)..."
+            sudo apt-get update -y && sudo apt-get install -y python3-openpyxl python3-pandas || true
+            if command -v pip3 &> /dev/null; then
+              pip3 install -r requirements.txt --break-system-packages || pip3 install -r requirements.txt || true
+            elif command -v pip &> /dev/null; then
+              pip install -r requirements.txt || true
+            fi
 
             # Ensure Playwright dependencies & browser are installed for visual evaluator
             echo "🎭 Installing Playwright Chromium dependencies..."
             npx playwright install --with-deps chromium || true
 
-            # Pre-pull Docker sandbox images for sub-second evaluations
+            # Pre-pull Docker sandbox images and build Excel sandbox container
             if command -v docker &> /dev/null; then
               echo "🐳 Pre-pulling Docker sandbox runner images..."
-              docker pull node:18-alpine || true
+              docker pull node:20-slim || true
               docker pull python:3.11-alpine || true
+              echo "📊 Building Excel isolated sandbox container..."
+              docker build -f docker/Dockerfile.excel -t eval-excel-sandbox . || true
             fi
 
             # Ensure PM2 is installed globally

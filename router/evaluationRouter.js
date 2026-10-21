@@ -2,6 +2,10 @@ import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { ValidationError } from '../controller/evaluatorController.js';
 
+/**
+ * Enqueue an evaluation payload or supported batch and return the created job or jobs.
+ * @throws {ValidationError} When the evaluator type is not registered.
+ */
 export async function routeEvaluation(payload) {
   const { type } = payload;
 
@@ -16,7 +20,7 @@ export async function routeEvaluation(payload) {
     // logger.info(`Job routed: ${type}`, { jobId: job.id });
     // return job;
     if (
-  ['javascript', 'visual', 'python'].includes(type) &&
+  ['javascript', 'visual', 'python', 'excel'].includes(type) &&
   payload.submissions
 ) {
 
@@ -29,6 +33,10 @@ export async function routeEvaluation(payload) {
         type,
       {
         submission,
+        fileUrl:
+          submission.fileUrl || submission.submission_file_url || submission.filePath || submission.submission_link || submission.repoUrl,
+        submissionId:
+          submission.submissionId || submission.id,
         testCases:
           payload.testCases,
         entryFunction:
