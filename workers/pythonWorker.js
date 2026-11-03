@@ -23,7 +23,7 @@ export async function initializePythonWorker() {
           try {
             logger.info(`Starting Python evaluation: ${job.id}`);
             const { submission, testCases, evaluationMode, entryFunction, expectedLogs } = job.data;
-            const repoUrl = submission.repoUrl;
+            const repoUrl = submission?.repoUrl || submission?.fileUrl || job.data?.fileUrl || job.data?.repoUrl;
 
             // Phase 0: Check if Docker Sandbox is enabled and available
             const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
@@ -163,9 +163,9 @@ export async function initializePythonWorker() {
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,
-          stalledInterval: 10000,
-          lockDuration: 60000,
-          lockRenewTime: 20000
+          stalledInterval: 30000,
+          lockDuration: 180000,
+          lockRenewTime: 30000
         }
       }
     );

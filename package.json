@@ -8,6 +8,8 @@
     "test:unit": "node scripts/test-scoring-logic.mjs && node scripts/test-rubric-fallback.mjs && node scripts/test-url-guard.mjs && node scripts/test-code-and-temporal-checks.mjs",
     "test:excel": "node scripts/run-excel-golden-suite.mjs",
     "benchmark:excel": "node scripts/benchmark-excel-queue.mjs",
+    "test:sql": "node test/test_sql_evaluator.js",
+    "verify:sql": "node scripts/verify-sql-sandbox.mjs",
     "start": "node --watch server.js",
     "dev": "node --watch server.js",
     "postinstall": "playwright install chromium"

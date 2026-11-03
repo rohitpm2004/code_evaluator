@@ -17,7 +17,7 @@ export async function initializeExcelWorker() {
 
     const config = queueManager.getConfig('excel') || {
       concurrency: 2,
-      timeout: 60000,
+      timeout: 180000,
       attempts: 2
     };
 
@@ -29,7 +29,7 @@ export async function initializeExcelWorker() {
     const targetConcurrency = !isNaN(envConcurrency) ? envConcurrency : (config.concurrency || 2);
     const effectiveConcurrency = Math.min(Math.max(1, targetConcurrency), maxSafeConcurrency);
 
-    logger.info(`Excel Worker concurrency set to ${effectiveConcurrency} (detected cores: ${cpuCount}, max safe cap: 5)`);
+    logger.info(`Excel Worker concurrency set to ${effectiveConcurrency} (detected cores: ${cpuCount}, max safe cap: 5) [env: ${process.env.EXCEL_CONCURRENCY || 'default'}]`);
 
     excelWorker = new Worker(
       'excel-evaluation',
@@ -57,9 +57,9 @@ export async function initializeExcelWorker() {
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,
-          stalledInterval: 10000,
-          lockDuration: 60000,
-          lockRenewTime: 20000
+          stalledInterval: 30000,
+          lockDuration: 180000,
+          lockRenewTime: 30000
         }
       }
     );

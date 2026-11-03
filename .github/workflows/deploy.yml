@@ -68,13 +68,18 @@ jobs:
             echo "🎭 Installing Playwright Chromium dependencies..."
             npx playwright install --with-deps chromium || true
 
-            # Pre-pull Docker sandbox images and build Excel sandbox container
+            # Pre-pull Docker sandbox images and build Excel/SQL sandbox containers
             if command -v docker &> /dev/null; then
               echo "🐳 Pre-pulling Docker sandbox runner images..."
               docker pull node:20-slim || true
               docker pull python:3.11-alpine || true
+              docker pull postgres:16-alpine || true
               echo "📊 Building Excel isolated sandbox container..."
               docker build -f docker/Dockerfile.excel -t eval-excel-sandbox . || true
+              if [ -f "docker/docker-compose.sql-sandbox.yml" ]; then
+                echo "🐘 Launching SQL Evaluator in-memory sidecar container..."
+                docker compose -f docker/docker-compose.sql-sandbox.yml up -d || true
+              fi
             fi
 
             # Ensure PM2 is installed globally

@@ -20,21 +20,29 @@ export async function routeEvaluation(payload) {
     // logger.info(`Job routed: ${type}`, { jobId: job.id });
     // return job;
     if (
-  ['javascript', 'visual', 'python', 'excel'].includes(type) &&
+  ['javascript', 'visual', 'python', 'excel', 'sql'].includes(type) &&
   payload.submissions
 ) {
 
   const jobs = [];
 
   for (const submission of payload.submissions) {
+    const resolvedUrl =
+      submission.fileUrl ||
+      submission.repoUrl ||
+      submission.submission_file_url ||
+      submission.filePath ||
+      submission.submission_link;
+    submission.repoUrl = submission.repoUrl || resolvedUrl;
+    submission.fileUrl = submission.fileUrl || resolvedUrl;
 
     const job =
       await queueManager.addEvaluation(
         type,
       {
         submission,
-        fileUrl:
-          submission.fileUrl || submission.submission_file_url || submission.filePath || submission.submission_link || submission.repoUrl,
+        fileUrl: resolvedUrl,
+        repoUrl: resolvedUrl,
         submissionId:
           submission.submissionId || submission.id,
         testCases:
@@ -57,6 +65,13 @@ export async function routeEvaluation(payload) {
           payload.rubricText,
         expectedUrl:
           payload.expectedUrl,
+        // SQL-specific fields
+        manifest:
+          payload.manifest,
+        sqlText:
+          submission.sqlText,
+        ideFiles:
+          submission.ideFiles,
         skipCache:
           payload.skipCache || payload.reEvaluate || false,
         reEvaluate:

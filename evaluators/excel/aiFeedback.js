@@ -107,7 +107,7 @@ Instructions:
 `;
 
     const model = process.env.OPENAI_MODEL || "deepseek-chat";
-    const completion = await aiClient.chat.completions.create({
+    const apiCall = aiClient.chat.completions.create({
       model,
       messages: [
         { 
@@ -119,6 +119,12 @@ Instructions:
       temperature: 0.1,
       response_format: { type: "json_object" }
     });
+
+    const timeoutPromise = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("AI feedback generation timed out after 10000ms")), 10000)
+    );
+
+    const completion = await Promise.race([apiCall, timeoutPromise]);
 
     const content = completion.choices[0]?.message?.content;
     const parsed = JSON.parse(content);

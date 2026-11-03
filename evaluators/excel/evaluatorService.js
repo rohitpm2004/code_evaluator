@@ -17,11 +17,11 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const MAX_FILE_SIZE_BYTES = 15 * 1024 * 1024; // 15MB
 const MAX_UNCOMPRESSED_BYTES = 50 * 1024 * 1024; // 50MB
 const MAX_COMPRESSION_RATIO = 100;
-const MAX_REDIRECT_HOPS = 3;
+const MAX_REDIRECT_HOPS = 8;
 
 /**
  * Downloads a spreadsheet safely with:
- * 1. Manual redirect following with SSRF re-validation at each hop (max 3 redirects).
+ * 1. Manual redirect following with SSRF re-validation at each hop (max 8 redirects).
  * 2. Streaming response directly to disk to prevent unbounded heap memory buffering.
  * 3. Enforcing hard byte limit (MAX_FILE_SIZE_BYTES = 15MB).
  */
@@ -35,7 +35,9 @@ async function safeDownloadSpreadsheet(targetUrl, destPath, maxBytes = MAX_FILE_
     res = await fetch(currentUrl, {
       redirect: "manual",
       headers: {
-        "User-Agent": "CodeGuru-Evaluator/1.0"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,application/vnd.ms-excel,text/csv,*/*",
+        "Accept-Language": "en-US,en;q=0.9"
       }
     });
 
@@ -54,7 +56,24 @@ async function safeDownloadSpreadsheet(targetUrl, destPath, maxBytes = MAX_FILE_
 
   if (!res || !res.ok) {
     const status = res ? res.status : "Unknown";
-    throw new Error(`Failed to download spreadsheet (HTTP ${status}): Make sure the Google Sheet is shared with "Anyone with the link can view".`);
+    const isGoogle = currentUrl.includes("google.com") || targetUrl.includes("google.com");
+    const isOneDrive =
+      currentUrl.includes("1drv.ms") ||
+      currentUrl.includes("onedrive.live.com") ||
+      currentUrl.includes("sharepoint.com") ||
+      currentUrl.includes("api.onedrive.com") ||
+      targetUrl.includes("1drv.ms") ||
+      targetUrl.includes("onedrive.live.com") ||
+      targetUrl.includes("sharepoint.com") ||
+      targetUrl.includes("api.onedrive.com");
+
+    let helpMsg = 'Make sure the file or spreadsheet is shared with "Anyone with the link can view".';
+    if (isGoogle) {
+      helpMsg = 'Make sure the Google Sheet or Drive file is shared with "Anyone with the link can view".';
+    } else if (isOneDrive) {
+      helpMsg = 'OneDrive / Excel Online links require Microsoft authentication and block automated server downloads. Please have the student upload the .xlsx file directly or share via Google Sheets with "Anyone with the link can view".';
+    }
+    throw new Error(`Failed to download spreadsheet (HTTP ${status}): ${helpMsg}`);
   }
 
   // Check Content-Length header if provided
@@ -107,9 +126,11 @@ async function validateZipSafety(filePath) {
     await fd.read(headBuf, 0, headBuf.length, 0);
 
     if (headBuf[0] !== 0x50 || headBuf[1] !== 0x4B) {
-      const textPreview = headBuf.toString("utf8", 0, 200).toLowerCase();
-      if (textPreview.includes("<!doctype") || textPreview.includes("<html")) {
-        throw new Error("Invalid spreadsheet: Received a web page instead of an Excel spreadsheet. Please ensure the Google Sheet is set to 'Anyone with the link can view'.");
+      const textPreview = headBuf.toString("utf8", 0, 500).toLowerCase();
+      if (textPreview.includes("<!doctype") || textPreview.includes("<html") || textPreview.includes("<head") || textPreview.includes("<body")) {
+        throw new Error(
+          "Invalid spreadsheet: Received an HTML web page instead of an Excel spreadsheet (.xlsx). If using Google Sheets or OneDrive, verify that sharing is set to 'Anyone with the link can view' without requiring sign-in, or submit directly as an uploaded Excel file (.xlsx)."
+        );
       }
       throw new Error("Invalid file format: Not a valid OpenXML (.xlsx) archive.");
     }
@@ -263,16 +284,64 @@ export async function evaluateExcelSubmission(jobData, jobId) {
         if (sheetIdMatch && sheetIdMatch[1]) {
           downloadUrl = `https://docs.google.com/spreadsheets/d/${sheetIdMatch[1]}/export?format=xlsx`;
         }
+      } else if (downloadUrl.includes("drive.google.com") || downloadUrl.includes("docs.google.com/file")) {
+        const match = downloadUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) ||
+                      downloadUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/) ||
+                      downloadUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
+        if (match && match[1]) {
+          downloadUrl = `https://drive.google.com/uc?export=download&id=${match[1]}&confirm=t`;
+        }
       } else if (
-        (downloadUrl.includes("onedrive.live.com") || downloadUrl.includes("1drv.ms") || downloadUrl.includes("sharepoint.com")) &&
-        !downloadUrl.includes("download=1")
+        (downloadUrl.includes("onedrive.live.com") || downloadUrl.includes("1drv.ms")) &&
+        !downloadUrl.includes("api.onedrive.com")
       ) {
+        try {
+          const cleanUrl = downloadUrl.replace(/[?&]download=\d+/, "");
+          const b64 = Buffer.from(cleanUrl, "utf-8")
+            .toString("base64")
+            .replace(/=+$/, "")
+            .replace(/\//g, "_")
+            .replace(/\+/g, "-");
+          downloadUrl = `https://api.onedrive.com/v1.0/shares/u!${b64}/root/content`;
+        } catch (e) {
+          logger.warn(`[ExcelEvaluator] Failed to convert OneDrive URL to Graph API: ${e.message}`);
+          if (!downloadUrl.includes("download=1")) {
+            const sep = downloadUrl.includes("?") ? "&" : "?";
+            downloadUrl = `${downloadUrl}${sep}download=1`;
+          }
+        }
+      } else if (downloadUrl.includes("sharepoint.com") && !downloadUrl.includes("download=1")) {
         const sep = downloadUrl.includes("?") ? "&" : "?";
         downloadUrl = `${downloadUrl}${sep}download=1`;
       }
 
       logger.info(`[ExcelEvaluator] Downloading submission file from URL for Job ${jobId}: ${downloadUrl}`);
       await safeDownloadSpreadsheet(downloadUrl, originalFile);
+
+      // Verify the downloaded file is not an HTML access-denied or preview page from Google
+      const sampleBuf = Buffer.alloc(512);
+      const fd = await fsp.open(originalFile, "r");
+      await fd.read(sampleBuf, 0, 512, 0);
+      await fd.close();
+      const headStr = sampleBuf.toString("utf-8");
+
+      if (/^\s*<!DOCTYPE\s+html/i.test(headStr) || /^\s*<html/i.test(headStr)) {
+        const htmlContent = await fsp.readFile(originalFile, "utf-8");
+        const confirmMatch = htmlContent.match(/href="(\/uc\?export=download[^"]+confirm=[^"]+)"/i) ||
+                             htmlContent.match(/href="(https:\/\/[^"]*drive\.usercontent\.google\.com\/[^"]+)"/i);
+        if (confirmMatch && confirmMatch[1]) {
+          let retryUrl = confirmMatch[1];
+          if (retryUrl.startsWith("/")) retryUrl = `https://drive.google.com${retryUrl}`;
+          logger.info(`[ExcelEvaluator] Following Google Drive interstitial confirmation link: ${retryUrl}`);
+          await safeDownloadSpreadsheet(retryUrl, originalFile);
+        } else {
+          const isOneDrive = downloadUrl.includes("1drv.ms") || downloadUrl.includes("onedrive.live.com") || downloadUrl.includes("sharepoint.com");
+          const msg = isOneDrive
+            ? "The submission URL returned an HTML web page instead of an Excel file. Please ensure the OneDrive / Excel link is shared with 'Anyone with the link can view' without requiring sign-in, or submit directly as an uploaded Excel file (.xlsx)."
+            : "The submission URL returned a private or restricted webpage instead of a raw Excel file. Please open the file in Google Drive/Sheets, click Share, set general access to 'Anyone with the link can view', or submit directly as an uploaded Excel file (.xlsx).";
+          throw new Error(msg);
+        }
+      }
     } else if (providedFilePath) {
       const resolvedPath = path.resolve(providedFilePath);
       const appRoot = path.resolve(__dirname, "../../..");

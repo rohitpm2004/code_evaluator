@@ -29,7 +29,7 @@ const QUEUE_CONFIG = {
   react: {
     jobName: 'react-job',
     concurrency: 5,
-    timeout: 120000,      // 2 minutes
+    timeout: 180000,      // 3 minutes (handles cold-starts and AI evaluation)
     description: 'React Component Evaluation'
   },
   
@@ -59,7 +59,7 @@ const QUEUE_CONFIG = {
   python: {
     jobName: 'python-job',
     concurrency: 5,
-    timeout: 120000,
+    timeout: 180000,      // 3 minutes
     description: 'Python Evaluation'
   },
   
@@ -73,8 +73,15 @@ const QUEUE_CONFIG = {
   excel: {
     jobName: 'excel-job',
     concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 2), Math.min(os.cpus()?.length || 2, 5)),
-    timeout: 120000,      // 2 minutes
+    timeout: 180000,      // 3 minutes (downloading large sheets + Python runner + AI feedback)
     description: 'Excel Spreadsheet Evaluation'
+  },
+
+  sql: {
+    jobName: 'sql-job',
+    concurrency: parseInt(process.env.SQL_CONCURRENCY, 10) || 4,
+    timeout: 120000,      // 2 minutes (multi-file GitHub fetch + AST parse + PG query + multiset compare + AI feedback)
+    description: 'SQL Database Evaluation'
   }
 };
 
@@ -110,17 +117,21 @@ class QueueManager {
           connection: sharedConnection,
           prefix: process.env.QUEUE_PREFIX || 'local',
           
-          // Default job options
+          // Default job options: strictly cap retained jobs to prevent Redis Cloud 30MB OOM
           defaultJobOptions: {
-            attempts: 3,
+            attempts: 2,
             backoff: {
               type: 'exponential',
               delay: 2000
             },
             removeOnComplete: {
-              age: 3600
+              count: 100,
+              age: 3600 // 1 hour
             },
-            removeOnFail: false
+            removeOnFail: {
+              count: 50,
+              age: 7200 // 2 hours
+            }
           }
         });
 
@@ -130,12 +141,93 @@ class QueueManager {
         logger.info(`Queue created: ${type}-evaluation (concurrency: ${config.concurrency})`);
       }
 
+      // Run proactive cleanup to immediately free Redis memory from previous runs
+      await this.pruneStaleRedisJobs();
+
+      // Run periodic cleanup every 3 minutes
+      setInterval(() => {
+        this.pruneStaleRedisJobs().catch(() => {});
+      }, 3 * 60 * 1000);
+
       this.isInitialized = true;
       logger.info('All queues initialized successfully');
 
     } catch (err) {
       logger.error('Failed to initialize queues:', err);
       throw err;
+    }
+  }
+
+  /**
+   * Proactively unlinks stale completed and failed job data from Redis to stay within memory limits.
+   */
+  async pruneStaleRedisJobs() {
+    const conn = redisConnection.connect();
+    const prefix = process.env.QUEUE_PREFIX || 'local';
+    logger.info('🧹 Running Redis memory cleanup to prevent OOM...');
+
+    try {
+      // Log current memory usage
+      try {
+        const memInfo = await conn.info('memory');
+        const usedMatch = memInfo.match(/used_memory_human:([^\r\n]+)/);
+        const maxMatch = memInfo.match(/maxmemory_human:([^\r\n]+)/);
+        if (usedMatch) {
+          logger.info(`📊 Redis Memory Usage: ${usedMatch[1]} (Max limit: ${maxMatch ? maxMatch[1] : 'unlimited'})`);
+        }
+      } catch {}
+
+      for (const type of Object.keys(QUEUE_CONFIG)) {
+        const queueName = `${type}-evaluation`;
+        const completedKey = `${prefix}:${queueName}:completed`;
+        const failedKey = `${prefix}:${queueName}:failed`;
+        const eventsKey = `${prefix}:${queueName}:events`;
+
+        // 1. Remove completed jobs keeping at most 100
+        try {
+          const completedJobIds = await conn.zrange(completedKey, 0, -101);
+          if (completedJobIds.length > 0) {
+            const keysToDelete = [];
+            for (const id of completedJobIds) {
+              keysToDelete.push(prefix + ':' + queueName + ':' + id);
+              keysToDelete.push(prefix + ':' + queueName + ':' + id + ':logs');
+            }
+            await conn.unlink(...keysToDelete).catch(() => {});
+            await conn.zremrangebyrank(completedKey, 0, -101).catch(() => {});
+          }
+        } catch {}
+
+        // 2. Remove failed jobs keeping at most 50
+        try {
+          const failedJobIds = await conn.zrange(failedKey, 0, -51);
+          if (failedJobIds.length > 0) {
+            const keysToDelete = [];
+            for (const id of failedJobIds) {
+              keysToDelete.push(prefix + ':' + queueName + ':' + id);
+              keysToDelete.push(prefix + ':' + queueName + ':' + id + ':logs');
+            }
+            await conn.unlink(...keysToDelete).catch(() => {});
+            await conn.zremrangebyrank(failedKey, 0, -51).catch(() => {});
+          }
+        } catch {}
+
+        // 3. Trim events stream to last 10 entries
+        try {
+          await conn.xtrim(eventsKey, 'MAXLEN', '~', 10);
+        } catch {}
+      }
+
+      // Also unlink any orphaned logs or legacy keys if Redis is tight on memory
+      try {
+        const legacyKeys = await conn.keys(`${prefix}:*:logs`);
+        if (legacyKeys.length > 20) {
+          await conn.unlink(...legacyKeys.slice(0, legacyKeys.length - 10)).catch(() => {});
+        }
+      } catch {}
+
+      logger.info('✅ Redis memory cleanup complete.');
+    } catch (err) {
+      logger.warn(`Redis memory cleanup warning: ${err.message}`);
     }
   }
 
@@ -205,11 +297,16 @@ class QueueManager {
         jobId = `${type}-${Date.now()}-${rand}-${hash}`;
       }
 
-      // Add job to queue with deterministic jobId for deduplication
+      // Add job to queue with deterministic jobId for deduplication and retry resilience
       const jobOptions = {
         jobId: String(jobId),
-        removeOnComplete: { count: 100 },
-        removeOnFail: { count: 100 }
+        attempts: config.attempts || 2,
+        backoff: {
+          type: 'exponential',
+          delay: 5000,
+        },
+        removeOnComplete: { count: 2000, age: 86400 },
+        removeOnFail: { count: 2000, age: 86400 }
       };
 
       // Only assign explicit positive numeric priority if explicitly requested.
@@ -265,6 +362,65 @@ class QueueManager {
       logger.error(`Failed to get job status: ${type}/${jobId}`, err);
       return null;
     }
+  }
+
+  /**
+   * Get statuses for a batch of jobs in parallel using a single batch request.
+   * @param {string} [type] - Optional evaluator queue type
+   * @param {string[]} jobIds - Array of job ID strings
+   * @returns {Promise<Array<object>>}
+   */
+  async getBatchJobStatus(type, jobIds) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0) return [];
+
+    return Promise.all(
+      jobIds.map(async (id) => {
+        try {
+          // Fast-path: determine queue by explicit type, or infer from id prefix (e.g. 'excel-123' -> 'excel')
+          let targetQueue = type ? this.queues[type] : null;
+          if (!targetQueue && typeof id === 'string') {
+            const prefix = id.split('-')[0].toLowerCase();
+            const normalized = prefix === 'js' ? 'javascript' : prefix;
+            targetQueue = this.queues[normalized];
+          }
+
+          if (targetQueue) {
+            const job = await targetQueue.getJob(id);
+            if (job) {
+              return {
+                id: job.id,
+                state: await job.getState(),
+                progress: job.progress ?? 0,
+                result: job.returnvalue,
+                failedReason: job.failedReason
+              };
+            }
+            return { id, state: 'not_found' };
+          }
+
+          // Fallback only if queue type could not be determined at all: check all queues
+          for (const [qType, q] of Object.entries(this.queues)) {
+            try {
+              const job = await q.getJob(id);
+              if (job) {
+                return {
+                  id: job.id,
+                  type: qType,
+                  state: await job.getState(),
+                  progress: job.progress ?? 0,
+                  result: job.returnvalue,
+                  failedReason: job.failedReason
+                };
+              }
+            } catch {}
+          }
+
+          return { id, state: 'not_found' };
+        } catch (e) {
+          return { id, state: 'error', error: e.message };
+        }
+      })
+    );
   }
 
   /**

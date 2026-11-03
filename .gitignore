@@ -27,4 +27,20 @@ __pycache__/
 .pytest_cache/
 
 
+# Scratch, test scripts, and local diagnostics
+inspect_redis.js
+scratch/
+scripts/check-redis-memory.mjs
+scripts/verify-sql-sandbox.mjs
+test/
+
+# Guidance, information, and audit markdown files
+SQL_EVALUATOR_ARCHITECTURE_AND_AUDIT.md
+ARCHITECTURE_AND_EVALUATORS_REVIEW.md
+VISUAL_EVALUATOR_AUDIT.md
+backendBugs.md
+jsBugs.md
+CLAUDE.md
+AWS_DEPLOYMENT.md
+
 DEPLOY.md

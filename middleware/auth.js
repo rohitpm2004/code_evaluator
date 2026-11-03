@@ -27,11 +27,15 @@ export function requireApiKey(req, res, next) {
   return next();
 }
 
-/** Rate limiter for /evaluate — defaults to 60 requests / minute / IP. */
+/** Rate limiter for /evaluate — defaults to 60 requests / minute / IP, bypassing authenticated internal LMS calls. */
 export const evaluateRateLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: Number(process.env.RATE_LIMIT_MAX) || 60,
   standardHeaders: true,
   legacyHeaders: false,
+  skip: (req) => {
+    const key = req.get("x-api-key");
+    return Boolean(key && process.env.API_KEY && key === process.env.API_KEY);
+  },
   message: { success: false, error: "Too many requests" }
 });

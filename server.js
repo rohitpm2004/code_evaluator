@@ -29,6 +29,7 @@ import { initializeReactWorker, stopReactWorker } from './workers/reactWorker.js
 import { initializePythonWorker, stopPythonWorker } from './workers/pythonWorker.js';
 import { initializeFullstackWorker, stopFullstackWorker } from './workers/fullstackWorker.js';
 import { initializeExcelWorker, stopExcelWorker } from './workers/excelWorker.js';
+import { initializeSqlWorker, stopSqlWorker } from './workers/sqlWorker.js';
 
 import { requireApiKey, evaluateRateLimiter } from './middleware/auth.js';
 import webhookRouter from './router/webhookRouter.js';
@@ -84,6 +85,9 @@ async function startServer() {
     await initializeExcelWorker();
     logger.info('✅ Excel worker initialized');
 
+    await initializeSqlWorker();
+    logger.info('✅ SQL worker initialized');
+
     // 4. API routes (V-04: rate limit + API-key auth)
     app.post('/evaluate', evaluateRateLimiter, requireApiKey, evaluate);
     app.use('/api/webhook', webhookRouter);
@@ -105,6 +109,42 @@ async function startServer() {
         res.json({ redis: 'connected' });
       } catch (err) {
         res.status(500).json({ redis: 'disconnected', error: err.message });
+      }
+    });
+
+    app.get('/health/redis-memory', async (req, res) => {
+      try {
+        const conn = redisConnection.connect();
+        const memInfo = await conn.info('memory');
+        const usedMatch = memInfo.match(/used_memory_human:([^\r\n]+)/);
+        const maxMatch = memInfo.match(/maxmemory_human:([^\r\n]+)/);
+        const peakMatch = memInfo.match(/used_memory_peak_human:([^\r\n]+)/);
+        res.json({
+          used_memory: usedMatch ? usedMatch[1] : 'unknown',
+          max_memory: maxMatch ? maxMatch[1] : 'unlimited',
+          peak_memory: peakMatch ? peakMatch[1] : 'unknown'
+        });
+      } catch (err) {
+        res.status(500).json({ error: err.message });
+      }
+    });
+
+    app.all('/admin/redis-flush', requireApiKey, async (req, res) => {
+      try {
+        const conn = redisConnection.connect();
+        const prefix = process.env.QUEUE_PREFIX || 'local';
+        const keys = await conn.keys(`${prefix}:*`);
+        let unlinked = 0;
+        if (keys.length > 0) {
+          unlinked = await conn.unlink(...keys);
+        }
+        res.json({
+          success: true,
+          message: `Flushed ${unlinked} Redis queue keys`,
+          keysFound: keys.length
+        });
+      } catch (err) {
+        res.status(500).json({ success: false, error: err.message });
       }
     });
 
@@ -148,6 +188,20 @@ async function startServer() {
           success: false,
           error: err.message
         });
+      }
+    });
+
+    app.post('/jobs/batch-status', requireApiKey, async (req, res) => {
+      try {
+        const { type, jobIds } = req.body || {};
+        if (!Array.isArray(jobIds) || jobIds.length === 0) {
+          return res.status(400).json({ success: false, error: 'jobIds must be a non-empty array' });
+        }
+        const statuses = await queueManager.getBatchJobStatus(type, jobIds);
+        res.json({ success: true, statuses });
+      } catch (err) {
+        logger.error(`Error retrieving batch job status: ${err.message}`);
+        res.status(500).json({ success: false, error: err.message });
       }
     });
 
@@ -204,6 +258,7 @@ async function shutdown(signal) {
     await stopPythonWorker();
     await stopFullstackWorker();
     await stopExcelWorker();
+    await stopSqlWorker();
     await queueManager.disconnect();
     logger.info('Shutdown complete');
     process.exit(0);
