@@ -10,6 +10,7 @@ Uses sqlglot (pinned 25.20.0) to enforce:
 7. AST complexity, recursion depth, and input byte bounds.
 """
 
+from __future__ import annotations
 import re
 from typing import Dict, Any, List, Set, Optional
 
@@ -19,6 +20,7 @@ try:
     HAS_SQLGLOT = True
 except ImportError:
     HAS_SQLGLOT = False
+    exp = None
 
 
 # Resource Limits for AST parsing
