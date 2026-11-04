@@ -425,8 +425,8 @@ CRITICAL RULES:
    - Do NOT give credit for code that does not implement the required features.
 
 2. BUILD FAILURE RULE:
-   - If the Build Report says "Build: Failed" or "failed to compile", students can STILL get partial credit for criteria that are fully correct in the source code (Setup, Component Structure, State, Handler Logic).
-   - However, criteria requiring runtime visual/rendering verification must be capped at max 5 marks if the build failed.
+   - If the build failed strictly due to Node.js version incompatibility, package manager engine warnings (EBADENGINE), or sandbox runner environment issues (and NOT a syntax error or missing file in the student's source code), do NOT penalize the student! Grade the student's implementation based on their source code correctness.
+   - If the build failed due to genuine student code errors (e.g. syntax error, unclosed JSX, missing file imports), students can STILL get partial credit for criteria that are fully correct in the source code (Setup, Component Structure, State, Handler Logic), but criteria requiring runtime visual/rendering verification must be capped at max 5 marks.
 
 Assign a discrete score multiplier for EACH criterion based strictly on verified code evidence:
 - 1.0 = Fully meets all exact requirements for this criterion.

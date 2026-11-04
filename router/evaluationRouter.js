@@ -2,6 +2,10 @@ import queueManager from '../config/queueManager.js';
 import logger from '../config/logger.js';
 import { ValidationError } from '../controller/evaluatorController.js';
 
+/**
+ * Enqueue an evaluation payload or supported batch and return the created job or jobs.
+ * @throws {ValidationError} When the evaluator type is not registered.
+ */
 export async function routeEvaluation(payload) {
   const { type } = payload;
 
@@ -16,19 +20,31 @@ export async function routeEvaluation(payload) {
     // logger.info(`Job routed: ${type}`, { jobId: job.id });
     // return job;
     if (
-  ['javascript', 'visual', 'python'].includes(type) &&
+  ['javascript', 'visual', 'python', 'excel', 'sql'].includes(type) &&
   payload.submissions
 ) {
 
   const jobs = [];
 
   for (const submission of payload.submissions) {
+    const resolvedUrl =
+      submission.fileUrl ||
+      submission.repoUrl ||
+      submission.submission_file_url ||
+      submission.filePath ||
+      submission.submission_link;
+    submission.repoUrl = submission.repoUrl || resolvedUrl;
+    submission.fileUrl = submission.fileUrl || resolvedUrl;
 
     const job =
       await queueManager.addEvaluation(
         type,
       {
         submission,
+        fileUrl: resolvedUrl,
+        repoUrl: resolvedUrl,
+        submissionId:
+          submission.submissionId || submission.id,
         testCases:
           payload.testCases,
         entryFunction:
@@ -49,6 +65,13 @@ export async function routeEvaluation(payload) {
           payload.rubricText,
         expectedUrl:
           payload.expectedUrl,
+        // SQL-specific fields
+        manifest:
+          payload.manifest,
+        sqlText:
+          submission.sqlText,
+        ideFiles:
+          submission.ideFiles,
         skipCache:
           payload.skipCache || payload.reEvaluate || false,
         reEvaluate:

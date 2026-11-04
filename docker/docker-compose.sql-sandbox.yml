@@ -1,0 +1,28 @@
+services:
+  eval-postgres:
+    image: postgres:16-alpine
+    container_name: eval-postgres
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    environment:
+      POSTGRES_USER: eval_runner
+      POSTGRES_PASSWORD: eval_password
+      POSTGRES_DB: neondb
+      POSTGRES_HOST_AUTH_METHOD: trust
+    tmpfs:
+      - /var/lib/postgresql/data:rw,size=1024m
+    command: >
+      postgres
+      -c fsync=off
+      -c synchronous_commit=off
+      -c full_page_writes=off
+      -c max_connections=300
+      -c shared_buffers=256MB
+      -c work_mem=16MB
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U eval_runner -d neondb"]
+      interval: 3s
+      timeout: 2s
+      retries: 5
+      start_period: 5s

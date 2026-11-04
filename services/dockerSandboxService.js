@@ -23,12 +23,7 @@ export async function isDockerAvailable() {
     dockerAvailableCache = true;
     return true;
   } catch (err) {
-    if (process.env.SANDBOX_MODE === "docker") {
-      logger.warn(`Docker check warning: ${err.message}. Retaining docker mode as configured.`);
-      dockerAvailableCache = true;
-      return true;
-    }
-    logger.warn(`Docker not reachable: ${err.message}. Will fall back to GitHub Actions.`);
+    logger.warn(`Docker not reachable: ${err.message}. Falling back to local execution.`);
     dockerAvailableCache = false;
     return false;
   }
@@ -56,8 +51,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
   const normalizedPath = path.resolve(repoPath).replace(/\\/g, "/");
 
   let containerCmd = options.command;
-  let dockerImage = "node:18-alpine";
-  let cacheVolume = "central-eval-npm-cache:/root/.npm";
+  let dockerImage = options.image || (language === "python" ? "python:3.11-alpine" : (process.env.NODE_SANDBOX_IMAGE || "node:20-slim"));
+  let cacheVolume = language === "python" ? "central-eval-pip-cache:/root/.cache/pip" : "central-eval-npm-cache:/root/.npm";
 
   if (language === "python") {
     dockerImage = "python:3.11-alpine";
@@ -83,8 +78,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
       }
 
       containerCmd = hasBuildScript
-        ? "npm install --prefer-offline --no-audit --progress=false && npm run build"
-        : "npm install --prefer-offline --no-audit --progress=false";
+        ? "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false && npm run build"
+        : "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false";
     }
   }
 
@@ -557,7 +552,7 @@ import { createRequire } from 'module';
 
   fs.writeFileSync(harnessFilePath, harnessCode, "utf-8");
   const containerName = `eval-js-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:18-alpine node ${harnessFileName}`;
+  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:20-slim node ${harnessFileName}`;
 
   let studentCode = "";
   try {
@@ -666,17 +661,81 @@ output_result({'results': results})
   const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app python:3.11-alpine python ${harnessFileName}`;
 
   try {
-    const { stdout } = await execPromise(dockerCmd, { timeout: 15000 });
+    const canDocker = await isDockerAvailable();
+    let stdout;
+    if (canDocker) {
+      const execRes = await execPromise(dockerCmd, { timeout: 15000 });
+      stdout = execRes.stdout;
+    } else {
+      logger.info('Docker not running, executing Python test harness via local python3 process...');
+      const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+      const execRes = await execPromise(`"${pythonBin}" "${harnessFileName}"`, {
+        cwd: repoPath,
+        timeout: 15000,
+        maxBuffer: 5 * 1024 * 1024
+      });
+      stdout = execRes.stdout;
+    }
+
     const match = stdout.match(/__EVAL_RESULT_START__([\s\S]*?)__EVAL_RESULT_END__/);
     const rawJson = match ? match[1].trim() : stdout.trim();
     const parsed = JSON.parse(rawJson);
     return parsed.results || [];
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
-    logger.error(`Docker Python test runner infrastructure error: ${err.message}`);
-    throw new Error(`Docker Python execution failed: ${err.message}`);
+    logger.error(`Python test runner error: ${err.message}`);
+    throw new Error(`Python execution failed: ${err.message}`);
   } finally {
     try { fs.unlinkSync(harnessFilePath); } catch {}
     try { fs.unlinkSync(testCasesFilePath); } catch {}
+  }
+}
+
+/**
+ * Runs Excel workbook recalculation & assertion evaluation inside Docker sandbox.
+ */
+export async function runExcelInDocker(workspaceDir, options = {}) {
+  const timeoutMs = options.timeoutMs || 45000;
+  const normalizedPath = path.resolve(workspaceDir).replace(/\\/g, "/");
+  const containerName = `eval-excel-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const dockerImage = process.env.EXCEL_SANDBOX_IMAGE || "eval-excel-sandbox";
+  const reportFilePath = path.join(workspaceDir, "report.json");
+  const scriptFilePath = path.join(workspaceDir, "run_excel.sh");
+
+  const runScriptContent = `#!/bin/sh
+set -e
+RECALC=/sandbox/recalculate.py
+[ -f /workspace/recalculate.py ] && RECALC=/workspace/recalculate.py
+RUNNER=/sandbox/excel_runner.py
+[ -f /workspace/excel_runner.py ] && RUNNER=/workspace/excel_runner.py
+python3 "$RECALC" --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof > /dev/null
+python3 "$RUNNER" --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json > /workspace/report.json
+`;
+
+  try {
+    fs.writeFileSync(scriptFilePath, runScriptContent.replace(/\r\n/g, "\n"), "utf-8");
+  } catch (writeErr) {
+    logger.warn(`Failed to write run_excel.sh: ${writeErr.message}`);
+  }
+
+  // Execute using runner script inside container - avoids OS shell quoting incompatibilities
+  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh /workspace/run_excel.sh`;
+
+  logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
+  try {
+    const { stdout } = await execPromise(dockerCmd, { timeout: timeoutMs });
+    if (fs.existsSync(reportFilePath)) {
+      const content = fs.readFileSync(reportFilePath, 'utf8');
+      return JSON.parse(content.trim());
+    }
+    return JSON.parse(stdout.trim());
+  } catch (err) {
+    execPromise(`docker rm -f ${containerName}`).catch(() => {});
+    throw new Error(`Docker Excel execution failed: ${err.message}`);
+  } finally {
+    try {
+      if (fs.existsSync(reportFilePath)) fs.unlinkSync(reportFilePath);
+      if (fs.existsSync(scriptFilePath)) fs.unlinkSync(scriptFilePath);
+    } catch {}
   }
 }
