@@ -113,6 +113,15 @@ export async function resolveElement(page, selector) {
   if (!selector) return null;
   const rawSel = String(selector).trim();
 
+  // 0. Handle comma-separated selectors (e.g. "header, nav, #app" or "input#task-input, input[type='text']")
+  if (rawSel.includes(',')) {
+    const parts = rawSel.split(',').map(s => s.trim()).filter(Boolean);
+    for (const part of parts) {
+      const el = await resolveElement(page, part);
+      if (el) return el;
+    }
+  }
+
   // 1. Try widened selector directly (handles exact id/class with camelCase, kebab-case, snake_case)
   try {
     const el = await page.$(widenSelector(rawSel));

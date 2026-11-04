@@ -28,59 +28,57 @@ import logger from './logger.js';
 const QUEUE_CONFIG = {
   react: {
     jobName: 'react-job',
-    concurrency: 5,
-    timeout: 180000,      // 3 minutes (handles cold-starts and AI evaluation)
+    concurrency: 2,
+    timeout: 45000,       // 45s hard ceiling
     description: 'React Component Evaluation'
   },
   
   backend: {
     jobName: 'backend-job',
-    concurrency: 3,
-    timeout: 180000,      // 3 minutes
+    concurrency: 2,
+    timeout: 45000,       // 45s hard ceiling
     description: 'Backend API Evaluation'
   },
   
   visual: {
     jobName: 'visual-job',
-    // Visual is heavy - browsers consume memory. Free-tier deploys run with
-    // BROWSER_POOL_SIZE=1, so keep concurrency modest by default.
     concurrency: parseInt(process.env.VISUAL_CONCURRENCY) || 2,
-    timeout: 300000,      // 5 minutes (screenshot + browser + AI)
+    timeout: 30000,       // 30s Playwright DOM ceiling
     description: 'Visual/UI Evaluation'
   },
   
   javascript: {
     jobName: 'javascript-job',
     concurrency: parseInt(process.env.JS_CONCURRENCY) || 4,
-    timeout: 180000,      // 3 minutes (accounts for Render cold-start ~50s + GitHub Actions ~13s + AI feedback)
+    timeout: 30000,
     description: 'JavaScript Evaluation'
   },
   
   python: {
     jobName: 'python-job',
-    concurrency: 5,
-    timeout: 180000,      // 3 minutes
+    concurrency: parseInt(process.env.PYTHON_CONCURRENCY) || 4,
+    timeout: 25000,       // 25s Python execution ceiling
     description: 'Python Evaluation'
   },
   
   fullstack: {
     jobName: 'fullstack-job',
-    concurrency: 2,       // Combines multiple evaluations
-    timeout: 300000,      // 5 minutes
+    concurrency: 2,
+    timeout: 45000,
     description: 'Full Stack Evaluation'
   },
 
   excel: {
     jobName: 'excel-job',
-    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 2), Math.min(os.cpus()?.length || 2, 5)),
-    timeout: 180000,      // 3 minutes (downloading large sheets + Python runner + AI feedback)
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 5), 5),
+    timeout: 35000,       // 35s Excel ceiling
     description: 'Excel Spreadsheet Evaluation'
   },
 
   sql: {
     jobName: 'sql-job',
-    concurrency: parseInt(process.env.SQL_CONCURRENCY, 10) || 4,
-    timeout: 120000,      // 2 minutes (multi-file GitHub fetch + AST parse + PG query + multiset compare + AI feedback)
+    concurrency: parseInt(process.env.SQL_CONCURRENCY, 10) || 5,
+    timeout: 30000,       // 30s SQL ceiling
     description: 'SQL Database Evaluation'
   }
 };
@@ -119,7 +117,7 @@ class QueueManager {
           
           // Default job options: strictly cap retained jobs to prevent Redis Cloud 30MB OOM
           defaultJobOptions: {
-            attempts: 2,
+            attempts: 1,
             backoff: {
               type: 'exponential',
               delay: 2000

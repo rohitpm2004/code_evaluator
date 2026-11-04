@@ -25,6 +25,10 @@ function isArchiveTarget(target) {
   }
   try {
     const parsed = new URL(trimmed);
+    const host = parsed.hostname.toLowerCase();
+    if (host.includes('drive.google.com') || host.includes('docs.google.com')) {
+      return true;
+    }
     const pathLower = parsed.pathname.toLowerCase();
     return (
       pathLower.endsWith('.zip') ||
@@ -45,16 +49,27 @@ async function extractZipToFolder(archivePath, destFolder) {
 }
 
 async function downloadAndExtractArchive(archiveUrl, destFolder) {
-  await assertSafeUrl(archiveUrl);
+  let downloadUrl = archiveUrl;
+  if (downloadUrl.includes('drive.google.com') || downloadUrl.includes('docs.google.com')) {
+    const match = downloadUrl.match(/\/file\/d\/([a-zA-Z0-9_-]+)/) ||
+                  downloadUrl.match(/[?&]id=([a-zA-Z0-9_-]+)/) ||
+                  downloadUrl.match(/\/d\/([a-zA-Z0-9_-]+)/);
+    if (match && match[1]) {
+      downloadUrl = `https://drive.google.com/uc?export=download&id=${match[1]}&confirm=t`;
+    }
+  }
+
+  await assertSafeUrl(downloadUrl);
   if (!fs.existsSync(TEMP_DIR)) {
     fs.mkdirSync(TEMP_DIR, { recursive: true });
   }
 
   const { randomUUID } = await import('crypto');
-  const tempZipPath = path.join(os.tmpdir(), `archive_${Date.now()}_${randomUUID()}.zip`);
+  const tempZipPath = path.join(os.tmpdir(), `archive_${Date.now()}_${randomUUID()}.tmp`);
 
-  logger.info(`[repoService] Downloading project archive from S3/remote: ${archiveUrl}`);
-  const res = await fetch(archiveUrl, {
+  logger.info(`[repoService] Downloading project archive/file from remote: ${downloadUrl}`);
+  let res = await fetch(downloadUrl, {
+    redirect: 'follow',
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36'
     }
@@ -64,27 +79,78 @@ async function downloadAndExtractArchive(archiveUrl, destFolder) {
     throw new Error(`Failed to download project archive (HTTP ${res.status}): ${res.statusText}`);
   }
 
-  const writeStream = fs.createWriteStream(tempZipPath);
-  let bytesDownloaded = 0;
-  try {
-    const readable = Readable.fromWeb(res.body);
-    for await (const chunk of readable) {
-      bytesDownloaded += chunk.length;
-      if (bytesDownloaded > MAX_ARCHIVE_BYTES) {
-        throw new Error(`Project archive size exceeds maximum limit of 50MB.`);
-      }
-      if (!writeStream.write(chunk)) {
-        await new Promise((r) => writeStream.once('drain', r));
-      }
+  // Handle Google Drive interstitial confirmation page if encountered
+  const contentType = res.headers.get('content-type') || '';
+  if (contentType.includes('text/html') && downloadUrl.includes('drive.google.com')) {
+    const htmlText = await res.text();
+    const confirmMatch = htmlText.match(/href="(\/uc\?export=download[^"]+)"/i) ||
+                         htmlText.match(/href="(https:\/\/[^"]*drive\.usercontent\.google\.com\/[^"]+)"/i);
+    if (confirmMatch && confirmMatch[1]) {
+      let retryUrl = confirmMatch[1].replace(/&amp;/g, '&');
+      if (retryUrl.startsWith('/')) retryUrl = `https://drive.google.com${retryUrl}`;
+      logger.info(`[repoService] Following Google Drive interstitial confirmation URL: ${retryUrl}`);
+      res = await fetch(retryUrl, {
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' }
+      });
+    } else {
+      // Re-create stream from htmlText if not an interstitial
+      const writeStream = fs.createWriteStream(tempZipPath);
+      writeStream.write(htmlText);
+      writeStream.end();
+      await new Promise((r) => writeStream.once('finish', r));
     }
-  } finally {
-    writeStream.end();
-    await new Promise((r) => writeStream.once('finish', r));
+  }
+
+  if (!fs.existsSync(tempZipPath)) {
+    const writeStream = fs.createWriteStream(tempZipPath);
+    let bytesDownloaded = 0;
+    try {
+      const readable = Readable.fromWeb(res.body);
+      for await (const chunk of readable) {
+        bytesDownloaded += chunk.length;
+        if (bytesDownloaded > MAX_ARCHIVE_BYTES) {
+          throw new Error(`Project archive size exceeds maximum limit of 50MB.`);
+        }
+        if (!writeStream.write(chunk)) {
+          await new Promise((r) => writeStream.once('drain', r));
+        }
+      }
+    } finally {
+      writeStream.end();
+      await new Promise((r) => writeStream.once('finish', r));
+    }
   }
 
   try {
-    logger.info(`[repoService] Extracting project archive to ${destFolder}`);
-    await extractZipToFolder(tempZipPath, destFolder);
+    if (!fs.existsSync(destFolder)) {
+      fs.mkdirSync(destFolder, { recursive: true });
+    }
+
+    // Inspect file header for ZIP magic bytes (PK\x03\x04)
+    const header = Buffer.alloc(4);
+    const fd = fs.openSync(tempZipPath, 'r');
+    fs.readSync(fd, header, 0, 4, 0);
+    fs.closeSync(fd);
+
+    const isZip = header[0] === 0x50 && header[1] === 0x4B && (header[2] === 0x03 || header[2] === 0x05);
+
+    if (isZip) {
+      logger.info(`[repoService] Extracting ZIP archive to ${destFolder}`);
+      await extractZipToFolder(tempZipPath, destFolder);
+    } else {
+      // Standalone text/code file (e.g. .py or .html or .js)
+      const sample = fs.readFileSync(tempZipPath, 'utf8').slice(0, 500).toLowerCase();
+      let targetName = 'solution.py';
+      if (sample.includes('<!doctype html') || sample.includes('<html')) {
+        targetName = 'index.html';
+      } else if (sample.includes('def ') || sample.includes('import ') || sample.includes('print(')) {
+        targetName = 'main.py';
+      } else if (sample.includes('function') || sample.includes('const ') || sample.includes('let ')) {
+        targetName = 'index.js';
+      }
+      logger.info(`[repoService] Standalone code file detected; copying to ${targetName}`);
+      fs.copyFileSync(tempZipPath, path.join(destFolder, targetName));
+    }
   } finally {
     try { fs.unlinkSync(tempZipPath); } catch {}
   }
@@ -238,7 +304,9 @@ export async function cloneRepo(repoUrl, options = {}) {
         fs.existsSync(path.join(subCandidate, 'package.json')) ||
         fs.existsSync(path.join(subCandidate, 'src')) ||
         fs.existsSync(path.join(subCandidate, 'server.js')) ||
-        fs.existsSync(path.join(subCandidate, 'app.js'))
+        fs.existsSync(path.join(subCandidate, 'app.js')) ||
+        fs.existsSync(path.join(subCandidate, 'index.html')) ||
+        fs.existsSync(path.join(subCandidate, 'main.py'))
       );
     });
 

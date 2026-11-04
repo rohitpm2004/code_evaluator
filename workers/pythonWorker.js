@@ -30,35 +30,38 @@ export async function initializePythonWorker() {
             const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
 
             let results;
-            if (canUseDocker) {
-              logger.info(`🐳 Python Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
-              const repoPath = await cloneRepo(repoUrl);
-              try {
-                results = await runPythonInDocker(repoPath, { testCases, entryFunction, evaluationMode });
-              } finally {
+            // Materialize submission source (direct code, IDE files, or downloaded repo/archive)
+            let repoPath = null;
+            let didClone = false;
+            const directCode = submission?.code || submission?.python_text || job.data?.code;
+
+            if (typeof directCode === 'string' && directCode.trim().length > 0) {
+              const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'py-eval-'));
+              await fs.promises.writeFile(path.join(tempDir, 'main.py'), directCode, 'utf8');
+              repoPath = tempDir;
+              didClone = true;
+            } else if (submission?.ideFiles && Array.isArray(submission.ideFiles) && submission.ideFiles.length > 0) {
+              const tempDir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'py-eval-'));
+              for (const file of submission.ideFiles) {
+                if (file.path && typeof file.content === 'string') {
+                  const fp = path.join(tempDir, file.path);
+                  await fs.promises.mkdir(path.dirname(fp), { recursive: true });
+                  await fs.promises.writeFile(fp, file.content, 'utf8');
+                }
+              }
+              repoPath = tempDir;
+              didClone = true;
+            } else {
+              repoPath = await cloneRepo(repoUrl);
+              didClone = true;
+            }
+
+            try {
+              results = await runPythonInDocker(repoPath, { testCases, entryFunction, evaluationMode });
+            } finally {
+              if (didClone && repoPath) {
                 await deleteRepo(repoPath);
               }
-            } else {
-              logger.info(`☁️ Python Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
-              results = await withTimeout(
-                (async () => {
-                  const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
-                  
-                  const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
-                  const extraPayload = { testCases, evaluationMode, entryFunction, expectedLogs };
-                  await triggerGraderWorkflow(repoUrl, job.id, webhookUrl, 'run-python-evaluation', extraPayload);
-                  
-                  const githubResult = await webhookPromise;
-                  
-                  if (githubResult.status === 'completed') {
-                    return githubResult.results || githubResult.evaluation || [];
-                  } else {
-                    throw new Error("GitHub Actions job failed or cancelled");
-                  }
-                })(),
-                config.timeout,
-                `python-eval ${job.id}`
-              );
             }
             
             let finalScore = 0;
@@ -103,14 +106,36 @@ export async function initializePythonWorker() {
 
             if (rubric && rubric.criteria && rubric.criteria.length > 0) {
               finalScore = 0; // Recalculate based on rubric weights
+              const testCaseList = Array.isArray(testCases) ? testCases : [];
+
               for (const c of rubric.criteria) {
                  const maxPts = typeof c.weight === 'number' ? c.weight : (typeof c.score === 'number' ? c.score : 0);
-                 const awardedPts = Math.round(maxPts * globalPassRatio);
-                 finalScore += awardedPts;
+                 const cName = (c.name || '').toLowerCase().trim();
 
-                 const reason = totalCount > 0 
-                    ? `Passed ${passedCount}/${totalCount} test cases.` 
-                    : "No test cases run.";
+                 // Match test cases bound specifically to this criterion
+                 const matchingTests = testCaseList.filter((tc) => {
+                   const tcCrit = (tc.criterion || '').toLowerCase().trim();
+                   const tcName = (tc.name || '').toLowerCase().trim();
+                   return tcCrit === cName || tcName === cName || cName.includes(tcCrit) || tcCrit.includes(cName);
+                 });
+
+                 let awardedPts = 0;
+                 let reason = '';
+
+                 if (matchingTests.length > 0) {
+                   const matchingPassed = matchingTests.filter(tc => {
+                     const r = Array.isArray(results) ? (results.find(res => res.name === tc.name) || results[testCaseList.indexOf(tc)]) : null;
+                     return r && r.passed;
+                   }).length;
+                   awardedPts = Math.round((matchingPassed / matchingTests.length) * maxPts);
+                   reason = `Passed ${matchingPassed}/${matchingTests.length} tests for this criterion.`;
+                 } else {
+                   // Fallback to globalPassRatio if tests were not bound by name
+                   awardedPts = Math.round(maxPts * globalPassRatio);
+                   reason = totalCount > 0 ? `Passed ${passedCount}/${totalCount} total test cases.` : "No test cases run.";
+                 }
+
+                 finalScore += awardedPts;
 
                  breakdown.push({
                    item: c.name,
@@ -119,13 +144,13 @@ export async function initializePythonWorker() {
                    reason
                  });
 
-                 if (globalPassRatio >= 1.0) {
+                 if (awardedPts === maxPts) {
                    strengths.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
-                 } else if (globalPassRatio >= 0.5) {
-                   strengths.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
-                   issues.push(`[${c.name}] Missed some test cases. (earned ${awardedPts}/${maxPts} marks)`);
+                 } else if (awardedPts > 0) {
+                   strengths.push(`[${c.name}] Partially correct (${awardedPts}/${maxPts} marks)`);
+                   issues.push(`[${c.name}] Missed some test cases: ${reason} (earned ${awardedPts}/${maxPts} marks)`);
                  } else {
-                   issues.push(`[${c.name}] ${reason} (earned ${awardedPts}/${maxPts} marks)`);
+                   issues.push(`[${c.name}] ${reason} (earned 0/${maxPts} marks)`);
                  }
               }
             }

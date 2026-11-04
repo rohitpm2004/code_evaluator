@@ -661,15 +661,30 @@ output_result({'results': results})
   const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app python:3.11-alpine python ${harnessFileName}`;
 
   try {
-    const { stdout } = await execPromise(dockerCmd, { timeout: 15000 });
+    const canDocker = await isDockerAvailable();
+    let stdout;
+    if (canDocker) {
+      const execRes = await execPromise(dockerCmd, { timeout: 15000 });
+      stdout = execRes.stdout;
+    } else {
+      logger.info('Docker not running, executing Python test harness via local python3 process...');
+      const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+      const execRes = await execPromise(`"${pythonBin}" "${harnessFileName}"`, {
+        cwd: repoPath,
+        timeout: 15000,
+        maxBuffer: 5 * 1024 * 1024
+      });
+      stdout = execRes.stdout;
+    }
+
     const match = stdout.match(/__EVAL_RESULT_START__([\s\S]*?)__EVAL_RESULT_END__/);
     const rawJson = match ? match[1].trim() : stdout.trim();
     const parsed = JSON.parse(rawJson);
     return parsed.results || [];
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
-    logger.error(`Docker Python test runner infrastructure error: ${err.message}`);
-    throw new Error(`Docker Python execution failed: ${err.message}`);
+    logger.error(`Python test runner error: ${err.message}`);
+    throw new Error(`Python execution failed: ${err.message}`);
   } finally {
     try { fs.unlinkSync(harnessFilePath); } catch {}
     try { fs.unlinkSync(testCasesFilePath); } catch {}
