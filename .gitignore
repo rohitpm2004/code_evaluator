@@ -32,6 +32,9 @@ inspect_redis.js
 scratch/
 scripts/check-redis-memory.mjs
 scripts/verify-sql-sandbox.mjs
+scripts/test-visual-style-checks.mjs
+scripts/test-visual-evaluator-end-to-end.mjs
+scripts/test-behavior-and-viewport.mjs
 test/
 
 # Guidance, information, and audit markdown files

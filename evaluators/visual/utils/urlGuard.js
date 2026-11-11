@@ -129,6 +129,6 @@ export function assertUrlSyntax(urlStr, opts = {}) {
 
 /** Comma-separated ALLOWED_GIT_HOSTS env → array (defaults to common hosts). */
 export function getAllowedGitHosts() {
-  const raw = process.env.ALLOWED_GIT_HOSTS || "github.com,gitlab.com,bitbucket.org";
+  const raw = process.env.ALLOWED_GIT_HOSTS || "github.com,gitlab.com,bitbucket.org,github.io,raw.githubusercontent.com,githubusercontent.com";
   return raw.split(",").map(s => s.trim()).filter(Boolean);
 }

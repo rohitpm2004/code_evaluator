@@ -50,6 +50,19 @@ function buildGithubRef(owner, repo, branch, subPath) {
 export function parseGithubTreeUrl(url) {
   const trimmed = url.trim();
 
+  if (trimmed.includes(".github.io")) {
+    try {
+      const parsed = new URL(trimmed);
+      const host = parsed.hostname.toLowerCase();
+      if (host.endsWith(".github.io")) {
+        const owner = host.replace(".github.io", "");
+        const pathParts = parsed.pathname.split("/").filter(Boolean);
+        const repo = pathParts[0] || `${owner}.github.io`;
+        return buildGithubRef(owner, repo, "main", null);
+      }
+    } catch {}
+  }
+
   const treeMatch = GITHUB_TREE_URL_RE.exec(trimmed);
   if (treeMatch) {
     const [, owner, repo, branch, rawPath] = treeMatch;

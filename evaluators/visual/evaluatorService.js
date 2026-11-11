@@ -24,7 +24,7 @@ import {
   buildDomBreakdown,
   buildBehaviorBreakdown
 } from "./scoring.js";
-import { readSourceText, computeCodeScore } from "./codeService.js";
+import { readSourceText, computeCodeScore, analyzeCodeSyntaxAndStructure } from "./codeService.js";
 import fs from "fs/promises";
 import os from "os";
 import path from "path";
@@ -86,7 +86,7 @@ async function renderExpectedScreenshot(context, expectedUrl) {
 }
 
 
-async function generateVisualAIFeedback({ studentName, rubric, score, domBreakdown, behaviorBreakdown, codeBreakdown, visualBreakdown, unifiedBreakdown, sourceText }) {
+async function generateVisualAIFeedback({ studentName, rubric, score, domBreakdown, behaviorBreakdown, codeBreakdown, visualBreakdown, unifiedBreakdown, sourceText, diagnostics, runtimeErrors }) {
   const openai = getOpenAI();
   if (!openai) return null;
 
@@ -96,22 +96,38 @@ async function generateVisualAIFeedback({ studentName, rubric, score, domBreakdo
       return `Criterion ${i + 1}: "${b.item}" [${status}] (${b.awarded}/${b.max} marks) - automated finding: ${b.reason || ""}`;
     }).join("\n");
 
-    const prompt = `You are an expert, objective code evaluator assessing a student's HTML/CSS/JavaScript project.
+    const diagnosticFindings = [
+      ...(diagnostics?.syntaxErrors || []).map(e => `[Syntax Error] ${e}`),
+      ...(diagnostics?.brokenLinks || []).map(e => `[Broken Link] ${e}`),
+      ...(diagnostics?.accessibilityIssues || []).map(e => `[Accessibility] ${e}`),
+      ...(runtimeErrors || []).map(e => `[Runtime Error] ${e}`)
+    ].slice(0, 10).join("\n");
+
+    const tierDesc = diagnostics?.detectedTier === 'html-only'
+      ? "HTML-only assignment. DO NOT expect, require, or penalize for missing CSS or JavaScript unless explicitly requested in the rubric criteria!"
+      : (diagnostics?.detectedTier === 'html-css'
+        ? "HTML & CSS assignment. DO NOT expect, require, or penalize for missing JavaScript unless explicitly requested in the rubric criteria!"
+        : "HTML, CSS & JavaScript DOM assignment.");
+
+    const prompt = `You are an expert, objective code evaluator assessing a student web project.
 Candidate Submission: ${studentName || "Student"}
 Overall Automated Score: ${score?.total ?? 0}/${score?.maxTotal ?? 100} (${score?.normalized ?? 0}%)
+Project Scope / Tier: ${tierDesc}
 
 Rubric Criteria & Automated Test Results:
 ${criteriaSummary}
-
+${diagnosticFindings ? `\nCode & Runtime Diagnostic Findings:\n${diagnosticFindings}\n` : ""}
 Candidate's Actual Source Code:
 ${(sourceText || "").slice(0, 15000)}
 
 Your evaluation guidelines:
+CRITICAL SCOPE RULE: Grade strictly according to the criteria listed above. If the rubric does NOT require JavaScript, NEVER mention JavaScript, setInterval, or Date APIs in your summary, strengths, or issues!
 1. "reconciliation": Inspect the candidate's code against each criterion in the EXACT order listed above:
+   - "awarded": Number of marks to award (between 0 and the criterion max). If the automated test FAILED or gave 0 purely because of selector specificity, class naming variation (e.g. .card vs .poster-card, or style.css vs index.css), or browser computed style quirks, but the candidate's source code genuinely contains the correct HTML/CSS implementation, AWARD fair credit! If the code is missing or fundamentally broken, award 0 or partial marks.
    - "reason": 1-2 concise, technical sentences citing the candidate's actual code (mentioning specific variables, element IDs/classes, or functions) explaining why this result was achieved.
 2. "summary": 2-3 concise, honest, and educational sentences summarizing what the candidate achieved, citing what worked well and what specifically was missing or had gaps in their code. Include one concrete actionable tip to improve.
 3. "strengths": Array of strings for criteria that passed or excelled. Each string MUST start with "[<Exact Criterion Name>] " and give a 1-2 sentence technical explanation citing what the candidate specifically implemented in their HTML, CSS, or JS (citing actual element tags, classes, functions, or APIs).
-4. "issues": Array of strings for criteria that have bugs, gaps, or lost marks. Each string MUST start with "[<Exact Criterion Name>] " and explain specifically what was missing, incorrect, or incomplete in their code. If and only if the candidate has 100% flawless implementation, provide 1 subtle best-practice suggestion or leave empty.
+4. "issues": Array of strings for criteria that have bugs, gaps, or lost marks, plus any real syntax/runtime/link errors detected. Each string MUST start with "[<Exact Criterion Name>] " (or "[Code Quality] " / "[Syntax Error] ") and explain specifically what was missing, incorrect, or incomplete in their code. If and only if the candidate has 100% flawless implementation, provide 1 subtle best-practice suggestion or leave empty.
 
 Return STRICT JSON only matching this format:
 {
@@ -122,6 +138,7 @@ Return STRICT JSON only matching this format:
     {
       "criterionIndex": 1,
       "item": "<Exact Criterion Name>",
+      "awarded": 15,
       "reason": "..."
     }
   ]
@@ -234,6 +251,7 @@ export async function evaluateStudentsWithVision({
   let server = null;
 
   try {
+    const diagnostics = await analyzeCodeSyntaxAndStructure(student);
     const { score: codeScore, breakdown: codeBreakdown } = await computeCodeScore(rubric, sourceText);
 
     // Per-job artifact dir (V-16/V-25) — unique, outside the source tree, always cleaned up.
@@ -289,6 +307,16 @@ export async function evaluateStudentsWithVision({
     const url = `${localUrl}${relativeHtml}`;
 
     const page = await context.newPage();
+    const runtimeErrors = [];
+    page.on("pageerror", (err) => {
+      runtimeErrors.push(`Runtime error: ${err.message || String(err)}`);
+    });
+    page.on("console", (msg) => {
+      if (msg.type() === "error") {
+        runtimeErrors.push(`Console error: ${msg.text()}`);
+      }
+    });
+
     try {
       const responsePage = await page.goto(url, { waitUntil: "networkidle", timeout: 30000 }); // V-24
       await page.evaluate(() => document.fonts && document.fonts.ready).catch(() => {}); // V-24
@@ -297,7 +325,37 @@ export async function evaluateStudentsWithVision({
       const screenshotPath = path.join(workDir, `${studentId || name}.png`);
       await page.screenshot({ path: screenshotPath, fullPage: false }); // V-26
 
-      const domResults = await runDynamicDomChecks(page, rubric);
+      const domResults = await runDynamicDomChecks(page, rubric, {
+        context,
+        localUrl,
+        normalizedBasePath,
+        htmlFiles: student.htmlFiles,
+        entryHtml: student.html
+      });
+
+      // If rubric has responsive criteria, re-evaluate on mobile viewport (375x667) so @media triggers!
+      const hasResponsiveCriteria = (rubric || []).some(r =>
+        /mobile|responsive|breakpoint|@media|768px|480px|375px|small screen/i.test(r.description || "")
+      );
+      if (hasResponsiveCriteria) {
+        try {
+          await page.setViewportSize({ width: 375, height: 667 });
+          await page.waitForTimeout(200);
+          const mobileDomResults = await runDynamicDomChecks(page, rubric, {
+            context,
+            localUrl,
+            normalizedBasePath,
+            htmlFiles: student.htmlFiles,
+            entryHtml: student.html
+          });
+          for (const [k, v] of Object.entries(mobileDomResults)) {
+            if (v && !domResults[k]) domResults[k] = true;
+          }
+          await page.setViewportSize(VIEWPORT);
+          await page.waitForTimeout(100);
+        } catch {}
+      }
+
       const behaviorResults = await runBehaviorChecks(page, rubric);
 
       // Deterministic, single-counted scores (V-07/V-21).
@@ -310,7 +368,10 @@ export async function evaluateStudentsWithVision({
       const bodyText = (await page
         .evaluate(() => (document.body ? document.body.innerText : ""))
         .catch(() => "")) || "";
-      const blank = bodyText.trim().length < 3;
+      const hasElements = await page
+        .evaluate(() => (document.body ? document.body.children.length > 0 : false))
+        .catch(() => false);
+      const blank = bodyText.trim().length < 3 && !hasElements;
       const badStatus = httpStatus >= 400;
       if (blank || badStatus) {
         const score = assembleScore({ rubric, domScore, behaviorScore, visualScore: 0, codeScore });
@@ -357,9 +418,12 @@ export async function evaluateStudentsWithVision({
 
       if (maxVisual > 0) {
         try {
-          const prompt = buildVisionPrompt(rubric, domResults, behaviorResults);
           const model = process.env.OPENAI_MODEL || "deepseek-chat";
           const isVisionModel = !model.includes("deepseek");
+          const prompt = buildVisionPrompt(rubric, domResults, behaviorResults, {
+            hasExpectedImg: Boolean(expectedImg),
+            isTextOnly: !isVisionModel
+          });
 
           let messages;
           if (isVisionModel) {
@@ -387,7 +451,7 @@ export async function evaluateStudentsWithVision({
             messages = [
               {
                 role: "user",
-                content: `${prompt}\n\nSTUDENT SOURCE CODE (HTML & CSS):\n${sourceText.slice(0, 4000)}`
+                content: `${prompt}\n\nSTUDENT SOURCE CODE (HTML, CSS & JS):\n${(sourceText || "").slice(0, 25000)}`
               }
             ];
           }
@@ -447,6 +511,19 @@ export async function evaluateStudentsWithVision({
         }
       });
 
+      if (diagnostics.syntaxErrors.length > 0) {
+        diagnostics.syntaxErrors.forEach(err => issues.push(`[Syntax] ${err}`));
+      }
+      if (diagnostics.brokenLinks.length > 0) {
+        diagnostics.brokenLinks.forEach(link => issues.push(`[Navigation] ${link}`));
+      }
+      if (runtimeErrors.length > 0) {
+        [...new Set(runtimeErrors)].slice(0, 5).forEach(err => issues.push(`[Console Error] ${err}`));
+      }
+      if (diagnostics.syntaxErrors.length === 0 && diagnostics.brokenLinks.length === 0 && runtimeErrors.length === 0) {
+        strengths.push("[Code Quality] Clean syntax with no broken relative links or runtime errors.");
+      }
+
       visualBreakdown.forEach(b => {
         if (b.max === 0) return; // Skip 0-weight/placeholder visual items
         if (b.awarded === b.max) {
@@ -473,7 +550,7 @@ export async function evaluateStudentsWithVision({
           item: b.item,
           awarded: b.awarded,
           max: b.max,
-          reason: b.awarded === b.max ? "Correct source code constructs and API usage." : "Missing required JavaScript functions, setInterval, or Date api."
+          reason: b.reason || (b.awarded === b.max ? "Correct source code constructs and file structure." : "Required source code patterns or files were incomplete.")
         })),
         ...visualBreakdown.filter(b => b.max > 0).map(b => ({
           item: b.item,
@@ -506,32 +583,44 @@ export async function evaluateStudentsWithVision({
         codeBreakdown,
         visualBreakdown,
         unifiedBreakdown,
-        sourceText
+        sourceText,
+        diagnostics,
+        runtimeErrors
       });
 
       let finalSummary = (aiFeedback?.summary || summaryText).replace(/\b(Candidate|Student)\b/g, name);
       const finalStrengths = (aiFeedback?.strengths && aiFeedback.strengths.length > 0) ? aiFeedback.strengths : strengths;
       const finalIssues = (aiFeedback?.issues && aiFeedback.issues.length > 0) ? aiFeedback.issues : issues;
 
-      // AI reconciliation enriches feedback reasons; numeric marks are kept 100% deterministic from automated tests.
+      // AI reconciliation enriches feedback reasons and reconciles marks for selector/naming variations
       const recList = aiFeedback?.reconciliation || aiFeedback?.breakdown || [];
       const finalBreakdown = unifiedBreakdown.map((autoItem, idx) => {
-        const rec = recList.find(r =>
-          (r.criterionIndex !== undefined && Number(r.criterionIndex) === idx + 1) ||
-          r.item === autoItem.item ||
-          autoItem.item.toLowerCase().includes(String(r.item || "").toLowerCase()) ||
-          String(r.item || "").toLowerCase().includes(autoItem.item.toLowerCase())
-        );
+        const rec = recList.find(r => {
+          if (r.criterionIndex !== undefined && Number(r.criterionIndex) === idx + 1) return true;
+          if (r.item && typeof r.item === 'string' && r.item.trim()) {
+            const rItem = r.item.trim().toLowerCase();
+            const autoLower = autoItem.item.trim().toLowerCase();
+            return rItem === autoLower || autoLower.includes(rItem) || rItem.includes(autoLower);
+          }
+          return false;
+        });
 
         if (rec) {
+          const recAwarded = Number(rec.awarded);
+          const awarded = !isNaN(recAwarded) ? Math.min(autoItem.max, Math.max(0, recAwarded)) : autoItem.awarded;
           return {
             ...autoItem,
+            awarded: Math.round(awarded * 100) / 100,
             reason: rec.reason || autoItem.reason
           };
         }
 
         return autoItem;
       });
+
+      const finalTotal = finalBreakdown.reduce((sum, it) => sum + (Number(it.awarded) || 0), 0);
+      score.total = Math.round(finalTotal * 100) / 100;
+      score.normalized = score.maxTotal > 0 ? Math.min(100, Math.round((score.total / score.maxTotal) * 100 * 100) / 100) : 0;
 
       results.push({
         name,
@@ -544,6 +633,7 @@ export async function evaluateStudentsWithVision({
         behaviorBreakdown,
         codeBreakdown,
         visualBreakdown,
+        diagnostics,
         feedback: {
           summary: finalSummary,
           strengths: finalStrengths,

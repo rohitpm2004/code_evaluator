@@ -43,7 +43,7 @@ const QUEUE_CONFIG = {
   visual: {
     jobName: 'visual-job',
     concurrency: parseInt(process.env.VISUAL_CONCURRENCY) || 2,
-    timeout: 30000,       // 30s Playwright DOM ceiling
+    timeout: 90000,       // 90s ceiling (covers git clone + multi-page Playwright DOM + AI reconciliation)
     description: 'Visual/UI Evaluation'
   },
   
@@ -374,12 +374,16 @@ class QueueManager {
     return Promise.all(
       jobIds.map(async (id) => {
         try {
-          // Fast-path: determine queue by explicit type, or infer from id prefix (e.g. 'excel-123' -> 'excel')
-          let targetQueue = type ? this.queues[type] : null;
-          if (!targetQueue && typeof id === 'string') {
+          // Priority 1: If job ID has an explicit queue prefix (e.g. 'visual-123' -> 'visual', 'excel-123' -> 'excel'),
+          // trust the ID prefix over any mismatched type passed by caller!
+          let targetQueue = null;
+          if (typeof id === 'string' && id.includes('-')) {
             const prefix = id.split('-')[0].toLowerCase();
             const normalized = prefix === 'js' ? 'javascript' : prefix;
             targetQueue = this.queues[normalized];
+          }
+          if (!targetQueue && type) {
+            targetQueue = this.queues[type];
           }
 
           if (targetQueue) {
@@ -393,11 +397,11 @@ class QueueManager {
                 failedReason: job.failedReason
               };
             }
-            return { id, state: 'not_found' };
           }
 
-          // Fallback only if queue type could not be determined at all: check all queues
+          // Fallback: search all queues
           for (const [qType, q] of Object.entries(this.queues)) {
+            if (q === targetQueue) continue;
             try {
               const job = await q.getJob(id);
               if (job) {
