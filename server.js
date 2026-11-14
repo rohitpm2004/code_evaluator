@@ -207,7 +207,7 @@ async function startServer() {
 
     // 6. Start server (bind explicitly to 0.0.0.0 for dual IPv4/loopback clarity on Windows)
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, '0.0.0.0', () => {
+    httpServer = app.listen(PORT, '0.0.0.0', () => {
       logger.info(`API Gateway running on port ${PORT}`);
     });
 
@@ -235,6 +235,7 @@ process.on('uncaughtException', (err) => {
 // Drain workers (waits for in-flight jobs + closes their browser pools),
 // then close queues/Redis. A hard-exit timer guards against a hung close
 // so we never leak zombie Chromium processes across a deploy.
+let httpServer = null;
 let shuttingDown = false;
 /**
  * Drain workers and disconnect queues on shutdown, with a deadline that forces process exit.
@@ -244,13 +245,16 @@ async function shutdown(signal) {
   shuttingDown = true;
   logger.info(`Received ${signal}, shutting down gracefully...`);
 
+  // Force exit within 8s if any connection or socket hangs
   const hardExit = setTimeout(() => {
     logger.error('Graceful shutdown timed out — forcing exit');
     process.exit(1);
-  }, 30000);
-  hardExit.unref();
+  }, 8000);
 
   try {
+    if (httpServer) {
+      await new Promise((resolve) => httpServer.close(resolve)).catch(() => {});
+    }
     await stopVisualWorker();
     await stopJsWorker();
     await stopBackendWorker();
@@ -259,8 +263,9 @@ async function shutdown(signal) {
     await stopFullstackWorker();
     await stopExcelWorker();
     await stopSqlWorker();
-    await queueManager.disconnect();
+    await queueManager.disconnect().catch(() => {});
     logger.info('Shutdown complete');
+    clearTimeout(hardExit);
     process.exit(0);
   } catch (err) {
     logger.error('Error during shutdown:', err);
