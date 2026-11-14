@@ -430,7 +430,19 @@ async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes, matchContext = {}
             });
             const maxS = Math.max(...scored.map((x) => x.s));
             if (maxS > 0) {
-              const filtered = scored.filter((x) => x.s >= Math.ceil(maxS * 0.6));
+              scored.sort((a, b) => b.s - a.s);
+              const top = scored[0];
+              const topHasQueries = /SELECT\b/i.test(top.text);
+              const isDominant = !scored[1] || top.s >= (scored[1].s * 1.3) || (top.s >= 5 && scored[1].s < top.s);
+
+              // If the top file already contains solution queries and is the best match,
+              // select it alone — NEVER bundle unrelated assignment files from the same student repository!
+              if (topHasQueries && isDominant) {
+                logger.info(`[SqlLoader] Smart-selected top-matching GitHub SQL file '${top.path}' (score: ${top.s}) out of ${contents.length} file(s).`);
+                return { combinedSql: top.formatted };
+              }
+
+              const filtered = scored.filter((x) => x.s >= Math.max(3, Math.ceil(maxS * 0.8)));
               if (filtered.length > 0 && filtered.length < contents.length) {
                 logger.info(`[SqlLoader] Smart-selected ${filtered.length}/${contents.length} matching GitHub SQL file(s): ${filtered.map((f) => f.path).join(', ')}`);
                 return { combinedSql: filtered.map((f) => f.formatted).join('\n\n') };
