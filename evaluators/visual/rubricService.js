@@ -30,8 +30,26 @@ export async function parseRubricWithSelectors(text) {
     return JSON.parse(JSON.stringify(RUBRIC_CACHE.get(cacheKey)));
   }
 
+  let targetTotal = 100;
+  try {
+    const directParse = JSON.parse(text.trim());
+    const candidateList = Array.isArray(directParse) ? directParse : (directParse?.items || directParse?.criteria || directParse?.rubric);
+    if (Array.isArray(candidateList)) {
+      const wSum = candidateList.reduce((s, it) => s + (Number(it.weight || it.max_marks || it.points) || 0), 0);
+      if (wSum > 0) targetTotal = wSum;
+      if (candidateList.length > 0 && candidateList.every(i => i && i.type && Array.isArray(i.checks))) {
+        const normalized = normalizeRubric(candidateList, targetTotal);
+        RUBRIC_CACHE.set(cacheKey, normalized);
+        return JSON.parse(JSON.stringify(normalized));
+      }
+    }
+  } catch {}
+
   const prompt = `
 Convert the rubric into STRICT JSON.
+
+TOTAL WEIGHT CONSTRAINT: The total sum of weights across all items in the returned JSON MUST EQUAL EXACTLY ${targetTotal}.
+If you split a criterion into multiple checks (e.g. both a "code" check for DOCTYPE and a "dom" check for structure), divide the weight proportionally so the total never exceeds ${targetTotal}.
 
 VERY IMPORTANT CLASSIFICATION RULES — this tool has FIVE ways to verify a
 criterion. Pick the one that actually matches; almost everything is
@@ -39,6 +57,7 @@ verifiable one of these ways, so "manual" should be RARE.
 
 - "dom" → HTML structure/elements in the rendered page. Conditions:
     "exists" | "visible" | "textContains" | "attr" (one-time static checks)
+    "style" → verifies computed CSS properties directly via browser engine (e.g. "uses flexbox layout", "header has dark background", "card has border-radius"). Give "property" (e.g. "display") and "expected" (e.g. "flex, inline-flex" or "10px").
     "updatesOverTime" → proves a value is actually LIVE by reading it twice
       ~1 second apart and requiring it to change (e.g. "clock updates every
       second", "counter increments").
@@ -46,12 +65,18 @@ verifiable one of these ways, so "manual" should be RARE.
       it to the real current date/time. "expected" MUST be the display
       format using tokens YYYY, MM, DD, HH (24h), hh (12h), mm, ss, A
       (AM/PM) — e.g. "DD/MM/YYYY" or "hh:mm:ss A".
-- "behavior" → a click. TWO modes:
-    (default) the click NAVIGATES to a new URL/tab (e.g. an external link).
+    CRITICAL SELECTOR RULE: NEVER guess arbitrary class names or IDs (like .poster-card, .photo-item, #myButton) unless they are explicitly named in the rubric text. Instead, write PURPOSE-DRIVEN semantic selectors using standard HTML5 tags and broad attribute matches:
+    - Semantic tags: header, nav, main, section, article, figure, figcaption, footer, h1, h2, h3, img, button, form, input.
+    - Flexible classes: [class*="card"], .card, article, figure or [class*="gallery"], main, .container
+    - Multiple options separated by commas: header, [role="banner"], nav
+- "behavior" → an interaction. Modes:
+    (default) action:"click" → clicks a link or button. Navigates or opens a new URL/tab.
+    action:"type" → types text into an <input> or <textarea>. Give "selector" and "value" (e.g. "Buy milk").
+    action:"submit" → submits a form. Give "selector" (e.g. "form, #todo-form").
     mode:"stateChange" → the click changes something ON THE SAME PAGE without
-      navigating (a toggle button, a format switcher, a show/hide). Give
-      "targetSelector" (the element whose text is expected to change) — the
-      check passes if that element's text is different after the click.
+      navigating (a toggle button, a format switcher, an item addition, a modal/accordion). Give
+      "targetSelector" (the element whose text or state is expected to change) — the
+      check passes if that element's content changes after the click.
 - "visual" → subjective layout/design/appearance judged from a SCREENSHOT
   (alignment, colors, spacing, typography, responsiveness). Only for things
   visibly different between two static images.
@@ -69,8 +94,7 @@ verifiable one of these ways, so "manual" should be RARE.
       student who names their file "style.css" instead of "styles.css" would
       wrongly fail despite linking it correctly. Instead check for a REAL
       <link rel="stylesheet" href="*.css"> / <script src="*.js"> tag,
-      independent of the exact filename: checks = [{ "kind": "filesLinked",
-      "target": "css" }, { "kind": "filesLinked", "target": "js" }]
+      independent of the exact filename: checks = [{ "kind": "filesLinked", "target": "css" }] (only add "target": "js" if the rubric explicitly involves JavaScript).
     quality check → subjective judgment (e.g. "code quality", "meaningful
       variable names", "proper indentation") — GPT reads the actual source
       text and judges it directly. checks = [{ "kind": "quality" }]
@@ -93,6 +117,10 @@ EXAMPLES:
 Favicon (static structure) →
 { "type": "dom", "description": "Has a favicon", "weight": 5,
   "checks": [{ "selector": "link[rel='icon']", "condition": "exists" }] }
+
+CSS Flexbox / Grid Layout (verifies real computed styling deterministically) →
+{ "type": "dom", "description": "Navigation links use Flexbox layout", "weight": 10,
+  "checks": [{ "selector": "nav, header nav, .navbar", "condition": "style", "property": "display", "expected": "flex, inline-flex" }] }
 
 Live clock (must be observed changing) →
 { "type": "dom", "description": "Time updates every second", "weight": 10,
@@ -145,7 +173,7 @@ ${text}
     throw new RubricParseError(`Rubric JSON parse failed: ${err.message}`);
   }
 
-  const normalized = normalizeRubric(parsed);
+  const normalized = normalizeRubric(parsed, targetTotal);
   if (RUBRIC_CACHE.size >= RUBRIC_CACHE_MAX) {
     RUBRIC_CACHE.delete(RUBRIC_CACHE.keys().next().value);
   }

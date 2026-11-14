@@ -113,11 +113,29 @@ export async function resolveElement(page, selector) {
   if (!selector) return null;
   const rawSel = String(selector).trim();
 
+  // 0. Handle comma-separated selectors (e.g. "header, nav, #app" or "input#task-input, input[type='text']")
+  if (rawSel.includes(',')) {
+    const parts = rawSel.split(',').map(s => s.trim()).filter(Boolean);
+    for (const part of parts) {
+      const el = await resolveElement(page, part);
+      if (el) return el;
+    }
+  }
+
   // 1. Try widened selector directly (handles exact id/class with camelCase, kebab-case, snake_case)
   try {
     const el = await page.$(widenSelector(rawSel));
     if (el) return el;
   } catch {}
+
+  // 1b. If selector uses child combinators (e.g. .gallery > div), relax child tag to match any child element (figure, article, etc.)
+  if (rawSel.includes('>')) {
+    try {
+      const relaxed = rawSel.replace(/>\s*[a-zA-Z0-9_-]+/g, '> *');
+      const el = await page.$(relaxed);
+      if (el) return el;
+    } catch {}
+  }
 
   // 2. Extract keywords from selector: e.g. #toggle-btn -> ["toggle", "btn"], #calc-screen -> ["calc", "screen"]
   const clean = rawSel.replace(/^[.#]/, '').replace(/[^a-zA-Z0-9_-]/g, ' ');
@@ -221,6 +239,57 @@ async function evaluateCheck(page, check) {
       return value ? actual.includes(value) : true;
     }
 
+    case "style":
+    case "computedstyle": {
+      const prop = check.property || (check.expected && check.expected.includes(":") ? check.expected.split(":")[0].trim() : (check.expected && check.expected.includes("=") ? check.expected.split("=")[0].trim() : "display"));
+      const expectedVal = check.value || (check.expected && check.expected.includes(":") ? check.expected.split(":")[1].trim() : (check.expected && check.expected.includes("=") ? check.expected.split("=")[1].trim() : check.expected));
+
+      const actual = await el.evaluate((node, propertyName) => {
+        const computed = window.getComputedStyle(node);
+        return computed.getPropertyValue(propertyName) || computed[propertyName] || "";
+      }, prop).catch(() => "");
+
+      if (!expectedVal) return Boolean(actual && actual !== "none");
+      const expectedLower = String(expectedVal).toLowerCase();
+      const actualLower = String(actual).toLowerCase();
+
+      // CSS Grid track breadth tolerance: computed style resolves repeat() into pixel tracks (e.g. "180px 180px")
+      if ((prop === "grid-template-columns" || prop === "gridTemplateColumns") && (expectedLower.includes("repeat") || expectedLower.includes("auto-fill") || expectedLower.includes("minmax") || expectedLower.includes("fr"))) {
+        if (actualLower && actualLower !== "none") return true;
+      }
+
+      // Margin auto tolerance: computed style resolves margin: auto into pixel distances or shorthand empty
+      if (prop === "margin" && expectedLower.includes("auto")) {
+        const hasAuto = await el.evaluate((node) => {
+          const comp = window.getComputedStyle(node);
+          return (comp.marginLeft && comp.marginLeft !== "0px" && comp.marginLeft === comp.marginRight) ||
+                 (node.getAttribute("style") || "").includes("auto");
+        }).catch(() => false);
+        if (hasAuto) return true;
+      }
+
+      // Box-shadow tolerance: any active box-shadow satisfies the styling requirement
+      if ((prop === "box-shadow" || prop === "boxShadow") && actualLower && actualLower !== "none") {
+        return true;
+      }
+
+      if (expectedLower.includes(",")) {
+        return expectedLower.split(",").map(v => v.trim()).includes(actualLower);
+      }
+      return actualLower.includes(expectedLower);
+    }
+
+    case "mincount":
+    case "count": {
+      const min = Number(check.expected || check.count || 1);
+      let elements = await page.$$(widenSelector(check.selector)).catch(() => []);
+      if (elements.length < min && check.selector && check.selector.includes('>')) {
+        const relaxed = check.selector.replace(/>\s*[a-zA-Z0-9_-]+/g, '> *');
+        elements = await page.$$(relaxed).catch(() => elements);
+      }
+      return elements.length >= min;
+    }
+
     case "updatesovertime": {
       const before = ((await el.textContent()) || "").trim();
       if (!before) return false;
@@ -284,8 +353,9 @@ async function evaluateCheck(page, check) {
   }
 }
 
-export async function runDynamicDomChecks(page, rubric) {
+export async function runDynamicDomChecks(page, rubric, options = {}) {
   const results = {};
+  const failedChecks = [];
 
   for (const item of rubric) {
     if (item.type !== "dom" || !item.checks) continue;
@@ -297,9 +367,45 @@ export async function runDynamicDomChecks(page, rubric) {
         const passed = await evaluateCheck(page, check);
         results[indexedKey] = passed;
         results[unindexedKey] = passed;
+        if (!passed) {
+          failedChecks.push({ item, index: i, check, indexedKey, unindexedKey });
+        }
       } catch {
         results[indexedKey] = false;
         results[unindexedKey] = false;
+        failedChecks.push({ item, index: i, check, indexedKey, unindexedKey });
+      }
+    }
+  }
+
+  // Multi-page resolution:
+  // If some checks failed on the entry page, and this submission has multiple HTML files
+  // (e.g. contact.html, departments.html, studentlife.html), check the remaining failed
+  // checks against the other pages so multi-page HTML websites are fairly evaluated!
+  const { context, localUrl, normalizedBasePath, htmlFiles, entryHtml } = options;
+  if (failedChecks.length > 0 && context && localUrl && Array.isArray(htmlFiles) && htmlFiles.length > 1) {
+    const otherHtmls = htmlFiles.filter(f => f !== entryHtml);
+    for (const otherPath of otherHtmls) {
+      if (failedChecks.every(fc => results[fc.indexedKey])) break; // All resolved!
+      let otherPage = null;
+      try {
+        const normBase = (normalizedBasePath || "").replace(/\\/g, "/");
+        const rel = otherPath.replace(/\\/g, "/").replace(normBase, "");
+        const otherUrl = `${localUrl}${rel.startsWith('/') ? rel : '/' + rel}`;
+        otherPage = await context.newPage();
+        await otherPage.goto(otherUrl, { waitUntil: "domcontentloaded", timeout: 8000 });
+        for (const fc of failedChecks) {
+          if (results[fc.indexedKey]) continue; // already passed on a previous page
+          try {
+            const passedOnOther = await evaluateCheck(otherPage, fc.check);
+            if (passedOnOther) {
+              results[fc.indexedKey] = true;
+              results[fc.unindexedKey] = true;
+            }
+          } catch {}
+        }
+      } catch {} finally {
+        if (otherPage) await otherPage.close().catch(() => {});
       }
     }
   }

@@ -169,6 +169,138 @@ function validateFullstackPayload(payload) {
   validateRubricCriteria(rubric);
 }
 
+/**
+ * Validate single or batch Excel file references, remote URLs, and optional rubric criteria.
+ * @throws {ValidationError} When a required file reference or its format is invalid.
+ */
+async function validateExcelPayload(payload) {
+  /**
+   * Recognize supported workbook paths and spreadsheet links; reject legacy .xls files.
+   */
+  const isUrlValidSpreadsheet = (url) => {
+    if (!url || typeof url !== 'string') return false;
+    const lower = url.trim().toLowerCase();
+    if (lower.includes('docs.google.com') || lower.includes('drive.google.com') || lower.includes('sheets.google.com')) return true;
+    if (lower.includes('onedrive') || lower.includes('1drv.ms') || lower.includes('sharepoint.com') || lower.includes('api.onedrive.com')) return true;
+    if (lower.includes('format=xlsx') || lower.includes('export=download') || lower.includes('/root/content')) return true;
+    const clean = lower.split('?')[0];
+    if (clean.endsWith('.xls')) {
+      throw new ValidationError('Legacy Excel (.xls) format is not supported. Please export or convert your spreadsheet to modern OpenXML (.xlsx).');
+    }
+    if (clean.endsWith('.xlsx') || clean.endsWith('.xlsm')) return true;
+    try {
+      const parsed = new URL(url.trim());
+      if (parsed.protocol === 'http:' || parsed.protocol === 'https:') return true;
+    } catch {}
+    return false;
+  };
+
+  const urlsToCheck = [];
+
+  if (Array.isArray(payload.submissions) && payload.submissions.length > 0) {
+    for (const s of payload.submissions) {
+      const u = s.fileUrl || s.submission_file_url || s.filePath || s.submission_link || s.repoUrl;
+      if (u && isUrlValidSpreadsheet(u)) {
+        urlsToCheck.push(u);
+      }
+    }
+  } else {
+    const fileUrl = payload.fileUrl || payload.submission_file_url || payload.filePath || payload.submission_link || payload.repoUrl;
+    if (!fileUrl || typeof fileUrl !== 'string' || !fileUrl.trim()) {
+      throw new ValidationError('fileUrl or filePath is required for excel evaluation');
+    }
+    if (!isUrlValidSpreadsheet(fileUrl)) {
+      throw new ValidationError('Invalid file type: Excel evaluator accepts .xlsx workbooks and Google Sheets / Excel links.');
+    }
+    urlsToCheck.push(fileUrl);
+  }
+
+  for (const u of urlsToCheck) {
+    if (u.startsWith('http://') || u.startsWith('https://')) {
+      assertUrlSyntax(u);
+    }
+  }
+
+  if (payload.rubric) {
+    validateRubricCriteria(payload.rubric);
+  }
+}
+
+/**
+ * Validate SQL evaluation payload before it enters BullMQ.
+ * Checks that submissions provide SQL content (sqlText, ideFiles, or a URL),
+ * and that the manifest structure is present with valid test cases.
+ * @throws {ValidationError} When required SQL fields are missing or malformed.
+ */
+export function validateSqlPayload(payload) {
+  // Normalize root-level single submission if sent without submissions array
+  if (!Array.isArray(payload.submissions) && (payload.submissionId || payload.fileUrl || payload.sqlText)) {
+    payload.submissions = [{
+      submissionId: payload.submissionId,
+      fileUrl: payload.fileUrl || payload.submission_file_url || payload.submission_link,
+      sqlText: payload.sqlText,
+      ideFiles: payload.ideFiles,
+      studentName: payload.studentName,
+      studentId: payload.studentId,
+    }];
+  }
+
+  const { submissions, manifest, testCases } = payload;
+
+  if (!Array.isArray(submissions) || submissions.length === 0) {
+    throw new ValidationError('submissions must be a non-empty array for SQL evaluation');
+  }
+
+  if (submissions.length > MAX_SUBMISSIONS) {
+    throw new ValidationError(`Too many submissions (max ${MAX_SUBMISSIONS})`);
+  }
+
+  for (const s of submissions) {
+    const hasSqlText = typeof s.sqlText === 'string' && s.sqlText.trim().length > 0;
+    const hasIdeFiles = Array.isArray(s.ideFiles) && s.ideFiles.length > 0;
+    const hasFileUrl = typeof (s.submission_file_url || s.submission_link || s.repoUrl || s.fileUrl) === 'string';
+
+    if (!hasSqlText && !hasIdeFiles && !hasFileUrl) {
+      throw new ValidationError(
+        'Each SQL submission must provide sqlText, ideFiles, submission_link, submission_file_url, or repoUrl'
+      );
+    }
+
+    // If a URL is provided (not inline SQL), do a fast allowlist check
+    if (!hasSqlText && !hasIdeFiles) {
+      const url = s.submission_file_url || s.submission_link || s.repoUrl || s.fileUrl;
+      if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+        // Git repo URLs get allowlist check; S3/presigned URLs are accepted as-is
+        try {
+          const parsedUrl = new URL(url);
+          const gitHosts = getAllowedGitHosts();
+          if (gitHosts.some(h => parsedUrl.hostname.endsWith(h))) {
+            assertUrlSyntax(url, { allowedHosts: gitHosts });
+          }
+        } catch (urlErr) {
+          if (urlErr instanceof ValidationError) throw urlErr;
+          // Non-git URL (S3, presigned) — accepted without git-host check
+        }
+      }
+    }
+  }
+
+  // Validate manifest or testCases presence
+  const sqlManifest = manifest || testCases;
+  if (!sqlManifest || typeof sqlManifest !== 'object') {
+    throw new ValidationError(
+      'SQL evaluation requires a manifest or testCases object containing fixtures, reference query, and test assertions'
+    );
+  }
+
+  if (payload.rubric) {
+    validateRubricCriteria(payload.rubric);
+  }
+}
+
+/**
+ * Validate an evaluation request, enqueue its submissions, and respond with job IDs or errors.
+ */
 export async function evaluate(req, res) {
   try {
     const payload = req.body || {};
@@ -192,6 +324,10 @@ export async function evaluate(req, res) {
       validateJavascriptPayload(payload);
     } else if (payload.type === 'fullstack') {
       validateFullstackPayload(payload);
+    } else if (payload.type === 'excel') {
+      await validateExcelPayload(payload);
+    } else if (payload.type === 'sql') {
+      validateSqlPayload(payload);
     }
 
     const jobs = await routeEvaluation(payload);

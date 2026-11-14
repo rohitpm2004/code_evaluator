@@ -13,7 +13,7 @@ import { chromium } from 'playwright';
 import logger from '../../config/logger.js';
 
 class BrowserPool {
-  constructor(poolSize = 3) {
+  constructor(poolSize = (parseInt(process.env.BROWSER_POOL_SIZE, 10) || 2)) {
     this.poolSize = poolSize;
     this.browsers = [];
     this.available = [];
@@ -211,7 +211,7 @@ class BrowserPool {
 // Create singleton
 let browserPoolInstance = null;
 
-export async function getBrowserPool(poolSize = 3) {
+export async function getBrowserPool(poolSize = (parseInt(process.env.BROWSER_POOL_SIZE, 10) || 2)) {
   if (!browserPoolInstance) {
     browserPoolInstance = new BrowserPool(poolSize);
   }

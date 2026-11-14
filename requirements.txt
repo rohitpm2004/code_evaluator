@@ -1,0 +1,7 @@
+# Python dependencies for central-evaluator Excel dual-workbook runner
+openpyxl>=3.1.2
+
+# Python dependencies for central-evaluator SQL Evaluator
+sqlglot==25.20.0
+psycopg[binary]>=3.1.18
+psutil>=5.9.0

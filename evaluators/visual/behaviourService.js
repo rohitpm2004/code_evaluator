@@ -14,7 +14,6 @@
 import { widenSelector, resolveElement } from "./domService.js";
 
 const CHECK_TIMEOUT = 5000;
-const CLOCK_SELECTOR = "#time, #clock, .time, .clock";
 
 async function runStateChangeCheck(page, check) {
   const targetSelector = check.targetSelector || check.selector;
@@ -26,9 +25,13 @@ async function runStateChangeCheck(page, check) {
   const before = beforeEl ? ((await beforeEl.textContent()) || "").trim() : null;
   const beforeBtn = ((await btn.textContent()) || "").trim();
 
-  // Capture fallback clock target text BEFORE click
-  const clockEl = await resolveElement(page, CLOCK_SELECTOR);
-  const beforeClock = clockEl ? ((await clockEl.textContent()) || "").trim() : null;
+  // If there's an input value to fill before state change (e.g. typing a todo item before click add)
+  if (check.inputValue && check.inputSelector) {
+    const inputEl = (await resolveElement(page, check.inputSelector)) || (await page.$(widenSelector(check.inputSelector)));
+    if (inputEl) {
+      await inputEl.fill(String(check.inputValue)).catch(() => {});
+    }
+  }
 
   await btn.click().catch(() => {});
 
@@ -39,28 +42,23 @@ async function runStateChangeCheck(page, check) {
 
     const afterEl = (await resolveElement(page, targetSelector)) || (await page.$(widenSelector(targetSelector)));
     const after = afterEl ? ((await afterEl.textContent()) || "").trim() : null;
-    if (before !== null && after !== null && before !== after) return true;
+    if (before !== null && after !== null && before !== after) {
+      if (check.expected) {
+        if (after.toLowerCase().includes(String(check.expected).toLowerCase())) return true;
+      } else {
+        return true;
+      }
+    }
 
     const afterBtn = ((await btn.textContent()) || "").trim();
     if (beforeBtn && afterBtn && beforeBtn !== afterBtn) return true;
 
-    const isClockCheck = 
-      (targetSelector || "").toLowerCase().includes("clock") || 
-      (targetSelector || "").toLowerCase().includes("time") || 
-      (check.selector || "").toLowerCase().includes("clock") || 
-      (check.selector || "").toLowerCase().includes("format");
-
-    if (isClockCheck && beforeClock !== null) {
-      const clockAgain = (await resolveElement(page, CLOCK_SELECTOR)) || clockEl;
-      const afterClock = clockAgain ? ((await clockAgain.textContent()) || "").trim() : null;
-      if (afterClock !== null) {
-        // Only pass if the clock format itself changed (e.g. 12h/24h toggle, AM/PM presence),
-        // NOT merely because seconds ticked forward
-        const hasAmPmBefore = /am|pm/i.test(beforeClock);
-        const hasAmPmAfter = /am|pm/i.test(afterClock);
-        if (hasAmPmBefore !== hasAmPmAfter) return true;
-        if (check.expected && afterClock.toLowerCase().includes(check.expected.toLowerCase())) return true;
-      }
+    // Attribute or class changes (e.g. dark mode toggle, aria-expanded, hidden attribute)
+    if (beforeEl && afterEl) {
+      const mutated = await afterEl.evaluate((node, oldBefore) => {
+        return node.className !== oldBefore || node.getAttribute("aria-expanded") === "true";
+      }, before).catch(() => false);
+      if (mutated) return true;
     }
   }
 
@@ -88,6 +86,44 @@ export default async function runBehaviorChecks(page, rubric) {
         try {
           const passed = await runStateChangeCheck(page, check);
           setCheckResult(passed);
+        } catch {
+          setCheckResult(false);
+        }
+        continue;
+      }
+
+      // Action: type / fill text into an input or textarea
+      if (check.action === "type" || check.action === "fill" || check.action === "input") {
+        try {
+          const el = (await resolveElement(page, check.selector)) || (await page.$(widenSelector(check.selector)));
+          if (!el) {
+            setCheckResult(false);
+            continue;
+          }
+          const textToType = check.value || check.text || check.expected || "Test Item";
+          await el.fill(String(textToType)).catch(() => {});
+          const actualVal = await el.inputValue().catch(() => "");
+          setCheckResult(actualVal.length > 0);
+        } catch {
+          setCheckResult(false);
+        }
+        continue;
+      }
+
+      // Action: submit a form
+      if (check.action === "submit") {
+        try {
+          const el = (await resolveElement(page, check.selector)) || (await page.$(widenSelector(check.selector)));
+          if (!el) {
+            setCheckResult(false);
+            continue;
+          }
+          await el.evaluate(node => {
+            if (node.requestSubmit) node.requestSubmit();
+            else if (node.submit) node.submit();
+            else node.dispatchEvent(new Event('submit', { bubbles: true, cancelable: true }));
+          }).catch(() => {});
+          setCheckResult(true);
         } catch {
           setCheckResult(false);
         }
