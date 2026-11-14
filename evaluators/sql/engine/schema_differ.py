@@ -10,6 +10,13 @@ import difflib
 import logging
 from typing import Dict, Any, List, Tuple, Optional, Set
 
+try:
+    import sqlglot
+    from sqlglot import exp
+    HAS_SQLGLOT = True
+except ImportError:
+    HAS_SQLGLOT = False
+
 logger = logging.getLogger("schema_differ")
 
 
@@ -199,10 +206,129 @@ def normalize_student_ddl(
     return normalized_sql, alias_map, applied_notices
 
 
+def rewrite_query_with_schema_mapping(
+    query: str,
+    schema_mapping: Optional[Dict[str, Any]] = None,
+    created_tables: Optional[List[str]] = None
+) -> str:
+    """
+    Scope-aware AST query rewriter for student custom schemas.
+    Re-maps physical tables and columns using AST traversal (sqlglot) while strictly
+    preserving table aliases, CTE scopes, correlated subqueries, comments, and string literals.
+    """
+    if not query or not query.strip():
+        return query
+
+    table_map: Dict[str, str] = {}
+    col_map: Dict[str, str] = {}
+    qualified_col_map: Dict[Tuple[str, str], str] = {}
+
+    if schema_mapping:
+        # Extract tables
+        raw_tables = schema_mapping.get('tables', {})
+        if isinstance(raw_tables, dict):
+            for k, v in raw_tables.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    table_map[k.strip().lower()] = v.strip().lower()
+
+        # Extract columns
+        raw_cols = schema_mapping.get('columns', {})
+        if isinstance(raw_cols, dict):
+            for k, v in raw_cols.items():
+                if isinstance(v, dict):
+                    # Table-scoped columns: {"employees": {"employee_id": "id"}}
+                    tbl = k.strip().lower()
+                    for c_orig, c_new in v.items():
+                        if isinstance(c_orig, str) and isinstance(c_new, str):
+                            qualified_col_map[(tbl, c_orig.strip().lower())] = c_new.strip().lower()
+                            col_map[c_orig.strip().lower()] = c_new.strip().lower()
+                elif isinstance(k, str) and isinstance(v, str):
+                    col_map[k.strip().lower()] = v.strip().lower()
+
+    # Fallback table inference if not in explicit map
+    if created_tables:
+        for ct in created_tables:
+            ct_lower = ct.lower()
+            if ct_lower not in table_map.values():
+                for m in re.finditer(r'\b(?:FROM|JOIN)\s+([a-zA-Z0-9_]+)\b', query, re.I):
+                    ref_tbl = m.group(1).lower()
+                    if ref_tbl not in table_map and ref_tbl != ct_lower:
+                        if compute_name_similarity(ref_tbl, ct_lower) >= 0.7 or len(created_tables) == 1:
+                            table_map[ref_tbl] = ct_lower
+
+    if not table_map and not col_map and not qualified_col_map:
+        return query
+
+    # Preferred AST Path via sqlglot: Scope-aware, protects literals and aliases
+    if HAS_SQLGLOT:
+        try:
+            tree = sqlglot.parse_one(query, read='postgres')
+
+            # 1. Collect CTE names: table references matching CTE names must NOT be rewritten
+            cte_names = set()
+            for cte in tree.find_all(exp.CTE):
+                if cte.alias:
+                    cte_names.add(cte.alias.lower())
+
+            # 2. Map table references
+            for t in tree.find_all(exp.Table):
+                t_name = (t.name or '').lower()
+                if t_name in cte_names:
+                    continue
+                if t_name in table_map:
+                    t.set('this', exp.to_identifier(table_map[t_name]))
+
+            # 3. Map column references
+            for c in tree.find_all(exp.Column):
+                c_name = (c.name or '').lower()
+                c_tbl = (c.table or '').lower()
+
+                if c_tbl and (c_tbl, c_name) in qualified_col_map:
+                    new_tbl = table_map.get(c_tbl, c_tbl)
+                    c.set('table', exp.to_identifier(new_tbl))
+                    c.set('this', exp.to_identifier(qualified_col_map[(c_tbl, c_name)]))
+                elif c_tbl and c_tbl in table_map:
+                    new_tbl = table_map[c_tbl]
+                    c.set('table', exp.to_identifier(new_tbl))
+                    if c_name in col_map:
+                        c.set('this', exp.to_identifier(col_map[c_name]))
+                elif c_name in col_map:
+                    c.set('this', exp.to_identifier(col_map[c_name]))
+
+            return tree.sql(dialect='postgres')
+        except Exception as ast_err:
+            logger.debug(f"AST schema rewriting fallback to regex: {ast_err}")
+
+    # Fallback regex path
+    rewritten = query
+    for (tbl, orig_col), new_col in qualified_col_map.items():
+        new_tbl = table_map.get(tbl, tbl)
+        pattern = rf'\b{re.escape(tbl)}\.{re.escape(orig_col)}\b'
+        rewritten = re.sub(pattern, f"{new_tbl}.{new_col}", rewritten, flags=re.I)
+
+    for orig_tbl, new_tbl in table_map.items():
+        for orig_col, new_col in col_map.items():
+            pattern = rf'\b{re.escape(orig_tbl)}\.{re.escape(orig_col)}\b'
+            rewritten = re.sub(pattern, f"{new_tbl}.{new_col}", rewritten, flags=re.I)
+
+    for orig_col, new_col in col_map.items():
+        if orig_col != new_col:
+            pattern = rf'\b{re.escape(orig_col)}\b'
+            rewritten = re.sub(pattern, new_col, rewritten, flags=re.I)
+
+    for orig_tbl, new_tbl in table_map.items():
+        if orig_tbl != new_tbl:
+            pattern = rf'\b{re.escape(orig_tbl)}\b'
+            rewritten = re.sub(pattern, new_tbl, rewritten, flags=re.I)
+
+    return rewritten
+
+
 def split_sql_statements(sql_text: str) -> List[str]:
     """
     Splits multi-statement SQL script into individual executable statements.
-    Preserves quoted strings, comments, and dollar-quoted blocks.
+    Preserves single/double quoted strings (including E'...' escapes), comments,
+    and PostgreSQL dollar-quoted blocks ($$...$$, $tag$...$tag$).
     """
     statements = []
     current: List[str] = []
@@ -210,6 +336,7 @@ def split_sql_statements(sql_text: str) -> List[str]:
     in_double_quote = False
     in_line_comment = False
     in_block_comment = False
+    dollar_tag: Optional[str] = None
     i = 0
     length = len(sql_text)
 
@@ -217,23 +344,37 @@ def split_sql_statements(sql_text: str) -> List[str]:
         ch = sql_text[i]
         next_ch = sql_text[i + 1] if i + 1 < length else ''
 
+        # Inside dollar-quoted block ($tag$...$tag$)
+        if dollar_tag is not None:
+            if sql_text.startswith(dollar_tag, i):
+                current.append(dollar_tag)
+                i += len(dollar_tag)
+                dollar_tag = None
+                continue
+            current.append(ch)
+            i += 1
+            continue
+
         # Handle comments
         if not in_single_quote and not in_double_quote:
             if not in_line_comment and not in_block_comment:
                 if ch == '-' and next_ch == '-':
                     in_line_comment = True
-                    current.append(ch)
-                    i += 1
-                    current.append(next_ch)
-                    i += 1
+                    current.append('--')
+                    i += 2
                     continue
                 elif ch == '/' and next_ch == '*':
                     in_block_comment = True
-                    current.append(ch)
-                    i += 1
-                    current.append(next_ch)
-                    i += 1
+                    current.append('/*')
+                    i += 2
                     continue
+                elif ch == '$':
+                    tag_m = re.match(r'\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$', sql_text[i:])
+                    if tag_m:
+                        dollar_tag = tag_m.group(0)
+                        current.append(dollar_tag)
+                        i += len(dollar_tag)
+                        continue
             elif in_line_comment:
                 current.append(ch)
                 if ch == '\n':
@@ -243,15 +384,20 @@ def split_sql_statements(sql_text: str) -> List[str]:
             elif in_block_comment:
                 current.append(ch)
                 if ch == '*' and next_ch == '/':
-                    current.append(next_ch)
+                    current.append('/')
                     in_block_comment = False
                     i += 2
                     continue
                 i += 1
                 continue
 
-        # Handle string literals
+        # Handle string literals & backslash escapes inside strings (e.g. E'don\'t')
         if not in_line_comment and not in_block_comment:
+            if in_single_quote and ch == '\\' and next_ch:
+                current.append(ch)
+                current.append(next_ch)
+                i += 2
+                continue
             if ch == "'" and not in_double_quote:
                 in_single_quote = not in_single_quote
             elif ch == '"' and not in_single_quote:
@@ -373,8 +519,10 @@ def sanitize_and_split_student_sql(raw_sql: str) -> Tuple[List[str], str, List[D
 
         # If the line starts with ANY recognized SQL statement or clause, it is SQL - NOT a note!
         if first_token not in GLOBAL_SQL_KEYWORDS:
-            # 1. Matches explicit note prefixes (e.g. "Step 1:", "Question 2", "Lab 4:")
+            # 1. Matches explicit note prefixes (e.g. "Step 1:", "Question 2", "Lab 4:") or numbered prose ("1.They need...")
             if re.match(r'^(step|task|question|q\d+|problem|part|ans|answer|note|lab|assignment|query\s*[:\d]|exercise|scenario)\b', stripped, re.I):
+                is_note = True
+            elif re.match(r'^\d+\.\s*[A-Za-z]{2,}', stripped) and ';' not in stripped and not any(ch in stripped for ch in ('=', '<', '>', '(', ')')):
                 is_note = True
             # 2. Ends with question mark or typical note colon (and is not a SQL statement)
             elif stripped.endswith('?') or (stripped.endswith(':') and not any(ch in stripped for ch in ('=', '<', '>', ';', '(', ')', '*', ',', '+', '-'))):
@@ -402,32 +550,54 @@ def sanitize_and_split_student_sql(raw_sql: str) -> Tuple[List[str], str, List[D
 
     sanitized_full_sql = "\n".join(sanitized_lines)
     stmts = split_sql_statements(sanitized_full_sql)
+    filtered_stmts = [
+        s for s in stmts
+        if not re.match(r'^(?:\s*--[^\n]*\n|\s)*(?:BEGIN|COMMIT|END)(?:\s+TRANSACTION)?\s*;?\s*$', s, re.I)
+    ]
+    if len(filtered_stmts) != len(stmts):
+        stmts = filtered_stmts
+        sanitized_full_sql = "\n".join(s if s.rstrip().endswith(';') else f"{s};" for s in stmts)
 
     return stmts, sanitized_full_sql, diagnostics
 
 
-def prune_bulk_inserts_for_llm(sql_text: str, max_tuples: int = 25) -> str:
+def prune_bulk_inserts_for_llm(sql_text: str, max_chars: int = 12000, max_tuples: Optional[int] = None) -> str:
     """
-    Prunes large repetitive INSERT INTO statements (e.g. >25 rows) to conserve LLM context tokens,
-    while explicitly noting that all rows were executed in PostgreSQL so the AI never penalizes the student.
+    Keeps student SQL intact for LLM feedback without regex-corrupting VALUES
+    containing parentheses or semicolons. Only trims at statement/line boundaries
+    when the full script exceeds max_chars, or when max_tuples is explicitly set.
     """
-    def _prune_insert(match: re.Match) -> str:
-        header = match.group(1) # INSERT INTO ... VALUES
-        values_body = match.group(2) # (1, ...), (2, ...)
+    if not sql_text:
+        return sql_text
 
-        # Split tuples safely by matching top-level parentheses
-        tuples = re.findall(r'\([^)]*\)', values_body, re.DOTALL)
-        if len(tuples) > max_tuples:
-            kept = ",\n  ".join(tuples[:max_tuples])
-            omitted_count = len(tuples) - max_tuples
-            return (
-                f"{header}\n  {kept}\n"
-                f"  -- [SYSTEM NOTE: Student successfully provided and executed all {len(tuples)} rows in the database. "
-                f"The remaining {omitted_count} rows were collapsed by the system purely for display brevity];"
-            )
-        return match.group(0)
+    if max_tuples is not None:
+        def _prune_insert(match: re.Match) -> str:
+            header = match.group(1)
+            values_body = match.group(2)
+            tuples = re.findall(r'\([^)]*\)', values_body, re.DOTALL)
+            if len(tuples) > max_tuples:
+                kept_tuples = ",\n  ".join(tuples[:max_tuples])
+                omitted_count = len(tuples) - max_tuples
+                return (
+                    f"{header}\n  {kept_tuples}\n"
+                    f"  -- [SYSTEM NOTE: Student successfully provided and executed all {len(tuples)} rows in the database. "
+                    f"The remaining {omitted_count} rows were collapsed by the system purely for display brevity];"
+                )
+            return match.group(0)
+        pattern = re.compile(r'(\bINSERT\s+INTO\s+[^;]+?\bVALUES\s*)(.+?);', re.IGNORECASE | re.DOTALL)
+        return pattern.sub(_prune_insert, sql_text)
 
-    # Match INSERT INTO ... VALUES (...)
-    pattern = re.compile(r'(\bINSERT\s+INTO\s+[^;]+?\bVALUES\s*)(.+?);', re.IGNORECASE | re.DOTALL)
-    return pattern.sub(_prune_insert, sql_text)
+    if len(sql_text) <= max_chars:
+        return sql_text
+
+    lines = sql_text.splitlines()
+    kept: List[str] = []
+    total = 0
+    for line in lines:
+        if total + len(line) + 1 > max_chars:
+            kept.append("-- [SYSTEM NOTE: Remaining lines omitted for prompt brevity; full SQL executed in PostgreSQL.]")
+            break
+        kept.append(line)
+        total += len(line) + 1
+    return "\n".join(kept)
 

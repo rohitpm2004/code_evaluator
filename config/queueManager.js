@@ -78,7 +78,7 @@ const QUEUE_CONFIG = {
   sql: {
     jobName: 'sql-job',
     concurrency: parseInt(process.env.SQL_CONCURRENCY, 10) || 5,
-    timeout: 30000,       // 30s SQL ceiling
+    timeout: 60000,       // 60s SQL ceiling to accommodate Python sandbox + AI feedback
     description: 'SQL Database Evaluation'
   }
 };

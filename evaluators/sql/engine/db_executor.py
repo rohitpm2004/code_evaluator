@@ -15,6 +15,7 @@ import re
 import time
 import uuid
 import logging
+import threading
 from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("db_executor")
@@ -101,6 +102,41 @@ def sanitize_schema_name(job_id: str, slot_id: int) -> str:
     return f"eval_slot_{slot_id}_{epoch_ts}_{clean_id}_{uid}".lower()
 
 
+class ExecutionWatchdog:
+    """
+    Independent worker-level watchdog that cancels backend execution and aborts
+    the connection if overall job deadline is exceeded.
+    """
+    def __init__(self, runner: "SandboxedSqlRunner", deadline_seconds: float = 15.0):
+        self.runner = runner
+        self.deadline_seconds = deadline_seconds
+        self.timer: Optional[threading.Timer] = None
+        self.expired = False
+
+    def _timeout_handler(self):
+        self.expired = True
+        logger.warning(
+            f"[ExecutionWatchdog] Evaluation deadline ({self.deadline_seconds}s) exceeded. "
+            f"Cancelling backend PID {self.runner.backend_pid}..."
+        )
+        try:
+            self.runner.cancel_execution()
+        except Exception as e:
+            logger.warning(f"Error cancelling timed-out runner: {e}")
+
+    def __enter__(self):
+        self.timer = threading.Timer(self.deadline_seconds, self._timeout_handler)
+        self.timer.daemon = True
+        self.timer.start()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self.timer:
+            self.timer.cancel()
+        if self.expired:
+            raise TimeoutError(f"Overall evaluation deadline ({self.deadline_seconds}s) exceeded.")
+
+
 class SandboxedSqlRunner:
     """
     Executes student SQL and reference queries in an ephemeral PostgreSQL schema
@@ -119,6 +155,8 @@ class SandboxedSqlRunner:
         self.backend_pid: Optional[int] = None
         self.backend_start: Optional[str] = None
         self.app_name: str = ""
+        self.last_script_errors: List[str] = []
+        self.repairs_applied: List[Dict[str, Any]] = []
 
     def __enter__(self):
         # 1. Establish administrative connection in autocommit mode for schema/lease management
@@ -205,10 +243,18 @@ class SandboxedSqlRunner:
         # Grant scoped schema permissions to the designated slot role
         try:
             with self.admin_conn.cursor() as cur:
-                cur.execute(f'GRANT USAGE, CREATE ON SCHEMA "{self.schema_name}" TO {self.runner_role};')
-        except Exception:
-            # In standard local/dev environments where slot roles are not yet provisioned, continue gracefully
-            pass
+                # Ensure the restricted slot execution role exists
+                cur.execute(f"""
+                    DO $$ 
+                    BEGIN 
+                        IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '{self.runner_role}') THEN 
+                            CREATE ROLE "{self.runner_role}" NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT; 
+                        END IF; 
+                    END $$;
+                """)
+                cur.execute(f'GRANT USAGE, CREATE ON SCHEMA "{self.schema_name}" TO "{self.runner_role}";')
+        except Exception as role_init_err:
+            logger.warning(f"Slot role provisioning notice: {role_init_err}")
 
     def _teardown_ephemeral_schema(self):
         """Unconditionally drops the ephemeral schema CASCADE on the autocommit admin connection."""
@@ -304,8 +350,25 @@ class SandboxedSqlRunner:
 
         try:
             with self.admin_conn.cursor() as cur:
-                # 1. Enforce strict session resource constraints
-                cur.execute(f'SET search_path TO "{self.schema_name}", pg_catalog;')
+                # 1. Enforce strict session resource constraints: search_path puts pg_temp last to prevent shadowing
+                cur.execute(f'SET search_path TO "{self.schema_name}", pg_catalog, pg_temp;')
+                role_set = False
+                if is_student and self.runner_role:
+                    try:
+                        cur.execute(f'SET ROLE "{self.runner_role}";')
+                        role_set = True
+                    except Exception as role_err:
+                        logger.error(f"Sandbox security: unable to switch to restricted execution role '{self.runner_role}': {role_err}")
+                        raise RuntimeError(f"Sandbox security failure: could not switch to restricted role '{self.runner_role}': {role_err}")
+                    # Verify session role
+                    try:
+                        cur.execute("SELECT session_user, current_user;")
+                        s_user, c_user = cur.fetchone()
+                        if c_user != self.runner_role:
+                            raise RuntimeError(f"Sandbox security failure: current_user ({c_user}) does not match restricted role ({self.runner_role})")
+                    except Exception as verify_err:
+                        if "does not match" in str(verify_err):
+                            raise
                 for set_stmt in [
                     f"SET statement_timeout = '{timeout_ms}';",
                     "SET lock_timeout = '2000ms';",
@@ -317,8 +380,16 @@ class SandboxedSqlRunner:
                     except Exception:
                         pass
 
-                # 2. Execute query
-                cur.execute(sql_query)
+                # 2. Execute query (strip public. prefixes so student queries target ephemeral schema)
+                try:
+                    query_to_run = re.sub(r'\bpublic\s*\.\s*', '', sql_query, flags=re.IGNORECASE) if is_student else sql_query
+                    cur.execute(query_to_run)
+                finally:
+                    if role_set:
+                        try:
+                            cur.execute("RESET ROLE;")
+                        except Exception:
+                            pass
 
                 col_names = []
                 if cur.description:
@@ -370,7 +441,7 @@ class SandboxedSqlRunner:
                 except Exception:
                     pass
 
-    def execute_script(self, script_sql: str) -> float:
+    def execute_script(self, script_sql: str, preserve_create: bool = False) -> float:
         """
         Executes multi-statement DDL/DML script inside the worker-managed schema sandbox.
         Executes as a whole batch first; if any statement fails, executes statements
@@ -378,14 +449,22 @@ class SandboxedSqlRunner:
         """
         start_time = time.time()
         timeout_ms = self.timeout_seconds * 1000
+        self.last_script_errors = []
 
-        # Auto-normalize CREATE TABLE to prevent crashes when student re-declares preloaded fixture tables
-        script_sql = re.sub(
-            r'\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)',
-            'CREATE TABLE IF NOT EXISTS ',
-            script_sql,
-            flags=re.IGNORECASE
-        )
+        # In sandboxed evaluation, ensure objects belong to the ephemeral sandbox schema.
+        # Strip hardcoded 'public.' schema prefixes produced by pgAdmin ERD/GUI export tools.
+        script_sql = re.sub(r'\bpublic\s*\.\s*', '', script_sql, flags=re.IGNORECASE)
+
+        if not preserve_create:
+            # Auto-normalize CREATE TABLE to prevent crashes when student re-declares preloaded fixture tables
+            script_sql = re.sub(
+                r'\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)',
+                'CREATE TABLE IF NOT EXISTS ',
+                script_sql,
+                flags=re.IGNORECASE
+            )
+
+        use_savepoint = not getattr(self.admin_conn, 'autocommit', True)
 
         with self.admin_conn.cursor() as cur:
             cur.execute(f'SET search_path TO "{self.schema_name}", pg_catalog;')
@@ -405,7 +484,8 @@ class SandboxedSqlRunner:
             except Exception as batch_err:
                 logger.warning(f"Batch script execution failed: {batch_err}. Falling back to statement-by-statement execution.")
                 try:
-                    self.admin_conn.rollback()
+                    if use_savepoint:
+                        self.admin_conn.rollback()
                 except Exception:
                     pass
                 try:
@@ -421,35 +501,95 @@ class SandboxedSqlRunner:
                         continue
                     sp_name = f"stmt_sp_{idx}"
                     try:
-                        cur.execute(f"SAVEPOINT {sp_name};")
+                        if use_savepoint:
+                            cur.execute(f"SAVEPOINT {sp_name};")
                         cur.execute(stmt)
-                        cur.execute(f"RELEASE SAVEPOINT {sp_name};")
+                        if use_savepoint:
+                            cur.execute(f"RELEASE SAVEPOINT {sp_name};")
                     except Exception as stmt_err:
-                        try:
-                            cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
-                        except Exception:
-                            pass
+                        if use_savepoint:
+                            try:
+                                cur.execute(f"ROLLBACK TO SAVEPOINT {sp_name};")
+                            except Exception:
+                                pass
                         err_str = str(stmt_err).lower()
+                        repaired_stmt = None
+                        repair_desc = ""
+                        repair_type = ""
 
-                        # If failed due to undeclared foreign key column, attempt smart repair:
-                        fk_match = re.search(r'FOREIGN\s+KEY\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*REFERENCES\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)', stmt, re.I)
-                        if fk_match and ('column' in err_str and 'does not exist' in err_str):
-                            col_name = fk_match.group(1)
-                            before_fk = stmt[:fk_match.start()]
-                            if not re.search(rf'\b{re.escape(col_name)}\b', before_fk, re.I):
-                                repaired_stmt = stmt[:fk_match.start()] + f"{col_name} INT, " + stmt[fk_match.start():]
-                                try:
+                        tbl_m = re.search(r'^\s*CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?([a-zA-Z0-9_".]+)', stmt, re.I)
+                        target_table = tbl_m.group(1).strip('"').lower() if tbl_m else ''
+
+                        # Smart Repair 1: Typo in NOT NULL (e.g. NOT NULLs, NOT NULLS)
+                        if ('nulls' in err_str or 'syntax error' in err_str) and re.search(r'\bNOT\s+NULL[sS]\b', stmt):
+                            repaired_stmt = re.sub(r'\bNOT\s+NULL[sS]\b', 'NOT NULL', stmt)
+                            repair_desc = "Typo in NOT NULL constraint (repaired NOT NULLs to NOT NULL)"
+                            repair_type = "TYPO_NOT_NULL"
+
+                        # Smart Repair 2: Trailing comma before closing parenthesis (e.g. col INT, )
+                        elif ('syntax error' in err_str) and re.search(r',\s*\)', stmt):
+                            repaired_stmt = re.sub(r',\s*\)', ' )', stmt)
+                            repair_desc = "Trailing comma before closing parenthesis repaired"
+                            repair_type = "TRAILING_COMMA"
+
+                        # Smart Repair 3: Embedded SELECT query pasted inside CREATE TABLE definition
+                        elif ('syntax error' in err_str) and re.match(r'^\s*CREATE\s+TABLE\b', stmt, re.I):
+                            sel_m = re.search(r'\bSELECT\b', stmt, re.I)
+                            if sel_m and sel_m.start() > 30:
+                                pre_select = stmt[:sel_m.start()].rstrip()
+                                if pre_select.count('(') > pre_select.count(')'):
+                                    repaired_stmt = pre_select.rstrip(';') + '\n);'
+                                    repair_desc = "Embedded SELECT query inside CREATE TABLE statement separated"
+                                    repair_type = "EMBEDDED_QUERY"
+
+                        # Smart Repair 4: Typo in PRIMARY KEY (e.g. PRIMARY KEYs)
+                        elif ('syntax error' in err_str) and re.search(r'\bPRIMARY\s+KEY[sS]\b', stmt):
+                            repaired_stmt = re.sub(r'\bPRIMARY\s+KEY[sS]\b', 'PRIMARY KEY', stmt)
+                            repair_desc = "Typo in PRIMARY KEY constraint (repaired PRIMARY KEYs to PRIMARY KEY)"
+                            repair_type = "TYPO_PRIMARY_KEY"
+
+                        # Smart Repair 5: Undeclared foreign key column
+                        if not repaired_stmt:
+                            fk_match = re.search(r'FOREIGN\s+KEY\s*\(\s*([a-zA-Z0-9_]+)\s*\)\s*REFERENCES\s+([a-zA-Z0-9_]+)\s*\(\s*([a-zA-Z0-9_]+)\s*\)', stmt, re.I)
+                            if fk_match and ('column' in err_str and 'does not exist' in err_str):
+                                col_name = fk_match.group(1)
+                                before_fk = stmt[:fk_match.start()]
+                                if not re.search(rf'\b{re.escape(col_name)}\b', before_fk, re.I):
+                                    repaired_stmt = stmt[:fk_match.start()] + f"{col_name} INT, " + stmt[fk_match.start():]
+                                    repair_desc = f"Undeclared foreign key column '{col_name}' auto-declared"
+                                    repair_type = "UNDECLARED_FK_COLUMN"
+
+                        if repaired_stmt:
+                            try:
+                                if use_savepoint:
                                     cur.execute(f"SAVEPOINT rep_{sp_name};")
-                                    cur.execute(repaired_stmt)
+                                cur.execute(repaired_stmt)
+                                if use_savepoint:
                                     cur.execute(f"RELEASE SAVEPOINT rep_{sp_name};")
-                                    logger.info(f"Auto-repaired statement by injecting missing '{col_name} INT'")
-                                    continue
-                                except Exception as rep_err:
+                                logger.info(f"Auto-repaired statement successfully ({stmt[:40]}...)")
+                                self.repairs_applied.append({
+                                    'table_name': target_table,
+                                    'repair_type': repair_type,
+                                    'original_statement': stmt.strip(),
+                                    'repaired_statement': repaired_stmt.strip(),
+                                    'error': str(stmt_err).strip(),
+                                    'description': repair_desc,
+                                    'score_factor': 0.67  # Standard pedagogical deduction: ~33% penalty on flawed statement
+                                })
+                                notice_msg = f"Auto-repaired syntax error on {target_table or 'statement'}: {repair_desc}"
+                                if notice_msg not in self.last_script_errors and len(self.last_script_errors) < 20:
+                                    self.last_script_errors.append(notice_msg)
+                                continue
+                            except Exception as rep_err:
+                                if use_savepoint:
                                     try:
                                         cur.execute(f"ROLLBACK TO SAVEPOINT rep_{sp_name};")
                                     except Exception:
                                         pass
-                                    logger.warning(f"Repaired statement also failed: {rep_err}")
+                                logger.warning(f"Repaired statement also failed: {rep_err}")
+                        err_msg = f"Statement failed ({stmt.strip()[:80]}): {str(stmt_err).strip()}"
+                        if len(self.last_script_errors) < 20:
+                            self.last_script_errors.append(err_msg)
                         logger.warning(f"Individual statement failed: {stmt[:60]}... Error: {stmt_err}")
 
         return round((time.time() - start_time) * 1000, 2)

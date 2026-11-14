@@ -5,9 +5,10 @@ and expected reference query results with N+1 overflow guards and type normaliza
 """
 
 import math
+import uuid
 from collections import Counter
 from decimal import Decimal
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, List, Tuple, Dict, Optional, Sequence
 
 
@@ -54,18 +55,23 @@ def normalize_value(val: Any, is_native_float: bool = False, float_rel_tol: floa
     if isinstance(val, int):
         return ('NUMBER', int(val))
 
-    # Temporal types with microsecond precision
+    # Temporal types with microsecond precision (unify aware/naive as UTC)
     if isinstance(val, datetime):
         if val.tzinfo is not None:
-            utc_dt = val.astimezone(timezone.utc)
-            return ('TIMESTAMP_AWARE', utc_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ'))
-        return ('TIMESTAMP_NAIVE', val.strftime('%Y-%m-%d %H:%M:%S.%f'))
+            val = val.astimezone(timezone.utc).replace(tzinfo=None)
+        return ('TIMESTAMP', val.strftime('%Y-%m-%d %H:%M:%S.%f'))
 
     if isinstance(val, date):
         return ('DATE', val.isoformat())
 
     if isinstance(val, time):
         return ('TIME', val.isoformat())
+
+    if isinstance(val, timedelta):
+        return ('INTERVAL', round(val.total_seconds(), 6))
+
+    if isinstance(val, uuid.UUID):
+        return ('UUID', str(val).lower())
 
     # String types (VARCHAR, TEXT, CHAR)
     if isinstance(val, str):
@@ -91,6 +97,22 @@ def normalize_row(row: Sequence[Any]) -> Tuple[Tuple[str, Any], ...]:
     return tuple(normalize_value(cell) for cell in row)
 
 
+def _rows_equal_with_tol(r1: Tuple[Tuple[str, Any], ...], r2: Tuple[Tuple[str, Any], ...], float_tol: float = 1e-2) -> bool:
+    """Compare two normalized rows, allowing small numeric rounding differences (e.g. AVG/ROUND)."""
+    if r1 == r2:
+        return True
+    if len(r1) != len(r2):
+        return False
+    for (t1, v1), (t2, v2) in zip(r1, r2):
+        if (t1, v1) == (t2, v2):
+            continue
+        if t1 == 'NUMBER' and t2 == 'NUMBER' and isinstance(v1, (int, float)) and isinstance(v2, (int, float)):
+            if abs(float(v1) - float(v2)) <= max(float_tol, 1e-4 * max(abs(float(v1)), abs(float(v2)))):
+                continue
+        return False
+    return True
+
+
 def compare_query_results(
     actual_rows: List[Sequence[Any]],
     expected_rows: List[Sequence[Any]],
@@ -98,6 +120,9 @@ def compare_query_results(
     expected_columns: Optional[List[str]] = None,
     enforce_order: bool = False,
     enforce_column_names: bool = False,
+    allow_extra_columns: Optional[bool] = None,
+    projection_policy: str = "flexible",
+    extra_column_penalty: float = 0.15,
     max_allowed_rows: int = 5000,
     has_overflow: bool = False
 ) -> Dict[str, Any]:
@@ -168,16 +193,36 @@ def compare_query_results(
                 actual_rows = [tuple(r[i] for i in proj_indices) for r in actual_rows]
                 actual_columns = [expected_columns[i] for i in range(len(expected_columns))]
 
+        if has_extra_columns:
+            is_strict = allow_extra_columns is False or (projection_policy and projection_policy.lower() == 'strict')
+            if is_strict:
+                return {
+                    'passed': False,
+                    'score_factor': 0.0,
+                    'reason': (
+                        f"Strict projection required: query returned extra column(s) [{', '.join(extra_col_names)}]. "
+                        f"Expected exactly [{', '.join(expected_columns)}]."
+                    ),
+                    'actual_count': actual_count,
+                    'expected_count': expected_count,
+                    'mismatch_details': {
+                        'expected_columns': expected_columns,
+                        'actual_columns': actual_columns,
+                        'extra_columns': extra_col_names,
+                        'policy': 'strict'
+                    }
+                }
+
         if enforce_column_names and actual_columns and not has_extra_columns:
             act_lower = [c.lower() for c in actual_columns]
             exp_lower = [c.lower() for c in expected_columns]
             if act_lower != exp_lower:
                 return {
                     'passed': False,
-                    'score_factor': 0.5,
+                    'score_factor': 0.0,
                     'reason': (
-                        f"Column names or aliases mismatch: expected [{', '.join(expected_columns)}], "
-                        f"received [{', '.join(actual_columns)}]."
+                        f"Column names mismatch: expected [{', '.join(expected_columns)}], "
+                        f"received [{', '.join(actual_columns)}]. Exact column names are required."
                     ),
                     'actual_count': actual_count,
                     'expected_count': expected_count,
@@ -186,6 +231,19 @@ def compare_query_results(
                         'actual_columns': actual_columns
                     }
                 }
+
+    # Determine extra columns score factor & message
+    if has_extra_columns:
+        if allow_extra_columns is True or (projection_policy and projection_policy.lower() == 'lenient'):
+            extra_col_sf = 1.0
+            extra_msg_suffix = " (extra columns permitted under lenient projection policy)."
+        else:
+            extra_col_sf = max(0.0, round(1.0 - extra_column_penalty, 2))
+            pct = int(round(extra_col_sf * 100))
+            extra_msg_suffix = f" (with extra columns via SELECT *; {pct}% credit awarded)."
+    else:
+        extra_col_sf = 1.0
+        extra_msg_suffix = "."
 
     # Normalize rows
     norm_actual = [normalize_row(r) for r in actual_rows]
@@ -227,10 +285,9 @@ def compare_query_results(
                 first_mismatch_idx = i
 
         if matched_count == actual_count:
-            sf = 0.85 if has_extra_columns else 1.0
+            sf = extra_col_sf if has_extra_columns else 1.0
             r_msg = (
-                f"All {actual_count} rows matched in exact order (with extra columns via SELECT *; 85% credit awarded)."
-                if has_extra_columns else f"All {actual_count} rows matched in exact order."
+                f"All {actual_count} rows matched in exact order{extra_msg_suffix}"
             )
             return {
                 'passed': True,
@@ -241,51 +298,37 @@ def compare_query_results(
                 'mismatch_details': None
             }
 
-        # Check for Creative Mock Data / Self-Consistent Sorted Output:
-        # If student created their own custom dataset, values won't match teacher's reference,
-        # but rows are returned in internally sorted order matching required row count!
-        is_internally_sorted = False
-        if actual_count > 1 and actual_columns:
-            for c_idx in range(len(actual_columns)):
-                # Check numeric sort (DESC or ASC)
+        # Check tie-group equivalence: identical multiset and identical values on all monotonic sort columns
+        if Counter(norm_actual) == Counter(norm_expected) and actual_count > 0:
+            ncols = len(norm_expected[0])
+            mono_cols = []
+            for c in range(ncols):
+                col_vals = [r[c][1] for r in norm_expected]
                 try:
-                    vals = []
-                    for r in norm_actual:
-                        cell_val = r[c_idx]
-                        if isinstance(cell_val, tuple) and len(cell_val) == 2:
-                            vals.append(float(cell_val[1]))
-                        else:
-                            vals.append(float(str(cell_val).replace('$', '').replace(',', '')))
-                    if len(vals) == actual_count and (all(vals[j] >= vals[j+1] for j in range(len(vals) - 1)) or all(vals[j] <= vals[j+1] for j in range(len(vals) - 1))):
-                        is_internally_sorted = True
-                        break
-                except (ValueError, TypeError, IndexError):
+                    is_asc = all(col_vals[j] <= col_vals[j + 1] for j in range(actual_count - 1))
+                    is_desc = all(col_vals[j] >= col_vals[j + 1] for j in range(actual_count - 1))
+                    if (is_asc or is_desc) and len(set(col_vals)) > 1:
+                        mono_cols.append(c)
+                except TypeError:
                     pass
+            if not mono_cols or any(all(norm_actual[i][c] == norm_expected[i][c] for i in range(actual_count)) for c in mono_cols):
+                sf = extra_col_sf if has_extra_columns else 1.0
+                return {
+                    'passed': True,
+                    'score_factor': sf,
+                    'reason': f"All {actual_count} rows matched in valid sorted order (tie-order equivalent){extra_msg_suffix}",
+                    'actual_count': actual_count,
+                    'expected_count': expected_count,
+                    'mismatch_details': None
+                }
 
-                # Check string/alphabetical sort (DESC or ASC)
-                try:
-                    s_vals = []
-                    for r in norm_actual:
-                        cell_val = r[c_idx]
-                        raw_str = cell_val[1] if isinstance(cell_val, tuple) and len(cell_val) == 2 else str(cell_val)
-                        s_vals.append(str(raw_str).strip().lower())
-                    if len(s_vals) == actual_count and (all(s_vals[j] >= s_vals[j+1] for j in range(len(s_vals) - 1)) or all(s_vals[j] <= s_vals[j+1] for j in range(len(s_vals) - 1))):
-                        is_internally_sorted = True
-                        break
-                except (ValueError, TypeError, IndexError):
-                    pass
-
-        if is_internally_sorted:
-            sf = 0.80 if has_extra_columns else 0.90
-            r_msg = (
-                f"Query returned {actual_count} sorted rows matching required row limit on student's custom dataset (with extra columns via SELECT *; 80% credit awarded)."
-                if has_extra_columns else
-                f"Query successfully returned {actual_count} sorted rows matching required row limit and ordering on student's custom dataset. (90% credit awarded)"
-            )
+        # Check tolerant numeric match in exact order (e.g., ROUND/AVG precision differences)
+        if all(_rows_equal_with_tol(norm_actual[i], norm_expected[i]) for i in range(actual_count)):
+            sf = extra_col_sf if has_extra_columns else 1.0
             return {
                 'passed': True,
                 'score_factor': sf,
-                'reason': r_msg,
+                'reason': f"All {actual_count} rows matched in exact order (within numeric rounding tolerance){extra_msg_suffix}",
                 'actual_count': actual_count,
                 'expected_count': expected_count,
                 'mismatch_details': None
@@ -314,10 +357,9 @@ def compare_query_results(
     expected_counter = Counter(norm_expected)
 
     if actual_counter == expected_counter:
-        sf = 0.85 if has_extra_columns else 1.0
+        sf = extra_col_sf if has_extra_columns else 1.0
         r_msg = (
-            f"All {expected_count} rows matched expected results (with extra columns via SELECT *; 85% credit awarded)."
-            if has_extra_columns else f"All {expected_count} rows matched expected results."
+            f"All {expected_count} rows matched expected results{extra_msg_suffix}"
         )
         return {
             'passed': True,
@@ -348,6 +390,27 @@ def compare_query_results(
     total_expected = max(1, expected_count)
     score_factor = round(matched_rows / total_expected, 2)
 
+    # Check tolerant numeric multiset match when counts match
+    if actual_count == expected_count and actual_count > 0:
+        unmatched_exp = list(norm_expected)
+        tol_matched = True
+        for act_r in norm_actual:
+            idx = next((i for i, exp_r in enumerate(unmatched_exp) if _rows_equal_with_tol(act_r, exp_r)), -1)
+            if idx == -1:
+                tol_matched = False
+                break
+            unmatched_exp.pop(idx)
+        if tol_matched:
+            sf = extra_col_sf if has_extra_columns else 1.0
+            return {
+                'passed': True,
+                'score_factor': sf,
+                'reason': f"All {actual_count} rows matched (within numeric rounding tolerance){extra_msg_suffix}",
+                'actual_count': actual_count,
+                'expected_count': expected_count,
+                'mismatch_details': None
+            }
+
     # Identify sample missing and surplus rows
     missing = list((expected_counter - actual_counter).elements())[:3]
     surplus = list((actual_counter - expected_counter).elements())[:3]
@@ -369,6 +432,8 @@ def compare_query_results(
         'mismatch_details': {
             'matched_rows': matched_rows,
             'missing_sample_count': len(missing),
-            'surplus_sample_count': len(surplus)
+            'surplus_sample_count': len(surplus),
+            'missing_sample': [[c[1] for c in r] for r in missing],
+            'surplus_sample': [[c[1] for c in r] for r in surplus],
         }
     }

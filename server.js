@@ -205,9 +205,9 @@ async function startServer() {
       }
     });
 
-    // 6. Start server
+    // 6. Start server (bind explicitly to 0.0.0.0 for dual IPv4/loopback clarity on Windows)
     const PORT = process.env.PORT || 3000;
-    app.listen(PORT, () => {
+    app.listen(PORT, '0.0.0.0', () => {
       logger.info(`API Gateway running on port ${PORT}`);
     });
 

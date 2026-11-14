@@ -53,7 +53,7 @@ async function callDeepSeekWithRetry(openaiClient, params, maxRetries = 3) {
  * @param {object} rubric       - Assignment rubric with criteria weights
  * @returns {Promise<object>}   - Standardized feedback object with pedagogicalScore
  */
-export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
+export async function generateSqlFeedback(engineResult = {}, rubric = {}, assignmentInstructions = '') {
   const {
     deterministicScore = 0,
     status = 'SUCCESS',
@@ -65,6 +65,7 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
     prunedStudentSql = '',
     preparseDiagnostics = [],
     normalizationNotices = [],
+    scriptErrors = [],
     error = null
   } = engineResult || {};
 
@@ -88,12 +89,30 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
       weight: typeof t.weight === 'number' ? t.weight : 10,
       reason,
       actualRowCount: t.actualRowCount,
-      expectedRowCount: t.expectedRowCount
+      expectedRowCount: t.expectedRowCount,
+      ...(t.mismatchDetails ? {
+        mismatchDetails: {
+          missingSample: t.mismatchDetails.missing_sample,
+          surplusSample: t.mismatchDetails.surplus_sample,
+          expectedColumns: t.mismatchDetails.expected_columns,
+          actualColumns: t.mismatchDetails.actual_columns
+        }
+      } : {})
     };
   });
 
   const passedTests = sanitizedTestResults.filter((t) => t.passed);
   const failedTests = sanitizedTestResults.filter((t) => !t.passed);
+  const allTestsPassed = sanitizedTestResults.length > 0 && sanitizedTestResults.every((t) => t.passed);
+  const isSyntaxValid = astAnalysis.validSyntax ?? astAnalysis.valid_syntax ?? true;
+
+  const hasScriptFaults = (scriptErrors && scriptErrors.length > 0) ||
+                          (preparseDiagnostics && preparseDiagnostics.length > 0) ||
+                          (normalizationNotices && normalizationNotices.length > 0) ||
+                          !isSyntaxValid ||
+                          Boolean(error);
+
+  const isExecutionFlawless = (deterministicScore >= 100 && !hasScriptFaults) && (allTestsPassed && !hasScriptFaults);
 
   // Normalize rubric criteria: fallback to test cases if assignment lacks explicit rubric
   const effectiveCriteria = (Array.isArray(rubric?.criteria) && rubric.criteria.length > 0)
@@ -107,7 +126,7 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
 
   const resolveAwardedMarks = (critName, idx, maxWeight = 0) => {
     if (!critName) return 0;
-    if (deterministicScore >= 100) return maxWeight;
+    if (deterministicScore >= 100 && !hasScriptFaults) return maxWeight;
 
     if (safeBreakdown[critName] !== undefined) return safeBreakdown[critName];
     const lower = String(critName).toLowerCase().trim();
@@ -173,6 +192,9 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
     for (const notice of (normalizationNotices || [])) {
       issues.push(`Notice: ${notice}`);
     }
+    for (const sErr of (scriptErrors || [])) {
+      issues.push(`Syntax / Execution Notice: ${sErr}`);
+    }
 
     let summaryText = '';
     if (error) {
@@ -188,7 +210,9 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
     return {
       summary: summaryText,
       strengths: passedTests.map((t) => `${t.name}: Query executed and matched expected results`),
-      issues: issues.length > 0 ? issues : ['Review assignment instructions and test case requirements for formatting details.'],
+      issues: deterministicScore >= 100 && issues.length === 0
+        ? []
+        : (issues.length > 0 ? issues : ['Review assignment instructions and test case requirements for formatting details.']),
       breakdown: breakdownList,
       pedagogicalScore: deterministicScore,
       ast_summary: {
@@ -210,7 +234,6 @@ export async function generateSqlFeedback(engineResult = {}, rubric = {}) {
     return fallbackFeedback;
   }
 
-  const isSyntaxValid = astAnalysis.validSyntax ?? astAnalysis.valid_syntax ?? true;
   const statementTypes = astAnalysis.statementTypes || astAnalysis.statement_types || [];
   const requiredClausesChecked = astAnalysis.requiredClausesChecked || astAnalysis.required_clauses_checked || {};
   const forbiddenDetected = astAnalysis.forbiddenDetected || astAnalysis.forbidden_detected || [];
@@ -251,8 +274,10 @@ DATABASE RUNTIME VERIFICATION FACTS:
 - Required Clauses Check: ${JSON.stringify(requiredClausesChecked)}
 - Pre-parser Diagnostics: ${JSON.stringify(preparseDiagnostics || [])}
 - Auto-Repair Notices: ${JSON.stringify(normalizationNotices || [])}
+- Script Statement Errors: ${JSON.stringify(scriptErrors || [])}
 - Test Cases Results: ${JSON.stringify(sanitizedTestResults, null, 2)}
 - Rubric Breakdown from Execution: ${JSON.stringify(safeBreakdown, null, 2)}
+${assignmentInstructions ? `\nASSIGNMENT INSTRUCTIONS (EXACT PROBLEM STATEMENT):\n${String(assignmentInstructions).slice(0, 3000)}\n` : ''}
 
 ANTI-HALLUCINATION & DETERMINISTIC FAIRNESS RULES:
 1. GROUND TRUTH DATABASE OVERRIDE:
@@ -315,20 +340,22 @@ PROFESSOR GRADING INSTRUCTIONS:
     const content = completion.choices[0]?.message?.content;
     const parsed = JSON.parse(content);
 
-    const allTestsPassed = sanitizedTestResults.length > 0 && sanitizedTestResults.every((t) => t.passed);
-    const isExecutionFlawless = (deterministicScore >= 100) || (allTestsPassed && isSyntaxValid && !error);
-
     // Merge rubric breakdown ensuring criteria weights match
     const mergedBreakdown = effectiveCriteria.map((c, idx) => {
       const maxWeight = typeof c.weight === 'number' ? c.weight : 0;
+      const deterministicMarks = resolveAwardedMarks(c.name, idx, maxWeight);
+
       const parsedItem = Array.isArray(parsed?.breakdown)
         ? parsed.breakdown.find((b) => (b.item || '').toLowerCase().trim() === c.name.toLowerCase().trim())
         : null;
 
-      let awarded = typeof parsedItem?.awarded === 'number' ? parsedItem.awarded : resolveAwardedMarks(c.name, idx, maxWeight);
-
       // DETERMINISTIC RUNTIME LOCK:
-      // If the runtime engine verified flawless test execution, an LLM cannot hallucinate point deductions
+      // When deterministicScore > 0, the engine's verified test marks are the single source of truth.
+      // This prevents scores from fluctuating across re-evaluations while preserving the LLM's rich explanations.
+      let awarded = (deterministicScore > 0)
+        ? deterministicMarks
+        : (typeof parsedItem?.awarded === 'number' ? Math.min(Math.round(maxWeight * 0.7), parsedItem.awarded) : deterministicMarks);
+
       if (isExecutionFlawless) {
         awarded = maxWeight;
       }
@@ -346,15 +373,23 @@ PROFESSOR GRADING INSTRUCTIONS:
     });
 
     // CRITICAL MATHEMATICAL INTEGRITY GUARD:
-    // The rubric criteria breakdown is the single source of truth for the student's grade.
-    // An LLM's separate holistic pedagogicalScore must NEVER deviate from the mathematical sum of its own breakdown items.
+    // When deterministicScore > 0, the score is strictly deterministicScore.
+    // When deterministicScore == 0, use capped pedagogical credit based on breakdown sum.
     const calculatedTotalScore = mergedBreakdown.reduce((sum, b) => sum + (b.awarded || 0), 0);
-    const suggestedScore = Math.max(0, Math.min(100, Math.round(calculatedTotalScore)));
+    const suggestedScore = (deterministicScore > 0)
+      ? Math.round(deterministicScore)
+      : Math.max(0, Math.min(70, Math.round(calculatedTotalScore)));
+
+    const safeSummary = (isExecutionFlawless && parsed.summary && /\b(error|fail|missing|omitted|deduct|incorrect|wrong)\b/i.test(parsed.summary))
+      ? fallbackFeedback.summary
+      : (parsed.summary || fallbackFeedback.summary);
 
     return {
-      summary: parsed.summary || fallbackFeedback.summary,
+      summary: safeSummary,
       strengths: Array.isArray(parsed.strengths) && parsed.strengths.length > 0 ? parsed.strengths : fallbackFeedback.strengths,
-      issues: Array.isArray(parsed.issues) && parsed.issues.length > 0 ? parsed.issues : fallbackFeedback.issues,
+      issues: (Array.isArray(parsed?.issues) && parsed.issues.length > 0)
+        ? parsed.issues
+        : (isExecutionFlawless ? [] : fallbackFeedback.issues),
       breakdown: mergedBreakdown.length > 0 ? mergedBreakdown : fallbackFeedback.breakdown,
       pedagogicalScore: suggestedScore,
       ast_summary: fallbackFeedback.ast_summary

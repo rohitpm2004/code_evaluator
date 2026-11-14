@@ -162,9 +162,9 @@ export function cleanSqlSubmission(rawSql) {
       continue;
     }
 
-    // A. Check if line starts with a CLI prompt (psql, MySQL, SQLite, etc.)
-    // Note: Must start with an alphanumeric word so it never confuses with '--' comments
-    const PROMPT_REGEX = /^(?:[a-zA-Z0-9_]+[#=>\-]+|mysql>|sqlite>|SQL>|\d+>|\$)\s*/i;
+    // A. Check if line starts with a CLI prompt (psql, MySQL, SQLite, PowerShell, cmd, bash)
+    // Note: Avoid matching SQL '--' comments
+    const PROMPT_REGEX = /^(?:PS\s+[A-Z]:\\[^>]*>|[A-Z]:\\[^>]*>|[\w.-]+@[\w.-]+:[^$#]*[$#]|[a-zA-Z0-9_]+(?:\(#|=[#>]|-[#>]|[#=>])|mysql>|sqlite>|SQL>|\d+>|\$)\s*/i;
     const hasPrompt = PROMPT_REGEX.test(trimmed);
     let stripped = trimmed.replace(PROMPT_REGEX, '');
 
@@ -172,8 +172,9 @@ export function cleanSqlSubmission(rawSql) {
       inTerminalOutput = false;
     }
 
-    // B. Real SQL comments: preserve completely intact
-    if (stripped.startsWith('--') || stripped.startsWith('/*')) {
+    // B. Real SQL comments: preserve completely intact (exclude ASCII table dividers like '----')
+    const isAsciiTableBorder = /^[\+\-|:=_\s]{3,}$/.test(stripped) && !stripped.includes('*');
+    if (!isAsciiTableBorder && (stripped.startsWith('--') || stripped.startsWith('/*'))) {
       inTerminalOutput = false;
       cleanedLines.push(stripped);
       continue;
@@ -181,14 +182,14 @@ export function cleanSqlSubmission(rawSql) {
 
     // C. Detect psql / database slash meta-commands (\l, \c, \q, \dt, \d+, \x, etc.)
     if (/^\\(?:l|c|q|dt|d|dn|df|du|x|timing|connect|copy|echo)\b/i.test(stripped)) {
-      inTerminalOutput = false;
+      inTerminalOutput = /^\\(?:l|dt|d|dn|df|du)\b/i.test(stripped);
       cleanedLines.push(`-- [Terminal Command] ${stripped}`);
       continue;
     }
 
-    // D. Detect terminal setup prompts & connection banners
-    if (/^(?:Server\s*\[|Database\s*\[|Port\s*\[|Username\s*\[|Password(?:\s+for\s+user)?\s*:|psql\s*\(|Type\s+"help"|SSL\s+connection|You\s+are\s+now\s+connected)/i.test(stripped)) {
-      inTerminalOutput = false;
+    // D. Detect terminal setup prompts, connection banners, shell commands & PG status/warning lines
+    if (/^(?:Server\s*\[|Database\s*\[|Port\s*\[|Username\s*\[|Password(?:\s+for\s+user(?:\s+[^:]+)?)?\s*:|psql\s*\(|psql\s+-|Type\s+"help"|SSL\s+connection|You\s+are\s+now\s+connected|8-bit\s+characters\s+might\s+not\s+work|See\s+psql\s+reference\s+page|page\s+"Notes\s+for\s+Windows\s+users"|Press\s+any\s+key\s+to\s+continue|List\s+of\s+(?:databases|relations|schemas|roles)|(?:NOTICE|WARNING|DETAIL|HINT|CONTEXT|INFO)\s*:|(?:sudo|apt(?:-get)?|brew|pg_ctl|systemctl|service)\s+|(?:INSERT\s+0\s+\d+|CREATE\s+TABLE|ALTER\s+TABLE|DROP\s+TABLE)\s*$)/i.test(stripped)) {
+      inTerminalOutput = /^List\s+of\s+/i.test(stripped);
       cleanedLines.push(`-- [Terminal Prompt] ${stripped}`);
       continue;
     }
@@ -204,7 +205,6 @@ export function cleanSqlSubmission(rawSql) {
     }
 
     // F. Detect ASCII table borders & row counts
-    const isAsciiTableBorder = /^[\+\-|:=_\s]{3,}$/.test(stripped) && !stripped.includes('*');
     const isAsciiRowCount = /^\(\d+\s+rows?\)$/i.test(stripped) || /^Query\s+OK,?\s+\d+/i.test(stripped);
 
     if (inTerminalOutput || isAsciiTableBorder || isAsciiRowCount) {
@@ -238,7 +238,7 @@ export function cleanSqlSubmission(rawSql) {
  * @param {number}   options.maxSizeBytes    - Maximum allowed SQL file size
  * @returns {Promise<string>}               - The student's SQL content as a string
  */
-export async function loadSqlSubmission({ sqlText, ideFiles, fileUrl, tempWorkspace, maxSizeBytes }) {
+export async function loadSqlSubmission({ sqlText, ideFiles, fileUrl, tempWorkspace, maxSizeBytes, assignmentTitle = '', manifest = null }) {
   // Priority 1: Inline SQL text from in-browser editor
   if (typeof sqlText === 'string' && sqlText.trim().length > 0) {
     logger.info('[SqlLoader] Using inline sqlText from submission payload');
@@ -303,7 +303,8 @@ export async function loadSqlSubmission({ sqlText, ideFiles, fileUrl, tempWorksp
  * @param {number} maxBytes
  * @returns {Promise<{ combinedSql?: string, directRawUrl?: string } | null>}
  */
-async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes) {
+async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes, matchContext = {}) {
+  const { assignmentTitle = '', manifest = null } = matchContext;
   // 1. Direct raw file link — let standard downloader fetch it directly
   if (gitHubUrl.includes('raw.githubusercontent.com')) {
     return null;
@@ -394,17 +395,50 @@ async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes) {
 
         if (!fileRes.ok) continue;
         const text = await fileRes.text();
+        const trimmed = text.trim();
+
+        // Skip pgAdmin ERD diagram JSON files masquerading as .sql
+        if (trimmed.startsWith('{') && (trimmed.includes('"version"') || trimmed.includes('"layers"') || trimmed.includes('"data"')) && trimmed.endsWith('}')) {
+          logger.info(`[SqlLoader] Skipping '${file.path}': detected pgAdmin ERD diagram JSON content disguised with .sql extension.`);
+          continue;
+        }
+
         totalBytes += Buffer.byteLength(text, 'utf-8');
 
         if (totalBytes > maxBytes) {
           throw new Error(`Total SQL content in repository exceeds ${maxBytes} byte limit.`);
         }
 
-        contents.push(`-- File: ${file.path}\n${text}`);
+        contents.push({ path: file.path, text, formatted: `-- File: ${file.path}\n${text}` });
       }
 
       if (contents.length > 0) {
-        return { combinedSql: contents.join('\n\n') };
+        if (contents.length > 1 && (assignmentTitle || manifest)) {
+          const stop = new Set(['practice', 'steps', 'assignment', 'module', 'challenge', 'environment', 'using', 'local', 'your', 'with', 'from', 'into', 'table', 'select', 'create']);
+          const metaText = `${assignmentTitle || ''} ${manifest?.schema || ''} ${manifest?.referenceQuery || ''} ${manifest?.referenceScript || ''}`.toLowerCase();
+          const keywords = [...new Set((metaText.match(/[a-z_]{4,}/g) || []).filter((w) => !stop.has(w)))];
+          if (keywords.length > 0) {
+            const scored = contents.map((c) => {
+              const pLow = c.path.toLowerCase();
+              const tLow = c.text.toLowerCase();
+              let s = 0;
+              for (const kw of keywords) {
+                if (pLow.includes(kw)) s += 3;
+                if (tLow.includes(kw)) s += 1;
+              }
+              return { ...c, s };
+            });
+            const maxS = Math.max(...scored.map((x) => x.s));
+            if (maxS > 0) {
+              const filtered = scored.filter((x) => x.s >= Math.ceil(maxS * 0.6));
+              if (filtered.length > 0 && filtered.length < contents.length) {
+                logger.info(`[SqlLoader] Smart-selected ${filtered.length}/${contents.length} matching GitHub SQL file(s): ${filtered.map((f) => f.path).join(', ')}`);
+                return { combinedSql: filtered.map((f) => f.formatted).join('\n\n') };
+              }
+            }
+          }
+        }
+        return { combinedSql: contents.map((c) => c.formatted).join('\n\n') };
       }
     } catch (err) {
       if (err.message.includes('No .sql files') || err.message.includes('exceeds')) {
@@ -441,7 +475,7 @@ async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes) {
 
     // Handle GitHub repository URLs — automatically discover & extract SQL files
     if (downloadUrl.includes('github.com')) {
-      const gitHubResult = await resolveGitHubSqlSubmission(downloadUrl, maxSizeBytes);
+      const gitHubResult = await resolveGitHubSqlSubmission(downloadUrl, maxSizeBytes, { assignmentTitle, manifest });
       if (gitHubResult?.combinedSql) {
         logger.info(`[SqlLoader] Successfully extracted SQL from GitHub repository: ${downloadUrl}`);
         return cleanSqlSubmission(gitHubResult.combinedSql);
@@ -453,12 +487,25 @@ async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes) {
 
     await safeDownloadSql(downloadUrl, destPath, maxSizeBytes);
 
-    // Check if the downloaded file is a ZIP archive (starts with PK\x03\x04 or URL contains .zip)
-    const headerBuf = Buffer.alloc(2);
+    // Check if the downloaded file is a binary image or document (e.g. PNG, JPG, PDF) uploaded instead of SQL
+    const fileHeader = Buffer.alloc(8);
     const fd = await fsp.open(destPath, 'r');
-    await fd.read(headerBuf, 0, 2, 0);
+    await fd.read(fileHeader, 0, 8, 0);
     await fd.close();
-    if (headerBuf[0] === 0x50 && headerBuf[1] === 0x4B) {
+
+    // PNG: 89 50 4E 47 | JPEG: FF D8 FF | PDF: 25 50 44 46 (%PDF)
+    const isPng = fileHeader[0] === 0x89 && fileHeader[1] === 0x50 && fileHeader[2] === 0x4E && fileHeader[3] === 0x47;
+    const isJpeg = fileHeader[0] === 0xFF && fileHeader[1] === 0xD8 && fileHeader[2] === 0xFF;
+    const isPdf = fileHeader[0] === 0x25 && fileHeader[1] === 0x50 && fileHeader[2] === 0x44 && fileHeader[3] === 0x46;
+    if (isPng || isJpeg || isPdf) {
+      const typeName = isPng ? 'PNG image' : (isJpeg ? 'JPEG image' : 'PDF document');
+      throw new Error(
+        `You submitted a ${typeName} screenshot instead of a SQL script file. Automated grading requires an executable .sql or .txt script file. Please copy your SQL code into a text file, save it as your_work.sql, and re-submit.`
+      );
+    }
+
+    // Check if the downloaded file is a ZIP archive (starts with PK\x03\x04 or URL contains .zip)
+    if (fileHeader[0] === 0x50 && fileHeader[1] === 0x4B) {
       logger.info(`[SqlLoader] Detected ZIP archive submission. Extracting SQL files from ${destPath}...`);
       const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
       const { stdout } = await execPromise(`"${pythonBin}" "${EXTRACT_SQL_ZIP_SCRIPT}" "${destPath}"`, { timeout: 30000 });

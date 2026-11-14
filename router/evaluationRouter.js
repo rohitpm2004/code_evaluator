@@ -68,6 +68,10 @@ export async function routeEvaluation(payload) {
         // SQL-specific fields
         manifest:
           payload.manifest,
+        assignmentTitle:
+          payload.assignmentTitle || payload.title || '',
+        assignmentInstructions:
+          payload.assignmentInstructions || payload.instructions || payload.description || '',
         sqlText:
           submission.sqlText,
         ideFiles:

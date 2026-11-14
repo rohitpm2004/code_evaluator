@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "test": "npm run test:unit",
-    "test:unit": "node scripts/test-scoring-logic.mjs && node scripts/test-rubric-fallback.mjs && node scripts/test-url-guard.mjs && node scripts/test-code-and-temporal-checks.mjs",
+    "test:unit": "node scripts/test-scoring-logic.mjs && node scripts/test-rubric-fallback.mjs && node scripts/test-url-guard.mjs && node scripts/test-code-and-temporal-checks.mjs && python scripts/test-sql-regression-suite.py",
     "test:excel": "node scripts/run-excel-golden-suite.mjs",
     "benchmark:excel": "node scripts/benchmark-excel-queue.mjs",
     "test:sql": "node test/test_sql_evaluator.js",

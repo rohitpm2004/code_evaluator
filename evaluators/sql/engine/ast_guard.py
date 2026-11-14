@@ -24,15 +24,16 @@ except ImportError:
 
 
 # Resource Limits for AST parsing
-MAX_SQL_CHARACTERS = 50_000
+MAX_SQL_CHARACTERS = 200_000
 MAX_AST_DEPTH = 50
-MAX_AST_NODES = 1_000
+MAX_AST_NODES = 2_500
 
 # High-risk functions and administrative keywords that must never be executed by students
 FORBIDDEN_IDENTIFIERS: Set[str] = {
     'pg_read_file', 'pg_write_file', 'pg_read_binary_file', 'pg_ls_dir',
     'pg_stat_file', 'pg_execute', 'dblink', 'dblink_exec', 'pg_terminate_backend',
     'pg_cancel_backend', 'pg_sleep', 'copy', 'pg_shadow', 'pg_authid',
+    'pg_roles', 'pg_user', 'pg_proc', 'pg_database', 'pg_tablespace',
     'set_config', 'current_setting', 'query_to_xml',
     'lo_import', 'lo_export', 'pg_advisory_lock', 'pg_advisory_unlock'
 }
@@ -46,17 +47,22 @@ NONDETERMINISTIC_FUNCTIONS: Set[str] = {
 SAFE_CALLABLE_FUNCTIONS: Set[str] = {
     # Math & Aggregates
     'count', 'sum', 'avg', 'min', 'max', 'round', 'ceil', 'ceiling', 'floor',
-    'abs', 'mod', 'power', 'sqrt', 'sign', 'exp', 'ln', 'log', 'trunc',
+    'abs', 'mod', 'power', 'sqrt', 'sign', 'exp', 'ln', 'log', 'log10', 'trunc',
+    'div', 'cbrt', 'pi', 'radians', 'degrees', 'isnan', 'num_nulls', 'num_nonnulls',
     'group_concat', 'string_agg', 'array_agg', 'listagg', 'json_agg', 'json_arrayagg',
-    # String Functions
-    'upper', 'lower', 'length', 'substring', 'substr', 'trim', 'ltrim', 'rtrim',
-    'replace', 'concat', 'concat_ws', 'coalesce', 'nullif', 'least', 'greatest',
-    'lpad', 'rpad', 'reverse', 'position', 'instr', 'left', 'right', 'initcap',
-    'repeat', 'split_part', 'format',
+    'jsonb_agg', 'jsonb_array_elements', 'jsonb_each', 'jsonb_typeof', 'json_typeof',
+    # String & Array Functions
+    'upper', 'lower', 'length', 'char_length', 'octet_length', 'substring', 'substr',
+    'trim', 'btrim', 'ltrim', 'rtrim', 'replace', 'concat', 'concat_ws', 'coalesce',
+    'nullif', 'least', 'greatest', 'lpad', 'rpad', 'reverse', 'position', 'instr',
+    'left', 'right', 'initcap', 'repeat', 'split_part', 'format', 'ascii', 'chr',
+    'regexp_replace', 'regexp_match', 'regexp_matches', 'string_to_array',
+    'array_length', 'cardinality', 'unnest', 'generate_series', 'exploding_generate_series', 'md5', 'encode', 'decode',
     # Date & Time Functions
-    'date_trunc', 'extract', 'to_char', 'to_date', 'to_timestamp', 'age',
+    'date_trunc', 'date_part', 'extract', 'to_char', 'to_date', 'to_timestamp', 'to_number', 'age',
     'make_date', 'make_time', 'make_timestamp', 'now', 'current_timestamp',
-    'current_date', 'current_time',
+    'current_date', 'current_time', 'pg_typeof', 'version', 'current_setting',
+    'current_database', 'current_user', 'current_schema',
     # Window Functions
     'row_number', 'rank', 'dense_rank', 'percent_rank', 'cume_dist', 'ntile',
     'lag', 'lead', 'first_value', 'last_value', 'nth_value',
@@ -67,10 +73,11 @@ SAFE_CALLABLE_FUNCTIONS: Set[str] = {
 
 
 def _strip_comments_and_literals(sql: str) -> str:
-    """Strips SQL line comments, block comments, and string literals to prevent false positives in regex scans."""
+    """Strips SQL line comments, block comments, dollar-quoted blocks, and string literals to prevent false positives in regex scans."""
     no_blocks = re.sub(r'/\*[\s\S]*?\*/', ' ', sql)
     no_comments = re.sub(r'--[^\r\n]*', ' ', no_blocks)
-    no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", no_comments)
+    no_dollars = re.sub(r'\$([a-zA-Z_][a-zA-Z0-9_]*)?\$[\s\S]*?\$\1\$', "''", no_comments)
+    no_strings = re.sub(r"'(?:[^'\\]|\\.)*'", "''", no_dollars)
     return no_strings
 
 
@@ -121,25 +128,77 @@ def validate_sql_ast(
         if re.search(rf'\b{re.escape(ft.lower())}\b', code_only_sql):
             detected_forbidden.append(f"FORBIDDEN_TOKEN: {ft}")
 
+    # Privilege escalation and session tampering checks
+    escalation_patterns = [
+        (r'\bRESET\s+ROLE\b', 'RESET ROLE is prohibited in student evaluations.'),
+        (r'\bSET\s+(?:SESSION\s+)?ROLE\b', 'SET ROLE is prohibited in student evaluations.'),
+        (r'\bSET\s+SESSION\s+AUTHORIZATION\b', 'SET SESSION AUTHORIZATION is prohibited in student evaluations.'),
+        (r'\bALTER\s+ROLE\b', 'ALTER ROLE is prohibited in student evaluations.'),
+        (r'\bDROP\s+ROLE\b', 'DROP ROLE is prohibited in student evaluations.'),
+        (r'\bCREATE\s+ROLE\b', 'CREATE ROLE is prohibited in student evaluations.')
+    ]
+    for pattern, reason in escalation_patterns:
+        if re.search(pattern, code_only_sql, re.I):
+            detected_forbidden.append(f"PRIVILEGE_ESCALATION_ATTEMPT: {reason}")
+
+    # Detect dangling / incomplete SQL clauses (syntax errors leniently overlooked by transpilers)
+    dangling_patterns = [
+        (r'\bON\s+(?:WHERE|GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|;|\s*$)', "Dangling ON clause without join condition."),
+        (r'\bGROUP\s+BY\s*(?:HAVING|ORDER\s+BY|LIMIT|;|\s*$)', "Empty GROUP BY clause without grouping columns."),
+        (r'\bORDER\s+BY\s*(?:LIMIT|;|\s*$)', "Empty ORDER BY clause without sort columns."),
+        (r'\bWHERE\s*(?:GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|;|\s*$)', "Empty WHERE clause without filter condition.")
+    ]
+    for pattern, reason in dangling_patterns:
+        if re.search(pattern, code_only_sql, re.I):
+            return {
+                'valid_syntax': False,
+                'statement_types': [],
+                'forbidden_detected': detected_forbidden,
+                'required_clauses_checked': {c: False for c in required_clauses},
+                'ast_error': f"SQL Syntax Error: {reason}",
+                'partial_syntax_errors': [reason],
+                'tables_referenced': []
+            }
+
     if not HAS_SQLGLOT:
         return _fallback_regex_validation(
             sql_text, mode, required_clauses, detected_forbidden
         )
 
+    partial_syntax_errors: List[str] = []
     try:
         parsed_statements = sqlglot.parse(sql_text, read=dialect)
     except Exception as parse_err:
         try:
             parsed_statements = sqlglot.parse(sql_text)
         except Exception:
-            return {
-                'valid_syntax': False,
-                'statement_types': [],
-                'forbidden_detected': detected_forbidden,
-                'required_clauses_checked': {c: False for c in required_clauses},
-                'ast_error': f"SQL Syntax Error: {str(parse_err)}",
-                'tables_referenced': []
-            }
+            # Statement-level fault isolation: parse individually so 1 typo doesn't abort valid queries/tables
+            from schema_differ import split_sql_statements
+            parsed_statements = []
+            for raw_stmt in split_sql_statements(sql_text):
+                if not raw_stmt.strip():
+                    continue
+                try:
+                    stmts_i = sqlglot.parse(raw_stmt, read=dialect)
+                    parsed_statements.extend([s for s in stmts_i if s is not None])
+                except Exception as s_err:
+                    try:
+                        stmts_i = sqlglot.parse(raw_stmt)
+                        parsed_statements.extend([s for s in stmts_i if s is not None])
+                    except Exception:
+                        if len(partial_syntax_errors) < 10:
+                            partial_syntax_errors.append(f"{raw_stmt.strip()[:80]}: {str(s_err)}")
+
+            if not parsed_statements:
+                return {
+                    'valid_syntax': False,
+                    'statement_types': [],
+                    'forbidden_detected': detected_forbidden,
+                    'required_clauses_checked': {c: False for c in required_clauses},
+                    'ast_error': f"SQL Syntax Error: {str(parse_err)}",
+                    'partial_syntax_errors': partial_syntax_errors,
+                    'tables_referenced': []
+                }
 
     if not parsed_statements or all(s is None for s in parsed_statements):
         return {
@@ -177,11 +236,11 @@ def validate_sql_ast(
         # Rule 2: Strict Root-Statement Allowlist
         if mode == 'query_only':
             if not isinstance(stmt, (exp.Select, exp.Union, exp.Intersect, exp.Except)):
-                # If submission contains valid SELECT statements, allow harmless DDL/DML scratchpad setup (CREATE TABLE, INSERT INTO)
-                if has_select and isinstance(stmt, (exp.Create, exp.Insert)):
+                # If submission contains valid SELECT statements, allow harmless DDL/DML scratchpad setup (CREATE, INSERT, UPDATE, DELETE)
+                if has_select and isinstance(stmt, (exp.Create, exp.Insert, exp.Update, exp.Delete)):
                     pass  # Harmless scratchpad table/data setup used by students for local testing
-                elif isinstance(stmt, (exp.Column, exp.Literal, exp.Identifier, exp.Var, exp.Anonymous)):
-                    pass  # Stray orphan token / trailing typo, not a security exploit
+                elif isinstance(stmt, (exp.Column, exp.Literal, exp.Identifier, exp.Var, exp.Anonymous, getattr(exp, 'Semicolon', exp.Expression))):
+                    pass  # Stray orphan token / trailing semicolon / typo, not a security exploit
                 else:
                     detected_forbidden.append(
                         f"DISALLOWED_ROOT_STATEMENT: {stmt_class} is not permitted in query-only mode. Only SELECT queries are allowed."
@@ -205,6 +264,7 @@ def validate_sql_ast(
         'forbidden_detected': detected_forbidden,
         'required_clauses_checked': checked_clauses,
         'ast_error': None if is_valid else f"AST Policy violations: {'; '.join(detected_forbidden)}",
+        'partial_syntax_errors': partial_syntax_errors,
         'tables_referenced': sorted(list(tables_referenced))
     }
 
@@ -218,10 +278,10 @@ def _validate_script_mode_statement(
     # Permitted DDL/DML statement classes
     if isinstance(stmt, exp.Create):
         target_kind = str(stmt.args.get('kind', '')).upper()
-        # Only TABLE, VIEW, INDEX allowed
-        if target_kind not in ('TABLE', 'VIEW', 'INDEX'):
+        # Only TABLE, VIEW, INDEX, TYPE, SEQUENCE allowed
+        if target_kind not in ('TABLE', 'VIEW', 'INDEX', 'TYPE', 'SEQUENCE'):
             detected_forbidden.append(
-                f"DISALLOWED_CREATE_OBJECT: 'CREATE {target_kind or stmt_class}' is prohibited. Only CREATE TABLE/VIEW/INDEX are permitted."
+                f"DISALLOWED_CREATE_OBJECT: 'CREATE {target_kind or stmt_class}' is prohibited. Only CREATE TABLE/VIEW/INDEX/TYPE/SEQUENCE are permitted."
             )
         # Check for forbidden CONCURRENTLY modifier on indexes
         if stmt.args.get('concurrently'):
@@ -242,6 +302,9 @@ def _validate_script_mode_statement(
 
     elif isinstance(stmt, (exp.Insert, exp.Update, exp.Delete, exp.Select, exp.Union)):
         pass  # Standard permitted DML
+
+    elif stmt_class in ('Semicolon', 'Comment') or isinstance(stmt, (getattr(exp, 'Semicolon', exp.Expression), getattr(exp, 'Comment', exp.Expression), exp.Column, exp.Literal, exp.Identifier, exp.Var, exp.Anonymous)):
+        pass  # Harmless trailing semicolon, comment, or stray orphan token
 
     elif isinstance(stmt, exp.Transaction):
         detected_forbidden.append(
@@ -307,11 +370,12 @@ def _inspect_subtree_recursively(
                 tables_referenced.add(node.name.lower())
             if node.db:
                 schema_name = node.db.lower()
-                if schema_name in ('public', 'pg_catalog', 'information_schema') and mode == 'script':
+                # Allow safe standard ANSI read-only metadata like information_schema and public
+                if schema_name.startswith('eval_slot_') and mode == 'script':
                     detected_forbidden.append(f"CROSS_SCHEMA_ESCAPE_PROHIBITED: Explicit qualification with schema '{schema_name}' is not permitted.")
 
-        # Callable Function Whitelist Verification
-        if isinstance(node, (exp.Anonymous, exp.Func)):
+        # Callable Function Whitelist Verification (skip SQL operators/connectors like AND, OR, +, =, CASE)
+        if isinstance(node, (exp.Anonymous, exp.Func)) and not isinstance(node, (exp.Binary, exp.Connector, exp.Case)):
             if isinstance(node, exp.Anonymous):
                 func_name = str(node.this or '').strip().lower()
             else:
@@ -329,7 +393,8 @@ def _inspect_subtree_recursively(
                         exp.Floor, exp.Ceil, exp.Abs, exp.Cast, exp.TryCast,
                         exp.Coalesce, exp.Nullif, exp.Substring, exp.Trim,
                         exp.Upper, exp.Lower, exp.Concat, exp.Length,
-                        exp.DateTrunc, exp.Extract, exp.CurrentTimestamp, exp.CurrentDate
+                        exp.DateTrunc, exp.Extract, exp.CurrentTimestamp, exp.CurrentDate,
+                        getattr(exp, 'CurrentVersion', exp.CurrentTimestamp)
                     )
                     if not isinstance(node, STANDARD_SQLGLOT_FUNCS):
                         detected_forbidden.append(f"UNAPPROVED_FUNCTION_CALL: Function '{func_name}' is not in the approved whitelist.")

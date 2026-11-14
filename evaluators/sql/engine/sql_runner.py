@@ -17,8 +17,17 @@ from typing import Dict, Any, List, Tuple, Optional
 
 from ast_guard import validate_sql_ast
 from comparator import compare_query_results
-from db_executor import SandboxedSqlRunner
-from schema_differ import normalize_student_ddl, compute_name_similarity, sanitize_and_split_student_sql, prune_bulk_inserts_for_llm
+from db_executor import SandboxedSqlRunner, ExecutionWatchdog
+from routine_runner import evaluate_routine_test_case
+from trigger_runner import evaluate_trigger_test_case
+from concurrency_runner import evaluate_transaction_test_case, evaluate_dcl_test_case
+from schema_differ import (
+    normalize_student_ddl,
+    compute_name_similarity,
+    sanitize_and_split_student_sql,
+    prune_bulk_inserts_for_llm,
+    rewrite_query_with_schema_mapping
+)
 
 try:
     import sqlglot
@@ -47,8 +56,8 @@ def check_ast_concept_match(cand_sql: str, ref_query: str) -> Tuple[bool, float,
     if not ref_query or not ref_query.strip():
         return False, 0.0, ""
 
-    cand_upper = cand_sql.upper()
-    ref_upper = ref_query.upper()
+    cand_upper = re.sub(r'\b(LEFT|RIGHT|FULL)\s+OUTER\s+JOIN\b', r'\1 JOIN', cand_sql.upper())
+    ref_upper = re.sub(r'\b(LEFT|RIGHT|FULL)\s+OUTER\s+JOIN\b', r'\1 JOIN', ref_query.upper())
 
     # 1. ORDER BY & Direction Check
     if 'ORDER BY' in ref_upper:
@@ -58,6 +67,18 @@ def check_ast_concept_match(cand_sql: str, ref_query: str) -> Tuple[bool, float,
             return False, 0.0, "ORDER BY direction should be DESC."
         if 'ASC' in ref_upper and 'DESC' in cand_upper and 'ASC' not in ref_upper:
             return False, 0.0, "ORDER BY direction should be ASC."
+
+    # 1b. JOIN Direction Check
+    outer_joins = ('LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN', 'CROSS JOIN')
+    for jtype in outer_joins:
+        if jtype in ref_upper and jtype not in cand_upper:
+            return False, 0.0, f"Expected {jtype}, but student query did not use {jtype}."
+    ref_is_inner = (
+        re.search(r'\bINNER\s+JOIN\b', ref_upper)
+        or (re.search(r'\bJOIN\b', ref_upper) and not any(j in ref_upper for j in outer_joins))
+    )
+    if ref_is_inner and any(j in cand_upper for j in ('LEFT JOIN', 'RIGHT JOIN', 'FULL JOIN')):
+        return False, 0.0, "Expected INNER JOIN, but student query used an OUTER JOIN."
 
     # 2. LIMIT Check
     ref_lim_m = re.search(r'\bLIMIT\s+(\d+)\b', ref_upper)
@@ -160,6 +181,151 @@ def try_auto_repair_query(
     return None, None, False, 0.0, ""
 
 
+def _evaluate_candidates(
+    runner: SandboxedSqlRunner,
+    cand_queries: List[str],
+    ref_query: str,
+    expected_rows: List[Any],
+    expected_cols: List[str],
+    enforce_order: bool,
+    enforce_col_names: bool,
+    max_rows: int,
+    question_tag: Optional[str] = None,
+    allow_extra_columns: Optional[bool] = None,
+    projection_policy: str = "flexible",
+    extra_column_penalty: float = 0.15
+) -> Tuple[Dict[str, Any], List[Any], List[str], float, bool, str]:
+    """Evaluate candidate student SELECT/WITH queries and return the best comparison result."""
+    best_comp_res = None
+    best_score_factor = -1.0
+    best_actual_rows: List[Any] = []
+    best_actual_cols: List[str] = []
+    best_actual_time = 0.0
+    best_actual_overflow = False
+    best_err = None
+    best_deduction = ""
+
+    # Filter candidates if explicit question anchors exist (e.g. -- @question Q1 or -- Question 1:)
+    filtered_candidates = cand_queries
+    if question_tag:
+        clean_tag = question_tag.strip().lower()
+        tagged = [
+            q for q in cand_queries
+            if re.search(rf'--\s*@question\s+{re.escape(clean_tag)}\b', q, re.I)
+            or re.search(rf'--\s*question\s*{re.escape(clean_tag)}\b', q, re.I)
+        ]
+        if tagged:
+            filtered_candidates = tagged
+
+    for cand_sql in filtered_candidates:
+        try:
+            c_rows, c_cols, c_overflow, c_time = runner.execute_query(
+                sql_query=cand_sql,
+                max_rows=max_rows,
+                is_student=True
+            )
+            c_comp = compare_query_results(
+                actual_rows=c_rows,
+                expected_rows=expected_rows,
+                actual_columns=c_cols,
+                expected_columns=expected_cols,
+                enforce_order=enforce_order,
+                enforce_column_names=enforce_col_names,
+                allow_extra_columns=allow_extra_columns,
+                projection_policy=projection_policy,
+                extra_column_penalty=extra_column_penalty,
+                max_allowed_rows=max_rows,
+                has_overflow=c_overflow
+            )
+
+            # Strict correctness: AST analysis confirms required syntax when rows pass, but never passes wrong data rows
+            if c_comp['passed']:
+                matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
+                if not matched and 'ORDER BY' in ref_query.upper() and 'ORDER BY' not in cand_sql.upper():
+                    c_comp['score_factor'] = round(c_comp['score_factor'] * 0.85, 2)
+                    c_comp['reason'] += " (Deduction: missing required ORDER BY clause)."
+
+            if c_comp['score_factor'] > best_score_factor:
+                best_score_factor = c_comp['score_factor']
+                best_comp_res = c_comp
+                best_actual_rows = c_rows
+                best_actual_cols = c_cols
+                best_actual_time = c_time
+                best_actual_overflow = c_overflow
+                best_deduction = ""
+        except Exception as c_err:
+            best_err = c_err
+            r_rows, r_cols, r_overflow, r_time, notice = try_auto_repair_query(
+                runner=runner,
+                cand_sql=cand_sql,
+                err_msg=str(c_err),
+                expected_cols=expected_cols,
+                max_rows=max_rows
+            )
+            if r_rows is not None:
+                r_comp = compare_query_results(
+                    actual_rows=r_rows,
+                    expected_rows=expected_rows,
+                    actual_columns=r_cols,
+                    expected_columns=expected_cols,
+                    enforce_order=enforce_order,
+                    enforce_column_names=enforce_col_names,
+                    allow_extra_columns=allow_extra_columns,
+                    projection_policy=projection_policy,
+                    extra_column_penalty=extra_column_penalty,
+                    max_allowed_rows=max_rows,
+                    has_overflow=r_overflow
+                )
+                if r_comp['passed']:
+                    adj_factor = round(r_comp['score_factor'] * 0.90, 2)
+                else:
+                    adj_factor = 0.0
+
+                if adj_factor > best_score_factor:
+                    best_score_factor = adj_factor
+                    r_comp['score_factor'] = adj_factor
+                    r_comp['passed'] = adj_factor > 0
+                    best_comp_res = r_comp
+                    best_actual_rows = r_rows
+                    best_actual_cols = r_cols
+                    best_actual_time = r_time
+                    best_actual_overflow = r_overflow
+                    best_deduction = notice
+                    continue
+
+            matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
+            if matched and ast_factor > best_score_factor:
+                best_score_factor = ast_factor
+                best_comp_res = {
+                    'passed': True,
+                    'score_factor': ast_factor,
+                    'reason': explanation,
+                    'actual_count': len(expected_rows) if expected_rows else 0,
+                    'expected_count': len(expected_rows) if expected_rows else 0,
+                    'mismatch_details': None
+                }
+                best_actual_rows = []
+                best_actual_cols = []
+                best_actual_time = 0.0
+                best_actual_overflow = False
+                best_deduction = f" (Verified via conceptual AST analysis: {explanation})"
+
+    if best_comp_res is not None:
+        return best_comp_res, best_actual_rows, best_actual_cols, best_actual_time, best_actual_overflow, best_deduction
+
+    return (
+        {
+            'passed': False,
+            'score_factor': 0.0,
+            'reason': f"Query execution error: {str(best_err)}" if best_err else "No matching query results.",
+            'actual_count': 0,
+            'expected_count': len(expected_rows) if expected_rows else 0,
+            'mismatch_details': {'error': str(best_err)} if best_err else None
+        },
+        [], [], 0.0, False, ""
+    )
+
+
 def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Evaluates student SQL against manifest requirements and test cases."""
     job_id = payload.get('jobId', 'unknown')
@@ -175,7 +341,11 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
     mode = payload.get('mode') or manifest.get('mode')
     if not mode or mode not in ('query_only', 'script'):
         # Auto-detect mode if not explicitly specified
-        if any(kw in student_sql.upper() for kw in ('CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'CREATE INDEX', 'CREATE VIEW')):
+        dml_or_ddl = (
+            'CREATE TABLE', 'ALTER TABLE', 'DROP TABLE', 'CREATE INDEX', 'CREATE VIEW',
+            'UPDATE ', 'DELETE FROM', 'INSERT INTO', 'MERGE '
+        )
+        if any(kw in student_sql.upper() for kw in dml_or_ddl):
             mode = 'script'
         else:
             mode = 'query_only'
@@ -189,8 +359,8 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
     alias_map = {}
     normalization_notices = []
     if mode == 'script':
-        norm_sql, alias_map, normalization_notices = normalize_student_ddl(student_sql, manifest)
-        student_sql = norm_sql
+        # Compute alias mapping for partial credit diagnosis, but NEVER silently mutate student SQL!
+        _, alias_map, normalization_notices = normalize_student_ddl(student_sql, manifest)
 
     test_cases = manifest.get('testCases', [])
     # If no testCases array provided, synthesize a default test case from top-level manifest
@@ -214,9 +384,18 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
     )
 
     if not ast_res['valid_syntax'] or ast_res.get('forbidden_detected'):
+        security_prefixes = (
+            'FORBIDDEN_', 'CROSS_SCHEMA_', 'SELECT_INTO_', 'TABLE_LOCK_',
+            'EXPLAIN_', 'DATA_MODIFYING_CTE_', 'AST_MAX_DEPTH_', 'PAYLOAD_TOO_LARGE'
+        )
+        policy_blocked = any(
+            str(item).startswith(security_prefixes)
+            for item in (ast_res.get('forbidden_detected') or [])
+        )
         return {
             'status': 'AST_ERROR',
             'deterministicScore': 0,
+            'policyBlocked': policy_blocked,
             'astAnalysis': ast_res,
             'testResults': [{
                 'name': 'AST & Syntax Validation',
@@ -236,6 +415,7 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     # ── Step 2: Sandboxed PostgreSQL Execution ─────────────────────────
     test_results: List[Dict[str, Any]] = []
+    script_errors: List[str] = list(ast_res.get('partial_syntax_errors') or [])
     total_weight = sum(t.get('weight', 10) for t in test_cases) or 100
     earned_weight = 0.0
     total_exec_time = 0.0
@@ -249,21 +429,27 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
         parts.append(manifest_setup if manifest_setup.endswith(';') else manifest_setup + ';')
     global_setup = '\n'.join(parts)
 
-    has_custom_tc_setup = any(tc.get('setupSql', '').strip() for tc in test_cases) and mode != 'query_only'
+    has_custom_tc_setup = any(tc.get('setupSql', '').strip() for tc in test_cases)
 
     # Fast path: without custom test setup, provision an ephemeral schema once,
     # load fixture once, then verify all test cases against it (massive WAN speedup and zero lock contention)
     if not has_custom_tc_setup:
         try:
             with SandboxedSqlRunner(job_id=f"{job_id}_main") as runner:
-                runner.load_fixture(global_setup)
+                with ExecutionWatchdog(runner, deadline_seconds=15.0):
+                    runner.load_fixture(global_setup)
 
                 ref_runner = None
-                cand_queries = []
+                from schema_differ import split_sql_statements
+                stmts = split_sql_statements(student_sql)
+                cand_queries = [s.strip() for s in stmts if re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
+                scratchpad = [s.strip() for s in stmts if not re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
+                scratchpad_loaded = False
 
                 if mode == 'script':
-                    script_time = runner.execute_script(student_sql)
+                    script_time = runner.execute_script(student_sql, preserve_create=True)
                     total_exec_time += script_time
+                    script_errors.extend(runner.last_script_errors)
 
                     # Check if a reference script needs to run
                     ref_script = manifest.get('referenceScript') or manifest.get('referenceSql') or manifest.get('referenceDdl')
@@ -277,23 +463,19 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                             logger.warning(f"Failed to execute unified reference script: {ref_setup_err}")
                             ref_runner = None
                 else:
-                    # In query_only mode, extract candidate SELECT statements from student SQL
-                    from schema_differ import split_sql_statements
-                    stmts = split_sql_statements(student_sql)
-                    cand_queries = [s.strip() for s in stmts if re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
                     if not cand_queries:
                         cand_queries = [student_sql.strip()]
 
-                    # Execute student scratchpad statements (CREATE TABLE, INSERT) if present
-                    scratchpad = [s.strip() for s in stmts if not re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
-                    if scratchpad:
+                    # Only pre-load student scratchpad DDL/DML if no teacher fixture exists;
+                    # otherwise keep the clean manifest dataset isolated and lazy-load only on missing relation/column.
+                    if scratchpad and not global_setup.strip():
                         try:
-                            clean_scratch = []
-                            for s in scratchpad:
-                                s_clean = s.rstrip(';') + ';'
-                                s_clean = re.sub(r'\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)', 'CREATE TABLE IF NOT EXISTS ', s_clean, flags=re.I)
-                                clean_scratch.append(s_clean)
+                            clean_scratch = [
+                                re.sub(r'\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)', 'CREATE TABLE IF NOT EXISTS ', s.rstrip(';') + ';', flags=re.I)
+                                for s in scratchpad
+                            ]
                             runner.load_fixture("\n".join(clean_scratch))
+                            scratchpad_loaded = True
                         except Exception as sc_err:
                             logger.info(f"Student scratchpad load notice: {sc_err}")
 
@@ -311,14 +493,97 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                         enforce_col_names = tc.get('enforceColumnNames', False)
                         max_rows = tc.get('maxRows', 5000)
 
+                        # Phase 2: Stored Functions & Procedures
+                        if test_kind in ('procedure', 'function', 'routine') or tc.get('routineName') or tc.get('invocations'):
+                            res = evaluate_routine_test_case(runner=runner, ref_runner=ref_runner, tc=tc, schema_name=runner.schema_name)
+                            tc_score = round(weight * res['score_factor'], 2)
+                            earned_weight += tc_score
+                            test_results.append({
+                                'name': test_name,
+                                'kind': test_kind,
+                                'weight': weight,
+                                'score': tc_score,
+                                'passed': res['passed'],
+                                'reason': res['reason'],
+                                'actualRowCount': res.get('passed_invocations', 0),
+                                'expectedRowCount': res.get('total_invocations', 0),
+                                'executionTimeMs': 0.0,
+                                'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                            })
+                            continue
+
+                        # Phase 3: Trigger Event Simulation
+                        if test_kind == 'trigger' or tc.get('triggerName') or tc.get('events'):
+                            res = evaluate_trigger_test_case(runner=runner, ref_runner=ref_runner, tc=tc, schema_name=runner.schema_name)
+                            tc_score = round(weight * res['score_factor'], 2)
+                            earned_weight += tc_score
+                            test_results.append({
+                                'name': test_name,
+                                'kind': test_kind,
+                                'weight': weight,
+                                'score': tc_score,
+                                'passed': res['passed'],
+                                'reason': res['reason'],
+                                'actualRowCount': res.get('passed_events', 0),
+                                'expectedRowCount': res.get('total_events', 0),
+                                'executionTimeMs': 0.0,
+                                'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                            })
+                            continue
+
+                        # Phase 4: Multi-Session Concurrency & Transactions (TCL)
+                        if test_kind in ('transaction', 'concurrency', 'tcl') or tc.get('steps'):
+                            res = evaluate_transaction_test_case(runner=runner, ref_runner=ref_runner, tc=tc, schema_name=runner.schema_name)
+                            tc_score = round(weight * res['score_factor'], 2)
+                            earned_weight += tc_score
+                            test_results.append({
+                                'name': test_name,
+                                'kind': test_kind,
+                                'weight': weight,
+                                'score': tc_score,
+                                'passed': res['passed'],
+                                'reason': res['reason'],
+                                'actualRowCount': 1 if res['passed'] else 0,
+                                'expectedRowCount': 1,
+                                'executionTimeMs': 0.0,
+                                'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                            })
+                            continue
+
+                        # Phase 4: Roles, Permissions & RLS (DCL)
+                        if test_kind in ('dcl', 'permission', 'rls', 'role') or tc.get('allowedStatements') or tc.get('prohibitedStatements'):
+                            res = evaluate_dcl_test_case(runner=runner, tc=tc, schema_name=runner.schema_name)
+                            tc_score = round(weight * res['score_factor'], 2)
+                            earned_weight += tc_score
+                            test_results.append({
+                                'name': test_name,
+                                'kind': test_kind,
+                                'weight': weight,
+                                'score': tc_score,
+                                'passed': res['passed'],
+                                'reason': res['reason'],
+                                'actualRowCount': res.get('passed_checks', 0),
+                                'expectedRowCount': res.get('total_checks', 0),
+                                'executionTimeMs': 0.0,
+                                'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                            })
+                            continue
+
                         try:
                             if mode == 'script':
-                                actual_rows, actual_cols, actual_overflow, actual_time = runner.execute_query(
-                                    sql_query=ref_query,
-                                    max_rows=max_rows,
-                                    is_student=False
-                                )
-                                total_exec_time += actual_time
+                                ref_exec_err = None
+                                try:
+                                    schema_mapping = manifest.get('schemaMapping')
+                                    rewritten_ref = rewrite_query_with_schema_mapping(ref_query, schema_mapping)
+                                    actual_rows, actual_cols, actual_overflow, actual_time = runner.execute_query(
+                                        sql_query=rewritten_ref,
+                                        max_rows=max_rows,
+                                        is_student=False
+                                    )
+                                    total_exec_time += actual_time
+                                except Exception as rq_err:
+                                    ref_exec_err = rq_err
+                                    actual_rows, actual_cols, actual_overflow, actual_time = [], [], False, 0.0
 
                                 # If actual_rows is empty for catalog query, check runtime fuzzy table match
                                 is_catalog_query = any(k in (ref_query or '').lower() for k in ['information_schema', 'pg_catalog', 'current_schema()'])
@@ -370,39 +635,118 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                                     expected_rows = tc.get('expectedRows')
                                     expected_cols = tc.get('expectedColumns')
 
-                                if expected_rows is None and is_catalog_query:
-                                    if len(actual_rows) > 0:
-                                        expected_rows = actual_rows
-                                        expected_cols = actual_cols
+                                if expected_rows is None:
+                                    if is_catalog_query:
+                                        if len(actual_rows) > 0:
+                                            expected_rows = actual_rows
+                                            expected_cols = actual_cols
+                                        else:
+                                            expected_rows = [['<expected_schema_objects_not_found>']]
+                                            expected_cols = actual_cols or ['status']
+                                    elif ref_exec_err is not None:
+                                        expected_rows = []
+                                        expected_cols = []
                                     else:
-                                        expected_rows = [['<expected_schema_objects_not_found>']]
-                                        expected_cols = actual_cols or ['status']
+                                        # Never manufacture expected results from student results
+                                        expected_rows = None
+                                        expected_cols = None
 
-                                comp_res = compare_query_results(
-                                    actual_rows=actual_rows,
-                                    expected_rows=expected_rows,
-                                    actual_columns=actual_cols,
-                                    expected_columns=expected_cols,
-                                    enforce_order=enforce_order,
-                                    enforce_column_names=enforce_col_names,
-                                    max_allowed_rows=max_rows,
-                                    has_overflow=actual_overflow
-                                )
+                                allow_extra_cols = tc.get('allowExtraColumns', manifest.get('allowExtraColumns'))
+                                proj_policy = tc.get('projectionPolicy', manifest.get('projectionPolicy', 'flexible'))
+                                extra_col_pen = tc.get('extraColumnPenalty', manifest.get('extraColumnPenalty', 0.15))
+
+                                if not is_catalog_query and expected_rows is None:
+                                    comp_res = {
+                                        'passed': False,
+                                        'score_factor': 0.0,
+                                        'reason': 'Evaluation configuration error: assignment manifest is missing referenceScript or expectedRows.',
+                                        'actual_count': len(actual_rows),
+                                        'expected_count': 0,
+                                        'mismatch_details': {'error': 'EVALUATION_CONFIGURATION_ERROR'}
+                                    }
+                                    cand_deduction = ""
+                                elif not is_catalog_query and cand_queries:
+                                    comp_res, actual_rows, actual_cols, cand_time, actual_overflow, cand_deduction = _evaluate_candidates(
+                                        runner=runner,
+                                        cand_queries=cand_queries,
+                                        ref_query=ref_query,
+                                        expected_rows=expected_rows or [],
+                                        expected_cols=expected_cols or [],
+                                        enforce_order=enforce_order,
+                                        enforce_col_names=enforce_col_names,
+                                        max_rows=max_rows,
+                                        question_tag=tc.get('questionId') or f"Q{idx + 1}",
+                                        allow_extra_columns=allow_extra_cols,
+                                        projection_policy=proj_policy,
+                                        extra_column_penalty=extra_col_pen
+                                    )
+                                    total_exec_time += cand_time
+                                elif ref_exec_err is not None:
+                                    comp_res = {
+                                        'passed': False,
+                                        'score_factor': 0.0,
+                                        'reason': f"Reference check failed on student schema: {ref_exec_err}",
+                                        'actual_count': 0,
+                                        'expected_count': len(expected_rows or []),
+                                        'mismatch_details': {'error': str(ref_exec_err)}
+                                    }
+                                    cand_deduction = ""
+                                else:
+                                    comp_res = compare_query_results(
+                                        actual_rows=actual_rows,
+                                        expected_rows=expected_rows,
+                                        actual_columns=actual_cols,
+                                        expected_columns=expected_cols,
+                                        enforce_order=enforce_order,
+                                        enforce_column_names=enforce_col_names,
+                                        allow_extra_columns=allow_extra_cols,
+                                        projection_policy=proj_policy,
+                                        extra_column_penalty=extra_col_pen,
+                                        max_allowed_rows=max_rows,
+                                        has_overflow=actual_overflow
+                                    )
+                                    cand_deduction = ""
 
                                 score_factor = comp_res['score_factor']
                                 has_naming_deduction = False
-                                deduction_reason = ""
+                                deduction_reason = cand_deduction
 
                                 if comp_res['passed']:
+                                    matched_rep = None
+                                    for rep in runner.repairs_applied:
+                                        t_name = rep.get('table_name')
+                                        if t_name and (t_name in ref_query.lower() or t_name in test_name.lower()):
+                                            matched_rep = rep
+                                            break
+
+                                    if matched_rep:
+                                        is_fk_tc = any(kw in test_name.lower() for kw in ['foreign key', 'constraint', 'relationship'])
+                                        rep_type = matched_rep.get('repair_type', '')
+                                        if is_fk_tc and rep_type != 'UNDECLARED_FK_COLUMN':
+                                            pass
+                                        else:
+                                            rep_factor = matched_rep.get('score_factor', 0.67)
+                                            score_factor = round(min(score_factor, rep_factor), 2)
+                                            cand_deduction += f" (Deduction: Syntax error on table '{matched_rep['table_name']}' required auto-repair)."
+                                    else:
+                                        is_exec_tc = any(kw in test_name.lower() for kw in ['script execution', 'dependency ordering', 'execution', 'sequential', 'ordering'])
+                                        if is_exec_tc and runner.repairs_applied:
+                                            num_rep = len(runner.repairs_applied)
+                                            exec_factor = max(0.40, round(1.0 - (0.25 * num_rep), 2))
+                                            score_factor = round(min(score_factor, exec_factor), 2)
+                                            cand_deduction += f" (Deduction: Script had {num_rep} statement execution faults requiring auto-repair)."
+
                                     for tbl_name, info in alias_map.items():
                                         if tbl_name in ref_query.lower() or info['canonical'] in ref_query.lower():
                                             has_naming_deduction = True
                                             score_factor = max(0.85, score_factor * 0.90)  # 10% naming deduction
-                                            deduction_reason = f" (Note: Table defined as '{info['original']}', matched to '{info['canonical']}')"
+                                            cand_deduction += f" (Note: Table defined as '{info['original']}', matched to '{info['canonical']}')"
                                             break
                                     if typo_matched and not has_naming_deduction:
                                         score_factor = max(0.80, score_factor * 0.85)
-                                        deduction_reason = f" (Note: Table '{matched_table_name}' matched target with partial credit)"
+                                        cand_deduction += f" (Note: Table '{matched_table_name}' matched target with partial credit)"
+
+                                    deduction_reason = cand_deduction
 
                             else:
                                 # Mode == 'query_only'
@@ -410,6 +754,10 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                                     expected_rows = tc.get('expectedRows')
                                     expected_cols = tc.get('expectedColumns')
                                 else:
+                                    allow_extra_cols = tc.get('allowExtraColumns', manifest.get('allowExtraColumns'))
+                                    proj_policy = tc.get('projectionPolicy', manifest.get('projectionPolicy', 'flexible'))
+                                    extra_col_pen = tc.get('extraColumnPenalty', manifest.get('extraColumnPenalty', 0.15))
+
                                     try:
                                         expected_rows, expected_cols, _, _ = runner.execute_query(
                                             sql_query=ref_query,
@@ -421,133 +769,70 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                                         expected_rows = tc.get('expectedRows') or []
                                         expected_cols = tc.get('expectedColumns') or []
 
-                                best_comp_res = None
-                                best_score_factor = -1.0
-                                best_actual_rows = []
-                                best_actual_cols = []
-                                best_actual_time = 0.0
-                                best_actual_overflow = False
-                                best_err = None
-                                best_deduction = ""
+                                comp_res, actual_rows, actual_cols, actual_time, actual_overflow, deduction_reason = _evaluate_candidates(
+                                    runner=runner,
+                                    cand_queries=cand_queries,
+                                    ref_query=ref_query,
+                                    expected_rows=expected_rows,
+                                    expected_cols=expected_cols,
+                                    enforce_order=enforce_order,
+                                    enforce_col_names=enforce_col_names,
+                                    max_rows=max_rows,
+                                    question_tag=tc.get('questionId') or f"Q{idx + 1}",
+                                    allow_extra_columns=allow_extra_cols,
+                                    projection_policy=proj_policy,
+                                    extra_column_penalty=extra_col_pen
+                                )
 
-                                for cand_sql in cand_queries:
+                                # Mode B — Custom Student Data:
+                                # If query failed due to missing relation/column, load student scratchpad/schema
+                                # and re-evaluate reference logic against the student's actual dataset!
+                                err_text = str((comp_res.get('mismatch_details') or {}).get('error', '')).lower()
+                                if (
+                                    not comp_res['passed']
+                                    and scratchpad
+                                    and not scratchpad_loaded
+                                    and ('does not exist' in err_text or 'undefined' in err_text)
+                                ):
                                     try:
-                                        c_rows, c_cols, c_overflow, c_time = runner.execute_query(
-                                            sql_query=cand_sql,
-                                            max_rows=max_rows,
-                                            is_student=True
-                                        )
-                                        c_comp = compare_query_results(
-                                            actual_rows=c_rows,
-                                            expected_rows=expected_rows,
-                                            actual_columns=c_cols,
-                                            expected_columns=expected_cols,
-                                            enforce_order=enforce_order,
-                                            enforce_column_names=enforce_col_names,
-                                            max_allowed_rows=max_rows,
-                                            has_overflow=c_overflow
-                                        )
+                                        clean_scratch = [
+                                            re.sub(r'\bCREATE\s+TABLE\s+(?!IF\s+NOT\s+EXISTS\b)', 'CREATE TABLE IF NOT EXISTS ', s.rstrip(';') + ';', flags=re.I)
+                                            for s in scratchpad
+                                        ]
+                                        runner.load_fixture("\n".join(clean_scratch))
+                                        scratchpad_loaded = True
 
-                                        # Check if query matched AST intent on creative mock data
-                                        matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                        if matched and ast_factor > c_comp['score_factor']:
-                                            if c_comp['actual_count'] == expected_count and c_comp['actual_count'] > 0:
-                                                c_comp['score_factor'] = ast_factor
-                                                c_comp['passed'] = True
-                                                c_comp['reason'] = f"Query logic successfully verified: returned {c_comp['actual_count']} rows on student dataset demonstrating {explanation}"
-
-                                        if c_comp['score_factor'] > best_score_factor:
-                                            best_score_factor = c_comp['score_factor']
-                                            best_comp_res = c_comp
-                                            best_actual_rows = c_rows
-                                            best_actual_cols = c_cols
-                                            best_actual_time = c_time
-                                            best_actual_overflow = c_overflow
-                                            best_deduction = ""
-                                    except Exception as c_err:
-                                        best_err = c_err
-                                        # Tier 1: Dynamic query auto-repair (column/table discrepancy)
-                                        r_rows, r_cols, r_overflow, r_time, notice = try_auto_repair_query(
-                                            runner=runner,
-                                            cand_sql=cand_sql,
-                                            err_msg=str(c_err),
-                                            expected_cols=expected_cols,
-                                            max_rows=max_rows
-                                        )
-                                        if r_rows is not None:
-                                            r_comp = compare_query_results(
-                                                actual_rows=r_rows,
-                                                expected_rows=expected_rows,
-                                                actual_columns=r_cols,
-                                                expected_columns=expected_cols,
-                                                enforce_order=enforce_order,
-                                                enforce_column_names=enforce_col_names,
-                                                max_allowed_rows=max_rows,
-                                                has_overflow=r_overflow
+                                        # Recompute expected_rows by running teacher's reference logic on student's custom dataset
+                                        try:
+                                            schema_mapping = manifest.get('schemaMapping')
+                                            rewritten_ref = rewrite_query_with_schema_mapping(ref_query, schema_mapping)
+                                            expected_rows, expected_cols, _, _ = runner.execute_query(
+                                                sql_query=rewritten_ref,
+                                                max_rows=max_rows,
+                                                is_student=False
                                             )
-                                            if r_comp['score_factor'] > 0:
-                                                adj_factor = round(r_comp['score_factor'] * 0.90, 2)
-                                            else:
-                                                matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                                if matched and r_comp['actual_count'] == expected_count and r_comp['actual_count'] > 0:
-                                                    adj_factor = round(ast_factor * 0.90, 2)
-                                                    r_comp['passed'] = True
-                                                    r_comp['reason'] = f"Query logic successfully verified on repaired schema: {explanation}"
-                                                else:
-                                                    adj_factor = 0.0
+                                        except Exception as ref_custom_err:
+                                            logger.info(f"Notice executing reference query on student dataset: {ref_custom_err}")
 
-                                            if adj_factor > best_score_factor:
-                                                best_score_factor = adj_factor
-                                                r_comp['score_factor'] = adj_factor
-                                                r_comp['passed'] = True
-                                                best_comp_res = r_comp
-                                                best_actual_rows = r_rows
-                                                best_actual_cols = r_cols
-                                                best_actual_time = r_time
-                                                best_actual_overflow = r_overflow
-                                                best_deduction = notice
-                                                continue
-
-                                        # Tier 2: AST / Semantic Concept Matcher (Intent-based grading)
-                                        matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                        if matched and ast_factor > best_score_factor:
-                                            best_score_factor = ast_factor
-                                            best_comp_res = {
-                                                'passed': True,
-                                                'score_factor': ast_factor,
-                                                'reason': explanation,
-                                                'actual_count': len(expected_rows) if expected_rows else 0,
-                                                'expected_count': len(expected_rows) if expected_rows else 0,
-                                                'mismatch_details': None
-                                            }
-                                            best_actual_rows = []
-                                            best_actual_cols = []
-                                            best_actual_time = 0.0
-                                            best_actual_overflow = False
-                                            best_deduction = f" (Verified via conceptual AST analysis: {explanation})"
-
-                                if best_comp_res is not None:
-                                    comp_res = best_comp_res
-                                    actual_rows = best_actual_rows
-                                    actual_cols = best_actual_cols
-                                    actual_time = best_actual_time
-                                    actual_overflow = best_actual_overflow
-                                    deduction_reason = best_deduction
-                                else:
-                                    actual_rows, actual_cols, actual_overflow, actual_time = [], [], False, 0.0
-                                    comp_res = {
-                                        'passed': False,
-                                        'score_factor': 0.0,
-                                        'reason': f"Query execution error: {str(best_err)}" if best_err else "No matching query results.",
-                                        'actual_count': 0,
-                                        'expected_count': len(expected_rows) if expected_rows else 0,
-                                        'mismatch_details': {'error': str(best_err)} if best_err else None
-                                    }
-                                    deduction_reason = ""
+                                        comp_res, actual_rows, actual_cols, actual_time, actual_overflow, deduction_reason = _evaluate_candidates(
+                                            runner=runner,
+                                            cand_queries=cand_queries,
+                                            ref_query=ref_query,
+                                            expected_rows=expected_rows,
+                                            expected_cols=expected_cols,
+                                            enforce_order=enforce_order,
+                                            enforce_col_names=enforce_col_names,
+                                            max_rows=max_rows,
+                                            question_tag=tc.get('questionId') or f"Q{idx + 1}",
+                                            allow_extra_columns=allow_extra_cols,
+                                            projection_policy=proj_policy,
+                                            extra_column_penalty=extra_col_pen
+                                        )
+                                    except Exception as sc_err:
+                                        logger.info(f"Student scratchpad lazy-load notice: {sc_err}")
 
                                 total_exec_time += actual_time
                                 score_factor = comp_res['score_factor']
-                                deduction_reason = ""
 
                             tc_score = round(weight * score_factor, 2)
                             earned_weight += tc_score
@@ -617,58 +902,147 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
 
             try:
                 with SandboxedSqlRunner(job_id=f"{job_id}_{idx}") as runner:
-                    full_setup = global_setup + '\n' + tc_setup
-                    runner.load_fixture(full_setup)
-
-                    # Creative tolerance: If student included CREATE TABLE statements, execute their setup DDL/DML
-                    # in the sandbox so custom table names and mock data exist and can be queried!
-                    if mode != 'script' and re.search(r'\bCREATE\s+TABLE\b', student_sql, re.I):
-                        try:
-                            from schema_differ import split_sql_statements
-                            all_stmts = split_sql_statements(student_sql)
-                            setup_stmts = [s for s in all_stmts if not re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
-                            if setup_stmts:
-                                runner.execute_script("\n".join(setup_stmts))
-                        except Exception as setup_err:
-                            logger.warning(f"Could not preload student setup DDL/DML: {setup_err}")
+                    with ExecutionWatchdog(runner, deadline_seconds=10.0):
+                        full_setup = global_setup + '\n' + tc_setup
+                        runner.load_fixture(full_setup)
 
                     if mode == 'script':
-                        runner.execute_script(student_sql)
+                        from schema_differ import split_sql_statements
+                        stmts = split_sql_statements(student_sql)
+                        cand_queries = [s.strip() for s in stmts if re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
+                        runner.execute_script(student_sql, preserve_create=True)
+                        script_errors.extend(runner.last_script_errors)
+
+                    # Phase 2: Stored Functions & Procedures
+                    if test_kind in ('procedure', 'function', 'routine') or tc.get('routineName') or tc.get('invocations'):
+                        res = evaluate_routine_test_case(runner=runner, tc=tc, schema_name=runner.schema_name)
+                        tc_score = round(weight * res['score_factor'], 2)
+                        earned_weight += tc_score
+                        test_results.append({
+                            'name': test_name,
+                            'kind': test_kind,
+                            'weight': weight,
+                            'score': tc_score,
+                            'passed': res['passed'],
+                            'reason': res['reason'],
+                            'actualRowCount': res.get('passed_invocations', 0),
+                            'expectedRowCount': res.get('total_invocations', 0),
+                            'executionTimeMs': 0.0,
+                            'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                        })
+                        continue
+
+                    # Phase 3: Trigger Event Simulation
+                    if test_kind == 'trigger' or tc.get('triggerName') or tc.get('events'):
+                        res = evaluate_trigger_test_case(runner=runner, tc=tc, schema_name=runner.schema_name)
+                        tc_score = round(weight * res['score_factor'], 2)
+                        earned_weight += tc_score
+                        test_results.append({
+                            'name': test_name,
+                            'kind': test_kind,
+                            'weight': weight,
+                            'score': tc_score,
+                            'passed': res['passed'],
+                            'reason': res['reason'],
+                            'actualRowCount': res.get('passed_events', 0),
+                            'expectedRowCount': res.get('total_events', 0),
+                            'executionTimeMs': 0.0,
+                            'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                        })
+                        continue
+
+                    # Phase 4: Multi-Session Concurrency & Transactions (TCL)
+                    if test_kind in ('transaction', 'concurrency', 'tcl') or tc.get('steps'):
+                        res = evaluate_transaction_test_case(runner=runner, tc=tc, schema_name=runner.schema_name)
+                        tc_score = round(weight * res['score_factor'], 2)
+                        earned_weight += tc_score
+                        test_results.append({
+                            'name': test_name,
+                            'kind': test_kind,
+                            'weight': weight,
+                            'score': tc_score,
+                            'passed': res['passed'],
+                            'reason': res['reason'],
+                            'actualRowCount': 1 if res['passed'] else 0,
+                            'expectedRowCount': 1,
+                            'executionTimeMs': 0.0,
+                            'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                        })
+                        continue
+
+                    # Phase 4: Roles, Permissions & RLS (DCL)
+                    if test_kind in ('dcl', 'permission', 'rls', 'role') or tc.get('allowedStatements') or tc.get('prohibitedStatements'):
+                        res = evaluate_dcl_test_case(runner=runner, tc=tc, schema_name=runner.schema_name)
+                        tc_score = round(weight * res['score_factor'], 2)
+                        earned_weight += tc_score
+                        test_results.append({
+                            'name': test_name,
+                            'kind': test_kind,
+                            'weight': weight,
+                            'score': tc_score,
+                            'passed': res['passed'],
+                            'reason': res['reason'],
+                            'actualRowCount': res.get('passed_checks', 0),
+                            'expectedRowCount': res.get('total_checks', 0),
+                            'executionTimeMs': 0.0,
+                            'mismatchDetails': res.get('details') if test_kind == 'visible' else None
+                        })
+                        continue
+
+                    ref_exec_err = None
+                    try:
                         actual_rows, actual_cols, actual_overflow, actual_time = runner.execute_query(
                             sql_query=ref_query,
                             max_rows=max_rows,
                             is_student=False
                         )
-                        ref_script = manifest.get('referenceScript') or manifest.get('referenceSql') or manifest.get('referenceDdl') or tc.get('referenceScript')
-                        if ref_script:
-                            try:
-                                with SandboxedSqlRunner(job_id=f"{job_id}_ref_{idx}") as ref_runner:
-                                    ref_runner.load_fixture(full_setup)
-                                    ref_runner.execute_script(ref_script)
-                                    expected_rows, expected_cols, ref_overflow, ref_time = ref_runner.execute_query(
-                                        sql_query=ref_query,
-                                        max_rows=max_rows,
-                                        is_student=False
-                                    )
-                            except Exception as ref_err:
-                                logger.warning(f"Failed to execute reference script for test '{test_name}': {ref_err}")
-                                expected_rows = tc.get('expectedRows')
-                                expected_cols = tc.get('expectedColumns')
-                        else:
+                    except Exception as rq_err:
+                        ref_exec_err = rq_err
+                        actual_rows, actual_cols, actual_overflow, actual_time = [], [], False, 0.0
+                    ref_script = manifest.get('referenceScript') or manifest.get('referenceSql') or manifest.get('referenceDdl') or tc.get('referenceScript')
+                    if ref_script:
+                        try:
+                            with SandboxedSqlRunner(job_id=f"{job_id}_ref_{idx}") as ref_runner:
+                                ref_runner.load_fixture(full_setup)
+                                ref_runner.execute_script(ref_script)
+                                expected_rows, expected_cols, ref_overflow, ref_time = ref_runner.execute_query(
+                                    sql_query=ref_query,
+                                    max_rows=max_rows,
+                                    is_student=False
+                                )
+                        except Exception as ref_err:
+                            logger.warning(f"Failed to execute reference script for test '{test_name}': {ref_err}")
                             expected_rows = tc.get('expectedRows')
                             expected_cols = tc.get('expectedColumns')
+                    else:
+                        expected_rows = tc.get('expectedRows')
+                        expected_cols = tc.get('expectedColumns')
 
-                        if expected_rows is None:
-                            is_catalog_query = any(k in (ref_query or '').lower() for k in ['information_schema', 'pg_catalog', 'current_schema()'])
-                            if is_catalog_query:
-                                if len(actual_rows) > 0:
-                                    expected_rows = actual_rows
-                                    expected_cols = actual_cols
-                                else:
-                                    expected_rows = [['<expected_schema_objects_not_found>']]
-                                    expected_cols = actual_cols or ['status']
+                    is_catalog_query = any(k in (ref_query or '').lower() for k in ['information_schema', 'pg_catalog', 'current_schema()'])
+                    if expected_rows is None:
+                        if is_catalog_query:
+                            if len(actual_rows) > 0:
+                                expected_rows = actual_rows
+                                expected_cols = actual_cols
                             else:
-                                expected_rows = []
+                                expected_rows = [['<expected_schema_objects_not_found>']]
+                                expected_cols = actual_cols or ['status']
+                        elif ref_exec_err is not None:
+                            expected_rows = []
+                            expected_cols = []
+                        else:
+                            expected_rows = None
+                            expected_cols = None
+
+                    if not is_catalog_query and expected_rows is None:
+                        comp_res = {
+                            'passed': False,
+                            'score_factor': 0.0,
+                            'reason': 'Evaluation configuration error: assignment manifest is missing referenceScript or expectedRows.',
+                            'actual_count': len(actual_rows),
+                            'expected_count': 0,
+                            'mismatch_details': {'error': 'EVALUATION_CONFIGURATION_ERROR'}
+                        }
                     else:
                         from schema_differ import split_sql_statements
                         stmts = split_sql_statements(student_sql)
@@ -676,156 +1050,151 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
                         if not cand_queries:
                             cand_queries = [student_sql.strip()]
 
-                        try:
-                            with SandboxedSqlRunner(job_id=f"{job_id}_ref_{idx}") as ref_runner:
-                                ref_runner.load_fixture(full_setup)
-                                expected_rows, expected_cols, ref_overflow, ref_time = ref_runner.execute_query(
+                        # Compute expected rows on clean full_setup using the same runner BEFORE any student scratchpad
+                        if tc.get('expectedRows') is not None:
+                            expected_rows = tc.get('expectedRows')
+                            expected_cols = tc.get('expectedColumns')
+                        else:
+                            try:
+                                expected_rows, expected_cols, ref_overflow, ref_time = runner.execute_query(
                                     sql_query=ref_query,
                                     max_rows=max_rows,
                                     is_student=False
                                 )
-                        except Exception as ref_err:
-                            logger.warning(f"Error executing reference query in independent sandbox: {ref_err}")
-                            expected_rows = tc.get('expectedRows') or []
-                            expected_cols = tc.get('expectedColumns') or []
+                            except Exception as ref_err:
+                                logger.warning(f"Error executing reference query: {ref_err}")
+                                expected_rows = tc.get('expectedRows') or []
+                                expected_cols = tc.get('expectedColumns') or []
 
-                        best_comp_res = None
-                        best_score_factor = -1.0
-                        best_actual_rows = []
-                        best_actual_cols = []
-                        best_actual_time = 0.0
-                        best_actual_overflow = False
-                        best_err = None
-                        best_deduction = ""
-
-                        for cand_sql in cand_queries:
+                        scratchpad = [s for s in stmts if not re.match(r'^\s*(SELECT|WITH)\b', s, re.I)]
+                        scratchpad_loaded = False
+                        if scratchpad and not full_setup.strip():
                             try:
-                                c_rows, c_cols, c_overflow, c_time = runner.execute_query(
-                                    sql_query=cand_sql,
-                                    max_rows=max_rows,
-                                    is_student=True
-                                )
-                                c_comp = compare_query_results(
-                                    actual_rows=c_rows,
-                                    expected_rows=expected_rows,
-                                    actual_columns=c_cols,
-                                    expected_columns=expected_cols,
-                                    enforce_order=enforce_order,
-                                    enforce_column_names=enforce_col_names,
-                                    max_allowed_rows=max_rows,
-                                    has_overflow=c_overflow
-                                )
+                                runner.execute_script("\n".join(scratchpad))
+                                scratchpad_loaded = True
+                            except Exception as setup_err:
+                                logger.warning(f"Could not preload student setup DDL/DML: {setup_err}")
 
-                                # Check if query matched AST intent on creative mock data
-                                matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                if matched and ast_factor > c_comp['score_factor']:
-                                    if c_comp['actual_count'] == expected_count and c_comp['actual_count'] > 0:
-                                        c_comp['score_factor'] = ast_factor
-                                        c_comp['passed'] = True
-                                        c_comp['reason'] = f"Query logic successfully verified: returned {c_comp['actual_count']} rows on student dataset demonstrating {explanation}"
+                        allow_extra_cols = tc.get('allowExtraColumns', manifest.get('allowExtraColumns'))
+                        proj_policy = tc.get('projectionPolicy', manifest.get('projectionPolicy', 'flexible'))
+                        extra_col_pen = tc.get('extraColumnPenalty', manifest.get('extraColumnPenalty', 0.15))
 
-                                if c_comp['score_factor'] > best_score_factor:
-                                    best_score_factor = c_comp['score_factor']
-                                    best_comp_res = c_comp
-                                    best_actual_rows = c_rows
-                                    best_actual_cols = c_cols
-                                    best_actual_time = c_time
-                                    best_actual_overflow = c_overflow
-                                    best_deduction = ""
-                            except Exception as c_err:
-                                best_err = c_err
-                                # Tier 1: Dynamic query auto-repair (column/table discrepancy)
-                                r_rows, r_cols, r_overflow, r_time, notice = try_auto_repair_query(
-                                    runner=runner,
-                                    cand_sql=cand_sql,
-                                    err_msg=str(c_err),
-                                    expected_cols=expected_cols,
-                                    max_rows=max_rows
-                                )
-                                if r_rows is not None:
-                                    r_comp = compare_query_results(
-                                        actual_rows=r_rows,
-                                        expected_rows=expected_rows,
-                                        actual_columns=r_cols,
-                                        expected_columns=expected_cols,
-                                        enforce_order=enforce_order,
-                                        enforce_column_names=enforce_col_names,
-                                        max_allowed_rows=max_rows,
-                                        has_overflow=r_overflow
+                        comp_res, actual_rows, actual_cols, actual_time, actual_overflow, _ = _evaluate_candidates(
+                            runner=runner,
+                            cand_queries=cand_queries,
+                            ref_query=ref_query,
+                            expected_rows=expected_rows,
+                            expected_cols=expected_cols,
+                            enforce_order=enforce_order,
+                            enforce_col_names=enforce_col_names,
+                            max_rows=max_rows,
+                            question_tag=tc.get('questionId') or f"Q{idx + 1}",
+                            allow_extra_columns=allow_extra_cols,
+                            projection_policy=proj_policy,
+                            extra_column_penalty=extra_col_pen
+                        )
+
+                        err_text = str((comp_res.get('mismatch_details') or {}).get('error', '')).lower()
+                        if (
+                            not comp_res['passed']
+                            and scratchpad
+                            and not scratchpad_loaded
+                            and ('does not exist' in err_text or 'undefined' in err_text)
+                        ):
+                            try:
+                                runner.execute_script("\n".join(scratchpad))
+                                scratchpad_loaded = True
+                                try:
+                                    schema_mapping = manifest.get('schemaMapping')
+                                    rewritten_ref = rewrite_query_with_schema_mapping(ref_query, schema_mapping)
+                                    expected_rows, expected_cols, _, _ = runner.execute_query(
+                                        sql_query=rewritten_ref,
+                                        max_rows=max_rows,
+                                        is_student=False
                                     )
-                                    if r_comp['score_factor'] > 0:
-                                        adj_factor = round(r_comp['score_factor'] * 0.90, 2)
-                                    else:
-                                        matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                        if matched and r_comp['actual_count'] == expected_count and r_comp['actual_count'] > 0:
-                                            adj_factor = round(ast_factor * 0.90, 2)
-                                            r_comp['passed'] = True
-                                            r_comp['reason'] = f"Query logic successfully verified on repaired schema: {explanation}"
-                                        else:
-                                            adj_factor = 0.0
+                                except Exception as ref_custom_err:
+                                    logger.info(f"Notice executing reference query on student dataset: {ref_custom_err}")
 
-                                    if adj_factor > best_score_factor:
-                                        best_score_factor = adj_factor
-                                        r_comp['score_factor'] = adj_factor
-                                        r_comp['passed'] = True
-                                        best_comp_res = r_comp
-                                        best_actual_rows = r_rows
-                                        best_actual_cols = r_cols
-                                        best_actual_time = r_time
-                                        best_actual_overflow = r_overflow
-                                        best_deduction = notice
-                                        continue
-
-                                # Tier 2: AST / Semantic Concept Matcher (Intent-based grading)
-                                matched, ast_factor, explanation = check_ast_concept_match(cand_sql, ref_query)
-                                if matched and ast_factor > best_score_factor:
-                                    best_score_factor = ast_factor
-                                    best_comp_res = {
-                                        'passed': True,
-                                        'score_factor': ast_factor,
-                                        'reason': explanation,
-                                        'actual_count': len(expected_rows) if expected_rows else 0,
-                                        'expected_count': len(expected_rows) if expected_rows else 0,
-                                        'mismatch_details': None
-                                    }
-                                    best_actual_rows = expected_rows or []
-                                    best_actual_cols = expected_cols or []
-                                    best_actual_time = 0.0
-                                    best_actual_overflow = False
-                                    best_deduction = f" (Note: Evaluated via concept verification due to execution discrepancy: {str(c_err)})"
-
-                        if best_comp_res is not None:
-                            comp_res = best_comp_res
-                            actual_rows = best_actual_rows
-                            actual_cols = best_actual_cols
-                            actual_time = best_actual_time
-                            actual_overflow = best_actual_overflow
-                        else:
-                            actual_rows, actual_cols, actual_overflow, actual_time = [], [], False, 0.0
-                            comp_res = {
-                                'passed': False,
-                                'score_factor': 0.0,
-                                'reason': f"Query execution error: {str(best_err)}" if best_err else "No matching query results.",
-                                'actual_count': 0,
-                                'expected_count': len(expected_rows) if expected_rows else 0,
-                                'mismatch_details': {'error': str(best_err)} if best_err else None
-                            }
+                                comp_res, actual_rows, actual_cols, actual_time, actual_overflow, _ = _evaluate_candidates(
+                                    runner=runner,
+                                    cand_queries=cand_queries,
+                                    ref_query=ref_query,
+                                    expected_rows=expected_rows,
+                                    expected_cols=expected_cols,
+                                    enforce_order=enforce_order,
+                                    enforce_col_names=enforce_col_names,
+                                    max_rows=max_rows,
+                                    question_tag=tc.get('questionId') or f"Q{idx + 1}",
+                                    allow_extra_columns=allow_extra_cols,
+                                    projection_policy=proj_policy,
+                                    extra_column_penalty=extra_col_pen
+                                )
+                            except Exception as setup_err:
+                                logger.warning(f"Could not lazy-load student setup DDL/DML: {setup_err}")
 
                     total_exec_time += actual_time
 
                     if mode == 'script':
-                        comp_res = compare_query_results(
-                            actual_rows=actual_rows,
-                            expected_rows=expected_rows,
-                            actual_columns=actual_cols,
-                            expected_columns=expected_cols,
-                            enforce_order=enforce_order,
-                            enforce_column_names=enforce_col_names,
-                            max_allowed_rows=max_rows,
-                            has_overflow=actual_overflow
-                        )
+                        if not is_catalog_query and cand_queries:
+                            comp_res, actual_rows, actual_cols, cand_time, actual_overflow, _ = _evaluate_candidates(
+                                runner=runner,
+                                cand_queries=cand_queries,
+                                ref_query=ref_query,
+                                expected_rows=expected_rows or [],
+                                expected_cols=expected_cols or [],
+                                enforce_order=enforce_order,
+                                enforce_col_names=enforce_col_names,
+                                max_rows=max_rows,
+                                allow_extra_columns=allow_extra_cols,
+                                projection_policy=proj_policy,
+                                extra_column_penalty=extra_col_pen
+                            )
+                            total_exec_time += cand_time
+                        elif ref_exec_err is not None:
+                            comp_res = {
+                                'passed': False,
+                                'score_factor': 0.0,
+                                'reason': f"Reference check failed on student schema: {ref_exec_err}",
+                                'actual_count': 0,
+                                'expected_count': len(expected_rows or []),
+                                'mismatch_details': {'error': str(ref_exec_err)}
+                            }
+                        else:
+                            comp_res = compare_query_results(
+                                actual_rows=actual_rows,
+                                expected_rows=expected_rows,
+                                actual_columns=actual_cols,
+                                expected_columns=expected_cols,
+                                enforce_order=enforce_order,
+                                enforce_column_names=enforce_col_names,
+                                allow_extra_columns=allow_extra_cols,
+                                projection_policy=proj_policy,
+                                extra_column_penalty=extra_col_pen,
+                                max_allowed_rows=max_rows,
+                                has_overflow=actual_overflow
+                            )
 
                     score_factor = comp_res['score_factor']
+                    if comp_res['passed'] and hasattr(runner, 'repairs_applied') and runner.repairs_applied:
+                        matched_rep = None
+                        for rep in runner.repairs_applied:
+                            t_name = rep.get('table_name')
+                            if t_name and (t_name in ref_query.lower() or t_name in test_name.lower()):
+                                matched_rep = rep
+                                break
+
+                        if matched_rep:
+                            rep_factor = matched_rep.get('score_factor', 0.67)
+                            score_factor = round(min(score_factor, rep_factor), 2)
+                            comp_res['reason'] += f" (Deduction: Syntax error on table '{matched_rep['table_name']}' required auto-repair)."
+                        else:
+                            is_exec_tc = any(kw in test_name.lower() for kw in ['script execution', 'dependency ordering', 'execution', 'sequential', 'ordering'])
+                            if is_exec_tc:
+                                num_rep = len(runner.repairs_applied)
+                                exec_factor = max(0.40, round(1.0 - (0.25 * num_rep), 2))
+                                score_factor = round(min(score_factor, exec_factor), 2)
+                                comp_res['reason'] += f" (Deduction: Script had {num_rep} statement execution faults requiring auto-repair)."
+
                     tc_score = round(weight * score_factor, 2)
                     earned_weight += tc_score
 
@@ -868,6 +1237,7 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {
         'status': 'SUCCESS' if final_score >= 100 else 'PARTIAL',
         'deterministicScore': final_score,
+        'policyBlocked': False,
         'astAnalysis': ast_res,
         'testResults': test_results,
         'rubricBreakdown': rubric_breakdown,
@@ -879,6 +1249,7 @@ def run_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
         'prunedStudentSql': pruned_sql_for_llm,
         'preparseDiagnostics': preparse_diagnostics,
         'normalizationNotices': normalization_notices,
+        'scriptErrors': script_errors[:20],
         'error': None
     }
 
