@@ -468,6 +468,66 @@ ENGLISH_NOTE_INDICATORS = {
 }
 
 
+def ensure_terminating_semicolons(sql_text: str) -> str:
+    """
+    Ensures multi-statement SQL has terminating semicolons between top-level statements
+    (e.g. when students omit ';' after SELECT before CREATE INDEX).
+    """
+    if not sql_text or not sql_text.strip():
+        return sql_text
+
+    top_level_pattern = re.compile(
+        r'^\s*(?:CREATE\s+(?:TABLE|INDEX|UNIQUE\s+INDEX|OR\s+REPLACE|VIEW|MATERIALIZED|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)|ALTER\s+(?:TABLE|VIEW|SCHEMA)|DROP\s+(?:TABLE|INDEX|VIEW|SCHEMA)|INSERT\s+INTO|DELETE\s+FROM|TRUNCATE\s+TABLE|COPY\s+|EXPLAIN\b|SELECT\b|WITH\b|UPDATE\s+[a-zA-Z0-9_.]+\s+SET)',
+        re.IGNORECASE
+    )
+    clause_continuation_pattern = re.compile(
+        r'\b(UNION(?:\s+ALL)?|INTERSECT|EXCEPT|AND|OR|ON|WHERE|SET|FROM|JOIN)\s*$',
+        re.IGNORECASE
+    )
+
+    lines = sql_text.splitlines()
+    result = []
+    prev_non_empty_idx = -1
+    paren_depth = 0
+    in_block_comment = False
+
+    for idx, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped or stripped.startswith('--'):
+            result.append(line)
+            continue
+
+        if '/*' in stripped:
+            in_block_comment = True
+        if '*/' in stripped:
+            in_block_comment = False
+            result.append(line)
+            continue
+
+        if paren_depth == 0 and not in_block_comment and prev_non_empty_idx != -1 and top_level_pattern.match(stripped):
+            prev_line = result[prev_non_empty_idx]
+            prev_trimmed = prev_line.strip()
+            if not prev_trimmed.endswith(';') and not clause_continuation_pattern.search(prev_trimmed):
+                result[prev_non_empty_idx] = prev_line + ';'
+
+        for ch in stripped:
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth = max(0, paren_depth - 1)
+
+        prev_non_empty_idx = len(result)
+        result.append(line)
+
+    if prev_non_empty_idx != -1:
+        last_line = result[prev_non_empty_idx]
+        last_trimmed = last_line.strip()
+        if not last_trimmed.endswith(';') and not last_trimmed.startswith('--'):
+            result[prev_non_empty_idx] = last_line + ';'
+
+    return "\n".join(result)
+
+
 def sanitize_and_split_student_sql(raw_sql: str) -> Tuple[List[str], str, List[Dict[str, Any]]]:
     """
     Fault-tolerant pre-parser for student SQL submissions.
@@ -548,7 +608,7 @@ def sanitize_and_split_student_sql(raw_sql: str) -> Tuple[List[str], str, List[D
         else:
             sanitized_lines.append(line)
 
-    sanitized_full_sql = "\n".join(sanitized_lines)
+    sanitized_full_sql = ensure_terminating_semicolons("\n".join(sanitized_lines))
     stmts = split_sql_statements(sanitized_full_sql)
     filtered_stmts = [
         s for s in stmts

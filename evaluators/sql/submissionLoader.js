@@ -99,6 +99,64 @@ async function safeDownloadSql(targetUrl, destPath, maxBytes) {
 }
 
 /**
+ * Ensures that multi-statement SQL scripts have terminating semicolons
+ * between top-level statements (e.g. when students omit ';' after SELECT before CREATE INDEX).
+ */
+export function ensureTerminatingSemicolons(sqlText) {
+  if (!sqlText || typeof sqlText !== 'string') return sqlText;
+  const lines = sqlText.split(/\r?\n/);
+  const result = [];
+  let prevNonEmptyIdx = -1;
+  let parenDepth = 0;
+  let inBlockComment = false;
+
+  const TOP_LEVEL_STMT = /^\s*(?:CREATE\s+(?:TABLE|INDEX|UNIQUE\s+INDEX|OR\s+REPLACE|VIEW|MATERIALIZED|SCHEMA|TRIGGER|FUNCTION|PROCEDURE)|ALTER\s+(?:TABLE|VIEW|SCHEMA)|DROP\s+(?:TABLE|INDEX|VIEW|SCHEMA)|INSERT\s+INTO|DELETE\s+FROM|TRUNCATE\s+TABLE|COPY\s+|EXPLAIN\b|SELECT\b|WITH\b|UPDATE\s+[a-zA-Z0-9_.]+\s+SET)/i;
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const trimmed = line.trim();
+
+    if (!trimmed || trimmed.startsWith('--')) {
+      result.push(line);
+      continue;
+    }
+
+    if (trimmed.includes('/*')) inBlockComment = true;
+    if (trimmed.includes('*/')) {
+      inBlockComment = false;
+      result.push(line);
+      continue;
+    }
+
+    if (parenDepth === 0 && !inBlockComment && prevNonEmptyIdx !== -1 && TOP_LEVEL_STMT.test(trimmed)) {
+      const prevLine = result[prevNonEmptyIdx];
+      const prevTrimmed = prevLine.trim();
+      if (!prevTrimmed.endsWith(';') && !/\b(UNION(?:\s+ALL)?|INTERSECT|EXCEPT|AND|OR|ON|WHERE|SET|FROM|JOIN)\s*$/i.test(prevTrimmed)) {
+        result[prevNonEmptyIdx] = prevLine + ';';
+      }
+    }
+
+    for (let c = 0; c < trimmed.length; c++) {
+      if (trimmed[c] === '(') parenDepth++;
+      else if (trimmed[c] === ')') parenDepth = Math.max(0, parenDepth - 1);
+    }
+
+    prevNonEmptyIdx = result.length;
+    result.push(line);
+  }
+
+  if (prevNonEmptyIdx !== -1) {
+    const lastLine = result[prevNonEmptyIdx];
+    const lastTrimmed = lastLine.trim();
+    if (!lastTrimmed.endsWith(';') && !lastTrimmed.startsWith('--')) {
+      result[prevNonEmptyIdx] = lastLine + ';';
+    }
+  }
+
+  return result.join('\n');
+}
+
+/**
  * Cleans SQL submissions that students copy-pasted directly from interactive
  * psql terminal/command prompt sessions (e.g. lines with "postgres=# SELECT ...",
  * "Server [localhost]:", "\l", "\c", "\q", output tables, etc.).
@@ -146,7 +204,7 @@ export function cleanSqlSubmission(rawSql) {
   // 5. Detect terminal transcript artifacts (e.g. psql / MySQL / SQLite CLI shell copy-paste)
   const isTerminalTranscript = /(?:Server\s*\[|Database\s*\[|Port\s*\[|Username\s*\[|Password for user|psql\s*\(|postgres[#=>]|mysql>|sqlite>|SQL>|\b\\[a-z]+\b|\(\d+\s+rows?\))/i.test(text);
   if (!isTerminalTranscript) {
-    return text;
+    return ensureTerminatingSemicolons(text);
   }
 
   logger.info('[SqlLoader] Detected interactive CLI / terminal transcript in submission. Cleaning and isolating SQL...');
@@ -221,7 +279,7 @@ export function cleanSqlSubmission(rawSql) {
 
   const cleanedResult = cleanedLines.join('\n').trim();
   logger.info('[SqlLoader] Terminal transcript successfully sanitized into executable SQL.');
-  return cleanedResult;
+  return ensureTerminatingSemicolons(cleanedResult);
 }
 
 /**
@@ -388,7 +446,8 @@ async function resolveGitHubSqlSubmission(gitHubUrl, maxBytes, matchContext = {}
       let totalBytes = 0;
 
       for (const file of sqlFiles) {
-        const rawFileUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${file.path}`;
+        const encodedPath = file.path.split('/').map(encodeURIComponent).join('/');
+        const rawFileUrl = `https://raw.githubusercontent.com/${owner}/${repo}/${branch}/${encodedPath}`;
         const fileRes = await fetch(rawFileUrl, {
           headers: { 'User-Agent': 'CodeGuru-Evaluator/1.0' }
         });
