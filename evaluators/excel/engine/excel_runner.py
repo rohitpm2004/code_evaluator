@@ -1102,6 +1102,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     Return rubric scores, assertion evidence, detected features, warnings, and review status.
     """
     wb_orig = safe_load_workbook(original_path, data_only=False)
+    wb_cached = safe_load_workbook(original_path, data_only=True)
     wb_recalc = safe_load_workbook(recalculated_path, data_only=True)
 
     defined_name_set = set()
@@ -1253,11 +1254,18 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 detected_charts.append(oc)
                 existing_keys.add((oc.get('type'), oc.get('title')))
 
-    for tc in test_cases:
+    for idx, tc in enumerate(test_cases):
         crit_name = tc.get("criterion", criteria[0].get("name") if criteria else "Standard Evaluation")
         if crit_name not in criterion_passes:
             criterion_passes[crit_name] = {"total": 0, "passed": 0}
         criterion_passes[crit_name]["total"] += 1
+
+        tc_id = tc.get("id") or f"{crit_name}_{idx}"
+        tc_weight = float(tc.get("weight", 1.0))
+        tc_is_critical = bool(tc.get("is_critical", tc.get("is_prerequisite", False)))
+        tc_score_cap = tc.get("score_cap")
+        tc_depends_on = tc.get("depends_on", [])
+        tc_dep_mode = tc.get("dependency_mode", "skip_penalty")
 
         tc_type = tc.get("type", "value_check")
 
@@ -1282,6 +1290,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             continue
 
         sheet_orig = wb_orig[sheet_name]
+        sheet_cached = wb_cached[sheet_name] if (wb_cached and sheet_name in wb_cached.sheetnames) else None
         sheet_recalc = wb_recalc[sheet_name] if sheet_name in wb_recalc.sheetnames else (wb_recalc.active or sheet_orig)
         table_bounds = detect_table_bounds(sheet_orig)
         col_map = table_bounds.get("col_map", {})
@@ -1291,7 +1300,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         # TYPE 1: Value Check (Explicit Cell or Anchor-Based)
         # -------------------------------------------------------------
-        if tc_type == "value_check":
+        if tc_type in ["value_check", "calculated_value"]:
             target_cell_coord = None
             if tc.get("cell"):
                 target_cell_coord = tc.get("cell")
@@ -1325,10 +1334,21 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 continue
 
             cell_val = sheet_recalc[target_cell_coord].value
+            cached_val = sheet_cached[target_cell_coord].value if sheet_cached else None
+            formula_expr = sheet_orig[target_cell_coord].value
             actual_num = parse_number(cell_val)
             expected_num = parse_number(tc.get("expectedValue"))
             abs_tol = float(tc.get("absTolerance", tc.get("tolerance", 0.05)))
             rel_tol = float(tc.get("relTolerance", 0.001))
+
+            # Stale formula cache detection (Amendment 7)
+            if cached_val is not None and cell_val is not None and isinstance(formula_expr, str) and formula_expr.startswith("="):
+                num_c = parse_number(cached_val)
+                num_r = parse_number(cell_val)
+                if num_c is not None and num_r is not None and not check_dual_tolerance(num_c, num_r, abs_tol, rel_tol):
+                    calculation_warnings.append(
+                        f"STALE_FORMULA_CACHE in {sheet_name}!{target_cell_coord}: student saved '{num_c}' but recalculated value is '{num_r}'."
+                    )
 
             passed = False
             reason = ""
@@ -1414,26 +1434,43 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         if passed:
                             break
 
+            # If mustBeFormula or formula_structure mode, student cannot pass with a hardcoded number
+            if (tc.get("mustBeFormula") or tc_type == "formula_structure") and passed:
+                if not (isinstance(formula_expr, str) and formula_expr.startswith("=")):
+                    passed = False
+                    reason = f"Cell {search_coord} contains hardcoded static value '{cell_val}' instead of a dynamic spreadsheet formula as required."
+
             if passed:
                 criterion_passes[crit_name]["passed"] += 1
-                reason = f"Cell {search_coord} matched expected value {tc.get('expectedValue')} within tolerance."
+                if not reason:
+                    reason = f"Cell {search_coord} matched expected value {tc.get('expectedValue')} within tolerance."
             else:
-                reason = f"Cell {target_cell_coord} value '{cell_val}' did not match expected '{tc.get('expectedValue')}'. Scanned surrounding region — no match found."
+                if not reason:
+                    reason = f"Cell {target_cell_coord} value '{cell_val}' did not match expected '{tc.get('expectedValue')}'. Scanned surrounding region — no match found."
 
             assertion_results.append({
+                "id": tc_id,
                 "criterion": crit_name,
                 "type": tc_type,
                 "cell": search_coord,
                 "actual": cell_val,
+                "cached": cached_val,
+                "formula": formula_expr if isinstance(formula_expr, str) and formula_expr.startswith("=") else None,
                 "expected": tc.get("expectedValue"),
                 "passed": passed,
+                "status": "VERIFIED_PASS" if passed else "VERIFIED_FAIL",
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
                 "reason": reason
             })
 
         # -------------------------------------------------------------
         # TYPE 2: Formula Range Check (Anti-Cheat & Dynamic References)
         # -------------------------------------------------------------
-        elif tc_type in ["formula_range_check", "formula_check", "function_check"]:
+        elif tc_type in ["formula_range_check", "formula_check", "function_check", "formula_structure"]:
             range_str = tc.get("range", tc.get("cell", ""))
             anchor_text = tc.get("columnAnchor") or tc.get("anchor")
             accepted_funcs = [f.upper() for f in tc.get("acceptedFunctions", [])]
@@ -2436,7 +2473,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         # TYPE 9: Controlled Formula-Behavior Check (Scenario Mutations)
         # -------------------------------------------------------------
-        elif tc_type in ["formula_behavior_check", "scenario_check", "behavior_check"]:
+        elif tc_type in ["formula_behavior_check", "scenario_check", "behavior_check", "mutation_check", "formula_behavior"]:
             scenarios = tc.get("scenarios", [])
             if not scenarios and tc.get("inputs") and tc.get("expectedOutputs"):
                 scenarios = [{
@@ -2538,180 +2575,199 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "scenarios": scenario_results
             })
 
-    # Compute Criterion Weighted Score
+    # ── SPRINT 1: Mathematical Scoring, Dependency Graph & Denominator Integrity ──
     rubric_breakdown = {}
-    total_score = 0.0
+    rubric_breakdown_details = {}
+    total_rubric_available = sum(float(crit.get("weight", 0)) for crit in criteria)
+    verified_earned_total = 0.0
+    verified_available_total = 0.0
+    pending_review_total = 0.0
+    verified_lost_total = 0.0
+
+    # Index assertions by id and type for dependency checking
+    assertion_results_by_id = {}
+    assertion_results_by_type = {}
+    for idx, a in enumerate(assertion_results):
+        a.setdefault("id", f"{a.get('criterion', 'crit')}_{idx}")
+        a.setdefault("weight", 1.0)
+        a.setdefault("is_critical", False)
+        a.setdefault("depends_on", [])
+        a.setdefault("dependency_mode", "skip_penalty")
+        if "status" not in a:
+            if a.get("passed") is True:
+                a["status"] = "VERIFIED_PASS"
+            elif a.get("passed") is False:
+                a["status"] = "VERIFIED_FAIL"
+            else:
+                a["status"] = "MANUAL_REVIEW_REQUIRED"
+
+        a_id = a.get("id")
+        if a_id:
+            assertion_results_by_id[a_id] = a
+        a_type = a.get("type")
+        if a_type:
+            assertion_results_by_type.setdefault(a_type, []).append(a)
 
     for crit in criteria:
         c_name = crit.get("name", "")
-        c_desc = (crit.get("description", "") or "").lower()
-        c_lower = c_name.lower()
         weight = float(crit.get("weight", 0))
-        stats = criterion_passes.get(c_name, {"total": 0, "passed": 0})
+        c_assertions = [a for a in assertion_results if a.get("criterion") == c_name]
 
-        is_formula_crit = any(k in c_lower or k in c_desc for k in [
-            "formula", "calculation", "dynamic", "function", "formulae",
-            "summary", "accuracy", "numerical", "total", "totals", "sum", "math", "arithmetic", "logical"
-        ])
-        is_data_crit = any(k in c_lower or k in c_desc for k in ["data", "table", "structure", "formatting", "format", "entry", "completeness"])
-        is_chart_crit = any(k in c_lower or k in c_desc for k in ["chart", "graph", "plot", "visualization", "visual"])
-        is_pivot_crit = any(k in c_lower or k in c_desc for k in ["pivot", "pivottable", "pivot table"])
-        is_macro_crit = any(k in c_lower or k in c_desc for k in ["vba", "macro", "macros", "automation"])
-        is_query_crit = any(k in c_lower or k in c_desc for k in ["power query", "powerquery", "data model", "etl", "transformation"])
+        if len(c_assertions) == 0:
+            # ── REMOVE HEURISTIC GUESSING (P0 Directive) ──
+            # An unmapped criterion without automated test cases must NEVER award guessed points.
+            # It routes directly to MANUAL_REVIEW_REQUIRED and marks are kept pending.
+            needs_review = True
+            crit_status = "MANUAL_REVIEW_REQUIRED"
+            awarded = 0.0
+            pending = weight
+            pending_review_total += pending
 
-        if stats["total"] > 0:
-            fraction = stats["passed"] / stats["total"]
-        else:
-            # If no specific test cases were mapped to this criterion
-            if is_chart_crit:
-                if len(detected_charts) == 0:
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "chart_scan",
-                        "passed": False,
-                        "reason": f"No charts or graphs detected in workbook for '{c_name}'."
-                    })
-                else:
-                    fraction = 1.0
-                    chart_types = ", ".join([c["type"] for c in detected_charts[:3]])
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "chart_scan",
-                        "passed": True,
-                        "reason": f"Verified {len(detected_charts)} chart(s) in workbook ({chart_types})."
-                    })
-            elif is_pivot_crit:
-                if len(detected_pivots) == 0:
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "pivot_scan",
-                        "passed": False,
-                        "reason": f"No native Pivot Tables detected in workbook for '{c_name}'."
-                    })
-                else:
-                    fraction = 1.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "pivot_scan",
-                        "passed": True,
-                        "reason": f"Verified {len(detected_pivots)} native Pivot Table(s) in workbook."
-                    })
-            elif is_macro_crit:
-                if not macro_info.get("has_macros"):
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "macro_scan",
-                        "passed": False,
-                        "reason": f"No VBA macros or procedure definitions detected in workbook for '{c_name}'."
-                    })
-                else:
-                    fraction = 1.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "macro_scan",
-                        "passed": True,
-                        "reason": f"Verified VBA macros in workbook ({', '.join(macro_info.get('macro_names', [])[:3])})."
-                    })
-            elif is_query_crit:
-                if not macro_info.get("has_power_query"):
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "query_scan",
-                        "passed": False,
-                        "reason": f"No Power Query or data model connections detected for '{c_name}'."
-                    })
-                else:
-                    fraction = 1.0
-            elif is_formula_crit:
-                is_summary_target = any(k in c_lower for k in ["summary", "total", "accuracy", "numerical"])
-                has_sum_formula = any(any(fn in f for fn in ["SUM", "AVERAGE", "COUNT", "MAX", "MIN"]) for f in all_formulas)
-                
-                if len(all_formulas) == 0:
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "formula_scan",
-                        "passed": False,
-                        "reason": f"No dynamic formulas detected in workbook. Student entered static values instead of spreadsheet calculations for '{c_name}'."
-                    })
-                elif is_summary_target:
-                    if has_sum_formula:
-                        fraction = 1.0
-                        assertion_results.append({
-                            "criterion": c_name,
-                            "type": "summary_formula_scan",
-                            "passed": True,
-                            "reason": f"Verified summary calculation formulas in workbook for '{c_name}'."
-                        })
-                    else:
-                        fraction = 0.4
-                        assertion_results.append({
-                            "criterion": c_name,
-                            "type": "summary_formula_scan",
-                            "passed": False,
-                            "reason": f"Workbook contains formulas, but summary formulas (=SUM) were not detected for '{c_name}'."
-                        })
-                else:
-                    fraction = 1.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "formula_scan",
-                        "passed": True,
-                        "reason": f"Verified dynamic spreadsheet formulas ({len(all_formulas)} detected) for '{c_name}'."
-                    })
-            elif is_data_crit:
-                if not has_any_data:
-                    fraction = 0.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "data_scan",
-                        "passed": False,
-                        "reason": f"No data entered in workbook for '{c_name}'."
-                    })
-                elif len(table_blank_cells) > 0:
-                    fraction = round(max(0.0, populated_table_cells / max(1, total_table_cells)), 2)
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "data_completeness",
-                        "passed": False,
-                        "reason": f"Incomplete table data: {len(table_blank_cells)} blank cell(s) detected in rows ({', '.join(table_blank_cells[:5])}). Student left required values unentered."
-                    })
-                else:
-                    fraction = 1.0
-                    assertion_results.append({
-                        "criterion": c_name,
-                        "type": "data_completeness",
-                        "passed": True,
-                        "reason": f"Table data is complete. All {total_table_cells} table cells are populated."
-                    })
+            assertion_results.append({
+                "id": f"{c_name}_unmapped",
+                "criterion": c_name,
+                "type": "unmapped_rubric",
+                "passed": None,
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "weight": weight,
+                "pending_marks": pending,
+                "reason": f"No automated test cases configured for criterion '{c_name}'. Flagged for instructor manual review."
+            })
+            rubric_breakdown[c_name] = 0.0
+            rubric_breakdown_details[c_name] = {
+                "awarded": 0.0,
+                "weight": weight,
+                "status": "MANUAL_REVIEW_REQUIRED",
+                "pending_marks": pending,
+                "reason": f"No automated assertions mapped. Pending manual instructor review.",
+                "assertions_count": 0,
+                "passed_count": 0
+            }
+            continue
+
+        # ── Weighted Assertion Calculation ──
+        weighted_sum = 0.0
+        total_assertion_weights = 0.0
+        has_critical_failure = False
+        critical_cap = None
+        has_pending_assertion = False
+
+        for a in c_assertions:
+            w_i = float(a.get("weight", 1.0))
+            is_crit = bool(a.get("is_critical", False))
+            s_cap = a.get("score_cap")
+            deps = a.get("depends_on", [])
+            dep_mode = a.get("dependency_mode", "skip_penalty")
+
+            # Check upstream dependencies to prevent double deduction
+            dep_failed = False
+            for dep in deps:
+                target_a = assertion_results_by_id.get(dep)
+                if target_a and target_a.get("passed") is False:
+                    dep_failed = True
+                    break
+                type_matches = assertion_results_by_type.get(dep, [])
+                if any(tm.get("passed") is False for tm in type_matches):
+                    dep_failed = True
+                    break
+
+            if dep_failed and dep_mode == "skip_penalty":
+                a["dependency_failed"] = True
+                a["status"] = "DEPENDENCY_SKIPPED"
+                a["reason"] = f"(Prerequisite '{dep}' failed — skipped duplicate secondary penalty) {a.get('reason', '')}"
+                continue
+
+            total_assertion_weights += w_i
+
+            if a.get("status") in ["MANUAL_REVIEW_REQUIRED", "UNSUPPORTED_FEATURE"]:
+                has_pending_assertion = True
+
+            # Score factor s_i in [0.0, 1.0]
+            if a.get("passed") is True:
+                s_i = 1.0
+            elif a.get("passed") is False:
+                s_i = float(a.get("score", 0.0))
             else:
-                fraction = 1.0
-                needs_review = True
-                assertion_results.append({
-                    "criterion": c_name,
-                    "type": "unmapped_rubric",
-                    "passed": True,
-                    "reason": f"No automated assertion mapped for '{c_name}'. Awarded full credit — instructor manual review recommended."
-                })
+                s_i = 0.0
 
-        awarded = round(fraction * weight, 2)
+            weighted_sum += (w_i * s_i)
+
+            if is_crit and not a.get("passed"):
+                has_critical_failure = True
+                cap_val = float(s_cap) if s_cap is not None else 0.0
+                if critical_cap is None or cap_val < critical_cap:
+                    critical_cap = cap_val
+
+        if total_assertion_weights > 0:
+            fraction = weighted_sum / total_assertion_weights
+        else:
+            fraction = 0.0
+
+        if has_critical_failure:
+            cap = critical_cap if critical_cap is not None else 0.0
+            awarded = round(min(fraction * weight, cap), 2)
+        else:
+            awarded = round(fraction * weight, 2)
+
+        if has_pending_assertion:
+            crit_status = "MANUAL_REVIEW_REQUIRED"
+            needs_review = True
+            pending = round(max(0.0, weight - awarded), 2)
+            pending_review_total += pending
+            verified_earned_total += awarded
+            verified_available_total += round(weight - pending, 2)
+        else:
+            pending = 0.0
+            crit_status = "VERIFIED_PASS" if awarded >= weight else "VERIFIED_FAIL"
+            verified_earned_total += awarded
+            verified_available_total += weight
+            verified_lost_total += round(max(0.0, weight - awarded), 2)
+
         rubric_breakdown[c_name] = awarded
-        total_score += awarded
+        rubric_breakdown_details[c_name] = {
+            "awarded": awarded,
+            "weight": weight,
+            "status": crit_status,
+            "pending_marks": pending,
+            "fraction": round(fraction, 4),
+            "assertions_count": len(c_assertions),
+            "passed_count": sum(1 for a in c_assertions if a.get("passed") is True)
+        }
 
-    total_score = min(100.0, max(0.0, round(total_score, 2)))
+    # ── Final Overall Score Calculation (Never shrink the denominator) ──
+    total_score = min(100.0, max(0.0, round(verified_earned_total, 2)))
 
     eval_status = "COMPLETED"
-    if needs_review:
-        eval_status = "NEEDS_REVIEW"
+    if needs_review or pending_review_total > 0:
+        eval_status = "MANUAL_REVIEW_REQUIRED"
+
+    scoring_summary = {
+        "total_available": round(total_rubric_available, 2),
+        "verified_earned": round(verified_earned_total, 2),
+        "verified_available": round(verified_available_total, 2),
+        "pending_review": round(pending_review_total, 2),
+        "verified_lost": round(verified_lost_total, 2),
+        "percentage_earned": round((verified_earned_total / max(1.0, total_rubric_available)) * 100, 2),
+        "status": eval_status
+    }
+
+    # Safely close workbooks
+    try:
+        if wb_orig:
+            wb_orig.close()
+        if wb_cached:
+            wb_cached.close()
+        if wb_recalc:
+            wb_recalc.close()
+    except Exception:
+        pass
 
     return {
         "success": True,
         "score": total_score,
         "rubric_breakdown": rubric_breakdown,
+        "rubric_breakdown_details": rubric_breakdown_details,
+        "scoring_summary": scoring_summary,
         "evaluation_status": eval_status,
         "detected_formulas": sorted(list(detected_formulas)),
         "detected_charts": detected_charts,
