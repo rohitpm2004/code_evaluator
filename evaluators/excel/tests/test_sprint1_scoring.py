@@ -183,8 +183,8 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
         }
 
         report = inspect_and_evaluate(orig_p, recalc_p, spec)
-        # downstream_chart was skipped due to upstream_table failure
-        skipped = [a for a in report["assertion_results"] if a.get("status") == "DEPENDENCY_SKIPPED"]
+        # downstream_chart was blocked due to upstream_table failure
+        skipped = [a for a in report["assertion_results"] if a.get("status") in ["DEPENDENCY_SKIPPED", "BLOCKED_BY_DEPENDENCY"]]
         self.assertEqual(len(skipped), 1)
 
     def test_denominator_integrity_and_pending_review(self):
@@ -393,6 +393,8 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
         # Score must be EXACTLY 30.0 / 100.0, NOT 42.8% (30/70)!
         self.assertEqual(report["score"], 30.0)
         self.assertEqual(report["rubric_breakdown"]["Dashboard & Table"], 30.0)
+        self.assertEqual(report["scoring_summary"]["pending_review"], 30.0)
+        self.assertEqual(report["evaluation_status"], "MANUAL_REVIEW_REQUIRED")
 
     def test_t10_circular_dependency_detected(self):
         """T10: Circular dependencies are caught and marked CONFIGURATION_ERROR."""
@@ -473,7 +475,7 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
         report = inspect_and_evaluate(orig_p, recalc_p, spec)
         # Root data failed, both dependents skipped without crashing, score is 0.0/100
         self.assertEqual(report["score"], 0.0)
-        skipped = [a for a in report["assertion_results"] if a.get("status") == "DEPENDENCY_SKIPPED"]
+        skipped = [a for a in report["assertion_results"] if a.get("status") in ["DEPENDENCY_SKIPPED", "BLOCKED_BY_DEPENDENCY"]]
         self.assertEqual(len(skipped), 2)
 
     def test_t12_all_assertions_pending_no_invented_score(self):

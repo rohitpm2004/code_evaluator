@@ -84,9 +84,10 @@ class WorkbookObjectRegistry:
                         r_id = rel.attrib.get("Id")
                         target = rel.attrib.get("Target", "")
                         if r_id and target:
-                            # Normalize path
-                            norm_target = "xl/" + target.lstrip("/").replace("\\", "/")
-                            rid_to_target[r_id] = norm_target
+                            clean_t = target.lstrip("/").replace("\\", "/")
+                            if not clean_t.startswith("xl/"):
+                                clean_t = "xl/" + clean_t
+                            rid_to_target[r_id] = clean_t
                 except Exception:
                     pass
 
@@ -140,6 +141,13 @@ class WorkbookObjectRegistry:
                         t_ref = t_elem.attrib.get("ref", "")
                         t_totals = t_elem.attrib.get("totalsRowCount", "0") != "0"
 
+                        row_count = 0
+                        if t_ref and ":" in t_ref:
+                            r_matches = re.findall(r'[0-9]+', t_ref)
+                            if len(r_matches) >= 2:
+                                s_r, e_r = int(r_matches[0]), int(r_matches[1])
+                                row_count = max(0, e_r - s_r - (1 if t_totals else 0))
+
                         cols = []
                         cols_elem = t_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}tableColumns")
                         if cols_elem is not None:
@@ -151,6 +159,7 @@ class WorkbookObjectRegistry:
                             "name": t_name,
                             "display_name": t_display,
                             "range_ref": t_ref,
+                            "row_count": row_count,
                             "has_totals_row": t_totals,
                             "columns": cols,
                             "file_path": name
@@ -173,10 +182,21 @@ class WorkbookObjectRegistry:
                             for cf in cache_fields:
                                 fields.append(cf.attrib.get("name", ""))
 
+                        src_elem = pc_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cacheSource")
+                        src_type = src_elem.attrib.get("type", "") if src_elem is not None else ""
+                        ws_src = pc_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}worksheetSource")
+                        src_sheet = ws_src.attrib.get("sheet", "") if ws_src is not None else ""
+                        src_ref = ws_src.attrib.get("ref", "") if ws_src is not None else ""
+                        src_name = ws_src.attrib.get("name", "") if ws_src is not None else ""
+
                         self.pivot_caches[c_id] = {
                             "cache_id": c_id,
                             "record_count": int(record_count) if record_count.isdigit() else 0,
                             "fields": fields,
+                            "source_type": src_type,
+                            "source_sheet": src_sheet,
+                            "source_ref": src_ref,
+                            "source_name": src_name,
                             "file_path": name
                         }
                     except Exception:
@@ -233,6 +253,7 @@ class WorkbookObjectRegistry:
                                 })
 
                         sheet_assigned = pt_to_sheet.get(name, list(self.worksheets.keys())[0] if self.worksheets else "Sheet1")
+                        cache_meta = self.pivot_caches.get(str(cache_id), {})
                         self.pivot_tables.append({
                             "name": pt_name,
                             "cache_id": cache_id,
@@ -241,6 +262,10 @@ class WorkbookObjectRegistry:
                             "fields": pivot_fields,
                             "row_fields": row_fields,
                             "data_fields": data_fields,
+                            "record_count": cache_meta.get("record_count", 0),
+                            "source_sheet": cache_meta.get("source_sheet", ""),
+                            "source_ref": cache_meta.get("source_ref", ""),
+                            "source_name": cache_meta.get("source_name", ""),
                             "file_path": name
                         })
                     except Exception:
@@ -290,14 +315,19 @@ class WorkbookObjectRegistry:
                         # Identify chart type and series references
                         ch_type = "Chart"
                         num_refs = []
+                        cat_refs = []
                         for node in c_elem.iter():
                             t_tag = node.tag.split("}")[-1] if "}" in node.tag else node.tag
                             if t_tag in ["barChart", "columnChart", "lineChart", "pieChart", "doughnutChart", "scatterChart", "areaChart", "radarChart"]:
                                 ch_type = t_tag.replace("Chart", "").capitalize() + "Chart"
-                            if t_tag == "numRef":
+                            if t_tag in ["numRef", "strRef"]:
                                 f_node = node.find(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f")
                                 if f_node is not None and f_node.text:
-                                    num_refs.append(f_node.text.strip())
+                                    ref_str = f_node.text.strip()
+                                    if t_tag == "numRef":
+                                        num_refs.append(ref_str)
+                                    else:
+                                        cat_refs.append(ref_str)
 
                         series_count = sum(1 for el in c_elem.iter() if el.tag.endswith("}ser"))
                         sheet_assigned = chart_to_sheet.get(name, list(self.worksheets.keys())[0] if self.worksheets else "Sheet1")
@@ -306,8 +336,10 @@ class WorkbookObjectRegistry:
                             "type": ch_type,
                             "title": ch_title,
                             "series_count": series_count,
+                            "seriesCount": series_count,
                             "sheet": sheet_assigned,
                             "num_refs": num_refs,
+                            "cat_refs": cat_refs,
                             "file_path": name
                         })
                     except Exception:
@@ -332,6 +364,10 @@ class WorkbookObjectRegistry:
                                 })
                     except Exception:
                         pass
+
+            if self.power_queries:
+                self.macro_info["has_power_query"] = True
+                self.macro_info["query_names"] = [q["query_name"] for q in self.power_queries]
 
             # Step 7: Index VBA Macros
             if "xl/vbaProject.bin" in namelist:

@@ -83,26 +83,35 @@ try:
         except Exception as first_err:
             err_msg = str(first_err)
             # If openpyxl crashes on pivot cache / CalculatedItem / formula / XML descriptor errors:
-            if any(term in err_msg.lower() for term in ["pivot", "calculateditem", "calculatedmember", "formula", "nonetype"]):
+            try:
+                temp_clean = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
+                temp_clean_path = temp_clean.name
+                temp_clean.close()
+                with zipfile.ZipFile(path, 'r') as zin:
+                    with zipfile.ZipFile(temp_clean_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                        for item in zin.infolist():
+                            # Omit pivotCache definition and record files that crash openpyxl's parser
+                            if 'xl/pivotCache/' in item.filename or 'xl/pivotTables/' in item.filename:
+                                continue
+                            content = zin.read(item.filename)
+                            if item.filename.endswith('.rels') and (b'pivotTable' in content or b'pivotCache' in content):
+                                try:
+                                    r_root = ET.fromstring(content)
+                                    to_remove = [r for r in r_root if 'pivotTable' in r.attrib.get('Type', '') or 'pivotCache' in r.attrib.get('Type', '')]
+                                    for r in to_remove:
+                                        r_root.remove(r)
+                                    content = ET.tostring(r_root, encoding='utf-8')
+                                except Exception:
+                                    pass
+                            zout.writestr(item, content)
+                wb = openpyxl.load_workbook(temp_clean_path, data_only=data_only)
                 try:
-                    temp_clean = tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False)
-                    temp_clean_path = temp_clean.name
-                    temp_clean.close()
-                    with zipfile.ZipFile(path, 'r') as zin:
-                        with zipfile.ZipFile(temp_clean_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
-                            for item in zin.infolist():
-                                # Omit pivotCache definition and record files that crash openpyxl's parser
-                                if 'xl/pivotCache/' in item.filename or 'xl/pivotTables/' in item.filename:
-                                    continue
-                                zout.writestr(item, zin.read(item.filename))
-                    wb = openpyxl.load_workbook(temp_clean_path, data_only=data_only)
-                    try:
-                        os.unlink(temp_clean_path)
-                    except Exception:
-                        pass
-                    return wb
+                    os.unlink(temp_clean_path)
                 except Exception:
                     pass
+                return wb
+            except Exception:
+                pass
             raise first_err
 except ImportError:
     print(json.dumps({
@@ -1089,11 +1098,25 @@ def inspect_openxml_charts_from_zip(xlsx_path: str) -> List[Dict[str, Any]]:
                     chart_title = _extract_title(root)
                     series_count = _count_series(root)
                     sheet_ref = sheet_chart_map.get(chart_file, 'unknown')
+                    num_refs = []
+                    cat_refs = []
+                    for node in root.iter():
+                        t_tag = node.tag.split("}")[-1]
+                        if t_tag in ["numRef", "strRef"]:
+                            f_node = node.find(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f")
+                            if f_node is not None and f_node.text:
+                                ref_str = f_node.text.strip()
+                                if t_tag == "numRef":
+                                    num_refs.append(ref_str)
+                                else:
+                                    cat_refs.append(ref_str)
                     charts.append({
                         'type': chart_type,
                         'title': chart_title,
                         'seriesCount': series_count,
                         'sheet': sheet_ref,
+                        'num_refs': num_refs,
+                        'cat_refs': cat_refs,
                         'source': 'openxml_zip',
                         'file': chart_file
                     })
@@ -1162,7 +1185,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     # Global inspections for Pivots, Macros, and Power Query
     detected_pivots = registry.pivot_tables if registry else inspect_openxml_pivots(original_path)
     macro_info = registry.macro_info if registry else inspect_openxml_macros_and_queries(original_path)
-    detected_charts = []
+    detected_charts = [dict(c) for c in registry.charts] if (registry and registry.charts) else []
 
     # Global formula and content scan across all sheets
     all_formulas = []
@@ -1195,12 +1218,25 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 else:
                     ch_title = str(ch.title or '')
             series_count = len(getattr(ch, 'series', []) or [])
-            detected_charts.append({
-                "sheet": s_name,
-                "type": ch_type,
-                "title": ch_title.strip(),
-                "seriesCount": series_count
-            })
+            num_refs = []
+            cat_refs = []
+            for s in getattr(ch, 'series', []) or []:
+                if hasattr(s, 'values') and s.values:
+                    num_refs.append(str(getattr(s.values, 'loc', '') or getattr(s.values, 'title', '') or str(s.values)))
+                if hasattr(s, 'categories') and s.categories:
+                    cat_refs.append(str(getattr(s.categories, 'loc', '') or getattr(s.categories, 'title', '') or str(s.categories)))
+
+            existing = any(c.get("title") == ch_title.strip() and c.get("sheet") == s_name for c in detected_charts)
+            if not existing:
+                detected_charts.append({
+                    "sheet": s_name,
+                    "type": ch_type,
+                    "title": ch_title.strip(),
+                    "seriesCount": series_count,
+                    "series_count": series_count,
+                    "num_refs": num_refs,
+                    "cat_refs": cat_refs
+                })
 
         # Find bounds of cells that contain content
         for r in range(1, min(sh.max_row or 100, 200) + 1):
@@ -2314,6 +2350,94 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         found_titles = ", ".join([f"'{c.get('title')}'" for c in target_sheet_charts if c.get("title")])
                         reason = f"Expected chart title containing '{req_title_raw}', found: {found_titles or 'Untitled'}."
 
+                # ── SPRINT 3: Chart Data Source & Rendered Series Verification ──
+                req_source_range = tc.get("expectedSourceRange") or tc.get("valueRange") or tc.get("sourceRange")
+                req_cat_range = tc.get("expectedCategoryRange") or tc.get("categoryRange")
+                req_values = tc.get("expectedValues")
+
+                if tc_passed and req_source_range:
+                    def _norm_r(r_str: str) -> str:
+                        return re.sub(r"[\$'\s]", "", str(r_str or "")).upper()
+
+                    norm_req_src = _norm_r(req_source_range)
+                    req_col_range = norm_req_src.split("!")[-1] if "!" in norm_req_src else norm_req_src
+
+                    src_matched = False
+                    for c in target_sheet_charts:
+                        c_refs = c.get("num_refs", [])
+                        for cr in c_refs:
+                            norm_cr = _norm_r(cr)
+                            cr_col_range = norm_cr.split("!")[-1] if "!" in norm_cr else norm_cr
+                            if norm_req_src in norm_cr or norm_cr in norm_req_src or req_col_range == cr_col_range:
+                                src_matched = True
+                                break
+                        if src_matched:
+                            break
+
+                    if not src_matched:
+                        tc_passed = False
+                        all_found_refs = [r for c in target_sheet_charts for r in c.get("num_refs", [])]
+                        reason = f"Chart source data range mismatch: expected '{req_source_range}', found {all_found_refs or 'none'}."
+
+                if tc_passed and req_cat_range:
+                    def _norm_r(r_str: str) -> str:
+                        return re.sub(r"[\$'\s]", "", str(r_str or "")).upper()
+
+                    norm_req_cat = _norm_r(req_cat_range)
+                    req_cat_col_range = norm_req_cat.split("!")[-1] if "!" in norm_req_cat else norm_req_cat
+                    cat_matched = False
+                    for c in target_sheet_charts:
+                        c_cats = c.get("cat_refs", [])
+                        for cc in c_cats:
+                            norm_cc = _norm_r(cc)
+                            cc_col_range = norm_cc.split("!")[-1] if "!" in norm_cc else norm_cc
+                            if norm_req_cat in norm_cc or norm_cc in norm_req_cat or req_cat_col_range == cc_col_range:
+                                cat_matched = True
+                                break
+                        if cat_matched:
+                            break
+
+                    if not cat_matched:
+                        tc_passed = False
+                        all_found_cats = [r for c in target_sheet_charts for r in c.get("cat_refs", [])]
+                        reason = f"Chart category range mismatch: expected '{req_cat_range}', found {all_found_cats or 'none'}."
+
+                if tc_passed and req_values:
+                    matched_values = []
+                    for c in target_sheet_charts:
+                        for cr in c.get("num_refs", []):
+                            m_sh = sheet_name
+                            m_rng = cr
+                            if "!" in cr:
+                                m_sh_raw, m_rng = cr.split("!", 1)
+                                m_sh = m_sh_raw.replace("'", "")
+                            m_sh = resolve_sheet(wb_recalc, m_sh)
+                            if m_sh in wb_recalc.sheetnames:
+                                try:
+                                    cells = wb_recalc[m_sh][m_rng.replace("$", "")]
+                                    if not isinstance(cells, tuple):
+                                        cells = ((cells,),)
+                                    elif cells and not isinstance(cells[0], tuple):
+                                        cells = (cells,)
+                                    for row in cells:
+                                        for cell in row:
+                                            nv = parse_number(cell.value)
+                                            if nv is not None:
+                                                matched_values.append(nv)
+                                except Exception:
+                                    pass
+                    if matched_values:
+                        exp_nums = [parse_number(ev) for ev in req_values if parse_number(ev) is not None]
+                        val_mismatches = []
+                        for ev in exp_nums:
+                            if not any(check_dual_tolerance(mv, ev, 0.05, 0.001) for mv in matched_values):
+                                val_mismatches.append(ev)
+                        if val_mismatches:
+                            tc_passed = False
+                            reason = f"Chart data values mismatch: expected {exp_nums}, actual series values: {matched_values[:10]}."
+                        else:
+                            reason += f" Verified chart data points match expected values ({len(exp_nums)} items)."
+
                 if tc_passed:
                     reason = f"Verified {len(target_sheet_charts)} chart(s) successfully matching requirements."
 
@@ -2435,6 +2559,89 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 else:
                     reason = f"Verified {len(detected_pivots)} native Pivot Table(s) in workbook."
 
+                # ── SPRINT 3: Pivot Table Rendered Grand Total & Output Verification ──
+                exp_grand_total = tc.get("expectedGrandTotal") or tc.get("expectedTotal")
+                exp_values = tc.get("expectedValues")
+
+                if tc_passed and (exp_grand_total is not None or exp_values is not None):
+                    exp_gt_num = parse_number(exp_grand_total) if exp_grand_total is not None else None
+                    gt_matched = False
+                    found_numbers = []
+
+                    # Scan rendered cells for each candidate pivot
+                    for p in detected_pivots:
+                        p_sheet = resolve_sheet(wb_recalc, p.get("sheet", sheet_name))
+                        if p_sheet not in wb_recalc.sheetnames:
+                            continue
+                        sh_recalc = wb_recalc[p_sheet]
+                        loc_ref = p.get("location_ref", "")
+                        cells_to_scan = []
+
+                        if loc_ref and ":" in loc_ref:
+                            try:
+                                start_col, start_row, end_col, end_row = openpyxl.utils.range_boundaries(loc_ref)
+                                for r in range(start_row, min(end_row + 5, 250)):
+                                    for c in range(start_col, min(end_col + 5, 50)):
+                                        cells_to_scan.append(sh_recalc.cell(row=r, column=c))
+                            except Exception:
+                                pass
+                        if not cells_to_scan:
+                            for r in range(1, min(sh_recalc.max_row or 50, 100)):
+                                for c in range(1, min(sh_recalc.max_column or 20, 30)):
+                                    cells_to_scan.append(sh_recalc.cell(row=r, column=c))
+
+                        total_row_nums = []
+                        total_col_nums = []
+                        for cell in cells_to_scan:
+                            cv_str = str(cell.value or "").strip().lower()
+                            if "total" in cv_str:
+                                total_row_nums.append(cell.row)
+                                total_col_nums.append(cell.column)
+
+                        for cell in cells_to_scan:
+                            if cell.row in total_row_nums or cell.column in total_col_nums:
+                                val_num = parse_number(cell.value)
+                                if val_num is not None:
+                                    found_numbers.append(val_num)
+
+                        if loc_ref and ":" in loc_ref:
+                            try:
+                                _, _, end_col, end_row = openpyxl.utils.range_boundaries(loc_ref)
+                                for r in [end_row - 1, end_row, end_row + 1]:
+                                    for c in range(max(1, end_col - 2), end_col + 3):
+                                        vn = parse_number(sh_recalc.cell(row=r, column=c).value)
+                                        if vn is not None:
+                                            found_numbers.append(vn)
+                            except Exception:
+                                pass
+
+                        if exp_gt_num is not None:
+                            for fn in found_numbers:
+                                if check_dual_tolerance(fn, exp_gt_num, abs_tol=1.0, rel_tol=0.005):
+                                    gt_matched = True
+                                    break
+                        if gt_matched:
+                            break
+
+                    if exp_gt_num is not None:
+                        if gt_matched:
+                            reason += f" Verified PivotTable Grand Total: {exp_gt_num}."
+                        else:
+                            tc_passed = False
+                            reason = f"PivotTable Grand Total mismatch: expected {exp_gt_num}, found candidate values: {found_numbers[:10] or 'none'}."
+
+                # Stale PivotCache Warning Detection
+                for p in detected_pivots:
+                    p_records = int(p.get("record_count", 0))
+                    p_src_table = p.get("source_name") or p.get("source_table")
+                    if p_records > 0 and p_src_table and registry and registry.tables:
+                        for t in registry.tables:
+                            if str(p_src_table).lower() in (t.get("name", "").lower(), t.get("display_name", "").lower()):
+                                t_rows = int(t.get("row_count", 0))
+                                if t_rows > 0 and abs(t_rows - p_records) > 0:
+                                    warning_msg = f"PIVOT_CACHE_STALE: PivotCache for '{p.get('name')}' has {p_records} records, but source table '{t.get('display_name') or t.get('name')}' has {t_rows} rows (PivotTable may not have been refreshed)."
+                                    calculation_warnings.append(warning_msg)
+
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
 
@@ -2483,9 +2690,70 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         elif tc_type in ["power_query_check", "query_check"]:
             require_query = tc.get("requireQuery", True)
             q_tables_count = len(macro_info.get("query_tables", []))
-            q_names = macro_info.get("query_names", [])
-            has_pq = macro_info.get("has_power_query", False) or q_tables_count > 0 or len(q_names) > 0
+            q_names = list(macro_info.get("query_names", []))
+            if registry and registry.power_queries:
+                for pq in registry.power_queries:
+                    if pq["query_name"] not in q_names:
+                        q_names.append(pq["query_name"])
+            has_pq = macro_info.get("has_power_query", False) or (registry and len(registry.power_queries) > 0) or q_tables_count > 0 or len(q_names) > 0
             tc_passed = has_pq if require_query else True
+            reason = ""
+
+            req_headers = tc.get("expectedHeaders") or tc.get("requiredColumns") or []
+            min_row_count = int(tc.get("minRowCount", 0))
+            expected_qname = tc.get("expectedQueryName")
+
+            pq_m_code_status = "POWER_QUERY_M_CODE_VERIFIED" if has_pq else "POWER_QUERY_M_CODE_MISSING"
+            pq_output_status = "POWER_QUERY_OUTPUT_VERIFIED" if (q_tables_count > 0 or (registry and registry.tables)) else "POWER_QUERY_OUTPUT_UNVERIFIED"
+            freshness_status = "POWER_QUERY_FRESHNESS_UNVERIFIED"
+
+            if tc_passed and expected_qname:
+                clean_exp_qn = str(expected_qname).strip().lower()
+                all_found_queries = [str(qn).lower() for qn in q_names]
+                if not any(clean_exp_qn in fq or fq in clean_exp_qn for fq in all_found_queries):
+                    tc_passed = False
+                    reason = f"Expected Power Query named '{expected_qname}', found queries: {q_names or 'none'}."
+
+            if req_headers:
+                found_matching_table = False
+                tables_to_check = registry.tables if (registry and registry.tables) else []
+                for tbl in tables_to_check:
+                    tbl_cols = [str(c).lower().strip() for c in tbl.get("columns", [])]
+                    if all(any(rh.lower().strip() == tc_col for tc_col in tbl_cols) for rh in req_headers):
+                        found_matching_table = True
+                        break
+
+                if not found_matching_table:
+                    for s_name in wb_orig.sheetnames:
+                        sh_o = wb_orig[s_name]
+                        tb = detect_table_bounds(sh_o)
+                        h_row = tb.get("header_row")
+                        if h_row:
+                            row_vals = [str(sh_o.cell(row=h_row, column=c).value or "").strip().lower() for c in range(1, min(sh_o.max_column or 20, 50))]
+                            if all(any(rh.lower().strip() == rv for rv in row_vals) for rh in req_headers):
+                                found_matching_table = True
+                                break
+
+                if not found_matching_table:
+                    tc_passed = False
+                    pq_output_status = "POWER_QUERY_OUTPUT_HEADER_MISMATCH"
+                    reason = f"Power Query output table missing required columns: {req_headers}."
+
+            if tc_passed and min_row_count > 0:
+                max_found_rows = 0
+                if registry and registry.tables:
+                    for tbl in registry.tables:
+                        max_found_rows = max(max_found_rows, int(tbl.get("row_count", 0)))
+                if max_found_rows < min_row_count:
+                    for s_name in wb_orig.sheetnames:
+                        sh_o = wb_orig[s_name]
+                        tb = detect_table_bounds(sh_o)
+                        rows_in_sh = max(0, tb.get("data_end_row", 0) - tb.get("data_start_row", 0) + 1)
+                        max_found_rows = max(max_found_rows, rows_in_sh)
+
+                if max_found_rows < min_row_count:
+                    tc_passed = False
+                    reason = f"Power Query output table has {max_found_rows} rows, expected at least {min_row_count}."
 
             if tc_passed:
                 details = []
@@ -2493,8 +2761,8 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     details.append(f"{len(q_names)} query connections ({', '.join(q_names[:3])})")
                 if q_tables_count:
                     details.append(f"{q_tables_count} loaded query tables")
-                reason = f"Verified Power Query pipeline in workbook ({'; '.join(details) or 'active ETL connections'})."
-            else:
+                reason = f"Verified Power Query pipeline ({pq_m_code_status}, {pq_output_status}). Static output verified; live remote refresh unverified (headless environment without external credentials)."
+            elif not reason:
                 reason = "No Power Query connections or loaded query tables detected."
 
             if tc_passed:
@@ -2506,19 +2774,24 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "passed": tc_passed,
                 "reason": reason,
                 "foundQueries": q_names,
-                "queryTables": macro_info.get("query_tables", [])
+                "queryTables": macro_info.get("query_tables", []),
+                "power_query_status": pq_m_code_status,
+                "power_query_output": pq_output_status,
+                "freshness_status": freshness_status
             })
 
         # -------------------------------------------------------------
         # TYPE 9: Controlled Formula-Behavior Check (Scenario Mutations)
         # -------------------------------------------------------------
-        elif tc_type in ["formula_behavior_check", "scenario_check", "behavior_check", "mutation_check", "formula_behavior"]:
+        elif tc_type in ["formula_behavior_check", "scenario_check", "behavior_check", "mutation_check", "formula_behavior"] or (tc_type in ["formula_check", "formula_range_check"] and tc.get("mode") == "formula_behavior"):
             scenarios = tc.get("scenarios", [])
-            if not scenarios and tc.get("inputs") and tc.get("expectedOutputs"):
+            if not scenarios and (tc.get("inputs") or tc.get("mutation")) and (tc.get("expectedOutputs") or tc.get("expectedOutput")):
+                inputs = tc.get("inputs") or [tc.get("mutation")]
+                expected = tc.get("expectedOutputs") or [tc.get("expectedOutput")]
                 scenarios = [{
                     "name": tc.get("name", "Default Mutation Scenario"),
-                    "inputs": tc.get("inputs", []),
-                    "expectedOutputs": tc.get("expectedOutputs", [])
+                    "inputs": inputs,
+                    "expectedOutputs": expected
                 }]
 
             scenario_results = []
@@ -2561,6 +2834,61 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
                     wb_scen_recalc = openpyxl.load_workbook(sc_recalc_path, data_only=True)
                     recalc_sheet = wb_scen_recalc[target_sc_sheet]
+
+                    # ── SPRINT 3: Lightweight Formula Evaluation Fallback when LO is offline ──
+                    if not recalc_ok:
+                        wb_scen_formula = openpyxl.load_workbook(sc_orig_path, data_only=False)
+                        f_sheet = wb_scen_formula[target_sc_sheet]
+
+                        def _eval_simple_formula(f_str: str, sheet):
+                            if not f_str or not str(f_str).startswith("="):
+                                return parse_number(f_str)
+                            expr = str(f_str)[1:].strip().upper()
+                            sum_m = re.match(r"^SUM\(([A-Z]+[0-9]+):([A-Z]+[0-9]+)\)$", expr)
+                            if sum_m:
+                                total = 0.0
+                                for row in sheet[f"{sum_m.group(1)}:{sum_m.group(2)}"]:
+                                    for c in row:
+                                        nv = parse_number(c.value)
+                                        if nv is not None:
+                                            total += nv
+                                return total
+                            avg_m = re.match(r"^AVERAGE\(([A-Z]+[0-9]+):([A-Z]+[0-9]+)\)$", expr)
+                            if avg_m:
+                                vals = []
+                                for row in sheet[f"{avg_m.group(1)}:{avg_m.group(2)}"]:
+                                    for c in row:
+                                        nv = parse_number(c.value)
+                                        if nv is not None:
+                                            vals.append(nv)
+                                return sum(vals) / len(vals) if vals else 0.0
+                            def _replace_coord(match):
+                                c_ref = match.group(0)
+                                try:
+                                    v = parse_number(sheet[c_ref].value)
+                                    return str(v if v is not None else 0)
+                                except Exception:
+                                    return "0"
+                            clean_expr = re.sub(r"\b[A-Z]+[0-9]+\b", _replace_coord, expr)
+                            if re.match(r"^[0-9\+\-\*\/\%\(\)\.\s]+$", clean_expr):
+                                try:
+                                    return float(eval(clean_expr, {"__builtins__": None}, {}))
+                                except Exception:
+                                    pass
+                            return None
+
+                        for exp in sc_expected:
+                            out_c = exp.get("cell")
+                            if out_c:
+                                try:
+                                    f_val = f_sheet[out_c].value
+                                    evaluated = _eval_simple_formula(f_val, f_sheet)
+                                    if evaluated is not None:
+                                        recalc_sheet[out_c].value = evaluated
+                                        recalc_ok = True
+                                except Exception:
+                                    pass
+                        wb_scen_formula.close()
 
                     sc_passed = True
                     output_diffs = []
@@ -2687,6 +3015,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # ── Weighted Assertion Calculation ──
         weighted_sum = 0.0
         total_assertion_weights = 0.0
+        pending_assertion_weights = 0.0
         has_critical_failure = False
         critical_cap = None
         has_pending_assertion = False
@@ -2733,29 +3062,37 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 a["reason"] = f"Circular dependency detected in 'depends_on' configuration involving '{dep}'."
                 needs_review = True
                 has_pending_assertion = True
+                pending_assertion_weights += w_i
                 total_assertion_weights += w_i
                 continue
 
             if dep_failed:
                 a["dependency_failed"] = True
-                a["status"] = "DEPENDENCY_SKIPPED"
-                a["reason"] = f"(Prerequisite '{dep}' failed — downstream assertion unverified) {a.get('reason', '')}"
-                # CRITICAL (Check 1): Never shrink the denominator! Keep w_i in total_assertion_weights!
                 total_assertion_weights += w_i
-                if dep_mode == "pending_review":
-                    has_pending_assertion = True
+                if dep_mode == "strict_fail":
+                    a["status"] = "VERIFIED_FAIL"
+                    a["reason"] = f"(Prerequisite '{dep}' failed — downstream assertion strictly failed) {a.get('reason', '')}"
+                    s_i = 0.0
+                    weighted_sum += (w_i * s_i)
                 elif dep_mode == "partial_credit":
+                    a["status"] = "PARTIAL_CREDIT"
+                    a["reason"] = f"(Prerequisite '{dep}' failed — awarded partial credit) {a.get('reason', '')}"
                     p_cred = float(a.get("partial_credit", 0.5))
                     weighted_sum += (w_i * p_cred)
                 else:
-                    s_i = 0.0
-                    weighted_sum += (w_i * s_i)
+                    # Fair Accounting: BLOCKED_BY_DEPENDENCY -> Routed to instructor review, never silent failure
+                    a["status"] = "BLOCKED_BY_DEPENDENCY"
+                    a["reason"] = f"(Prerequisite '{dep}' failed — downstream assertion blocked, routed to instructor review) {a.get('reason', '')}"
+                    has_pending_assertion = True
+                    pending_assertion_weights += w_i
+                    needs_review = True
                 continue
 
             total_assertion_weights += w_i
 
-            if a.get("status") in ["MANUAL_REVIEW_REQUIRED", "UNSUPPORTED_FEATURE"]:
+            if a.get("status") in ["MANUAL_REVIEW_REQUIRED", "UNSUPPORTED_FEATURE", "BLOCKED_BY_DEPENDENCY"]:
                 has_pending_assertion = True
+                pending_assertion_weights += w_i
 
             # Score factor s_i in [0.0, 1.0]
             if a.get("passed") is True:
@@ -2787,10 +3124,14 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         if has_pending_assertion:
             crit_status = "MANUAL_REVIEW_REQUIRED"
             needs_review = True
-            pending = round(max(0.0, weight - awarded), 2)
+            if total_assertion_weights > 0:
+                pending = round(min(weight - awarded, (pending_assertion_weights / total_assertion_weights) * weight), 2)
+            else:
+                pending = weight
             pending_review_total += pending
             verified_earned_total += awarded
             verified_available_total += round(weight - pending, 2)
+            verified_lost_total += round(max(0.0, weight - awarded - pending), 2)
         else:
             pending = 0.0
             crit_status = "VERIFIED_PASS" if awarded >= weight else "VERIFIED_FAIL"
