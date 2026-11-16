@@ -37,6 +37,14 @@ except ImportError:
             return False, "recalculate_via_cli not available"
 
 try:
+    from workbook_registry import WorkbookObjectRegistry
+except ImportError:
+    try:
+        from engine.workbook_registry import WorkbookObjectRegistry
+    except ImportError:
+        WorkbookObjectRegistry = None
+
+try:
     import openpyxl
     from openpyxl.utils import coordinate_to_tuple, get_column_letter
 
@@ -1143,9 +1151,17 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
     default_sheet_name = wb_orig.sheetnames[0]
 
+    # Universal Workbook Object Registry (Sprint 2)
+    registry = None
+    if WorkbookObjectRegistry:
+        try:
+            registry = WorkbookObjectRegistry(original_path, recalculated_path)
+        except Exception as reg_err:
+            calculation_warnings.append(f"Registry notice: {str(reg_err)}")
+
     # Global inspections for Pivots, Macros, and Power Query
-    detected_pivots = inspect_openxml_pivots(original_path)
-    macro_info = inspect_openxml_macros_and_queries(original_path)
+    detected_pivots = registry.pivot_tables if registry else inspect_openxml_pivots(original_path)
+    macro_info = registry.macro_info if registry else inspect_openxml_macros_and_queries(original_path)
     detected_charts = []
 
     # Global formula and content scan across all sheets
@@ -2810,8 +2826,10 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         "status": eval_status
     }
 
-    # Safely close workbooks
+    # Safely close workbooks and registry
     try:
+        if registry:
+            registry.close()
         if wb_orig:
             wb_orig.close()
         if wb_cached:
@@ -2828,6 +2846,14 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         "rubric_breakdown_details": rubric_breakdown_details,
         "scoring_summary": scoring_summary,
         "evaluation_status": eval_status,
+        "registry_summary": {
+            "worksheet_count": len(registry.worksheets) if registry else len(wb_orig.sheetnames),
+            "table_count": len(registry.tables) if registry else 0,
+            "pivot_count": len(registry.pivot_tables) if registry else len(detected_pivots),
+            "chart_count": len(registry.charts) if registry else len(detected_charts),
+            "query_count": len(registry.power_queries) if registry else 0,
+            "has_macros": registry.macro_info.get("has_macros", False) if registry else macro_info.get("has_macros", False)
+        } if registry else None,
         "detected_formulas": sorted(list(detected_formulas)),
         "detected_charts": detected_charts,
         "detected_pivots": detected_pivots,
