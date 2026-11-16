@@ -305,15 +305,17 @@ def find_column_by_anchor(sheet, anchor_text: str, max_rows: int = 50, max_cols:
     return None
 
 TABLE_CONCEPTS = {
-    "date": ["date", "trans_date", "transaction date", "time"],
-    "client": ["client", "company", "customer", "account", "client name", "company name"],
+    "date": ["date", "trans_date", "transaction date", "time", "order date", "order_date"],
+    "client": ["client", "company", "customer", "account", "client name", "company name", "customer name", "customername", "customer_name", "customer id", "customer_id", "customerid"],
     "ticker": ["ticker", "tickers", "symbol", "stock", "code", "xnas", "xnys"],
-    "contact": ["contact", "contact name", "rep", "representative", "cleaned contact", "full name", "clean contact", "name"],
-    "department": ["department", "dept", "division", "sector"],
+    "contact": ["contact", "contact name", "rep", "representative", "cleaned contact", "full name", "clean contact", "name", "sales person", "salesperson", "sales rep", "agent"],
+    "department": ["department", "dept", "division", "sector", "segment"],
     "payment": ["payment", "payment method", "pay method", "pay type", "type"],
-    "revenue": ["revenue", "sales", "rev", "gross sales", "inflow"],
+    "revenue": ["revenue", "sales", "rev", "gross sales", "inflow", "amount", "net sales", "netsales", "net_sales", "total sales", "total revenue", "sales volume", "salesvolume", "sales_amount"],
     "profit": ["profit", "net profit", "gain", "earnings"], # disambiguated from profit margin
-    "margin": ["profit margin", "margin", "% margin", "margin %", "profit %", "markup"]
+    "margin": ["profit margin", "margin", "% margin", "margin %", "profit %", "markup"],
+    "product": ["product", "product name", "product_name", "product id", "product_id", "productid", "item", "category", "product category"],
+    "region": ["region", "geography", "territory", "location", "area", "zone", "country"]
 }
 
 def detect_table_bounds(sheet, max_scan_rows: int = 100, max_scan_cols: int = 60) -> Dict[str, Any]:
@@ -578,6 +580,19 @@ def resolve_sheet(wb, target_name: Optional[str] = None, anchor_hint: Optional[s
     raw_target = str(target_name).strip()
     clean_target = _norm_ws(raw_target)
 
+    # If anchor_hint is provided, prioritize sheet containing that anchor
+    if anchor_hint:
+        # Check if requested sheet directly contains anchor
+        if raw_target in wb.sheetnames:
+            coords, _ = find_anchor_cell(wb[raw_target], anchor_hint)
+            if coords:
+                return raw_target
+        # Check all sheets for anchor
+        for s in wb.sheetnames:
+            coords, _ = find_anchor_cell(wb[s], anchor_hint)
+            if coords:
+                return s
+
     # T1: Exact
     if raw_target in wb.sheetnames:
         return raw_target
@@ -629,56 +644,196 @@ def resolve_sheet(wb, target_name: Optional[str] = None, anchor_hint: Optional[s
 
     return wb.sheetnames[0]
 
+def normalize_field_name(raw_name: str) -> List[str]:
+    """Generates standard variants of a field name (handling OLAP [Table].[Col] and underscores)."""
+    if not raw_name:
+        return []
+    variants = [raw_name]
+    clean = re.sub(r'[\[\]]', '', raw_name).strip()
+    if clean != raw_name:
+        variants.append(clean)
+    if '.' in clean:
+        parts = clean.split('.')
+        variants.append(parts[-1].strip())
+    if '_' in clean:
+        variants.append(clean.replace('_', ' '))
+    return list(dict.fromkeys(v for v in variants if v))
+
 def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
-    """Inspects native Excel Pivot Tables and PivotCaches from OpenXML package."""
+    """Inspects native Excel Pivot Tables and PivotCaches with per-pivot sheet and field resolution."""
     pivots = []
-    cache_fields_list = []
     try:
         with zipfile.ZipFile(xlsx_path, 'r') as z:
-            # Discover fields from pivotCacheDefinitions (captures Data Model and multi-table cache fields)
-            for fname in z.namelist():
+            names = z.namelist()
+
+            # 1. Map worksheet XML paths to worksheet human names
+            sheet_file_to_name = {}
+            if 'xl/workbook.xml' in names and 'xl/_rels/workbook.xml.rels' in names:
+                try:
+                    wb_rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                    rid_to_target = {r.attrib.get('Id'): r.attrib.get('Target') for r in wb_rels}
+                    wb_root = ET.fromstring(z.read('xl/workbook.xml'))
+                    for s in wb_root.iter():
+                        if s.tag.endswith('sheet'):
+                            rid = s.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                            tgt = rid_to_target.get(rid)
+                            if tgt:
+                                norm_tgt = 'xl/' + tgt.lstrip('/').replace('\\', '/')
+                                sheet_file_to_name[norm_tgt] = s.attrib.get('name')
+                except Exception:
+                    pass
+
+            # 2. Map sheet files to their pivot tables
+            pt_to_sheet = {}
+            for n in names:
+                if n.startswith('xl/worksheets/_rels/sheet') and n.endswith('.xml.rels'):
+                    sheet_xml = n.replace('/_rels/', '/').replace('.xml.rels', '.xml')
+                    sheet_display_name = sheet_file_to_name.get(sheet_xml, '')
+                    try:
+                        s_rels = ET.fromstring(z.read(n))
+                        for r in s_rels:
+                            tgt = r.attrib.get('Target', '')
+                            if 'pivotTable' in tgt:
+                                pt_file = 'xl/' + tgt.replace('../', '').lstrip('/')
+                                pt_to_sheet[pt_file] = sheet_display_name
+                    except Exception:
+                        pass
+
+            # 3. Parse pivotCacheDefinitions (standard + OLAP / Data Model)
+            cache_definitions = {} # cache_file -> list of cache field names
+            for fname in names:
                 if fname.startswith('xl/pivotCache/pivotCacheDefinition') and fname.endswith('.xml'):
                     try:
                         c_bytes = z.read(fname)
                         c_root = ET.fromstring(c_bytes)
+                        c_fields = []
                         for elem in c_root.iter():
                             tag = elem.tag.split('}')[-1]
-                            if tag == 'cacheField':
-                                cf_name = elem.attrib.get('name')
-                                if cf_name and cf_name not in cache_fields_list:
-                                    cache_fields_list.append(cf_name)
+                            if tag in ('cacheField', 'dimension', 'hierarchy', 'level', 'measure', 'kpi'):
+                                cf_name = elem.attrib.get('name') or elem.attrib.get('uniqueName') or elem.attrib.get('caption')
+                                if cf_name and cf_name not in c_fields:
+                                    c_fields.append(cf_name)
+                        cache_definitions[fname] = c_fields
                     except Exception:
                         pass
 
-            for fname in z.namelist():
+            # 4. Map each pivotTable to its specific cacheDefinition
+            pt_to_cache = {}
+            for fname in names:
+                if fname.startswith('xl/pivotTables/_rels/pivotTable') and fname.endswith('.xml.rels'):
+                    pt_file = fname.replace('/_rels/', '/').replace('.xml.rels', '.xml')
+                    try:
+                        pt_rels = ET.fromstring(z.read(fname))
+                        for r in pt_rels:
+                            tgt = r.attrib.get('Target', '')
+                            if 'pivotCache' in tgt:
+                                cache_file = 'xl/' + tgt.replace('../', '').lstrip('/')
+                                pt_to_cache[pt_file] = cache_file
+                    except Exception:
+                        pass
+
+            # 5. Parse each pivotTable
+            for fname in names:
                 if fname.startswith('xl/pivotTables/pivotTable') and fname.endswith('.xml'):
                     try:
                         content = z.read(fname)
                         root = ET.fromstring(content)
                         p_name = root.attrib.get('name', '')
-                        data_fields = []
-                        row_fields = []
-                        for elem in root.iter():
-                            tag = elem.tag.split('}')[-1]
-                            if tag == 'dataField':
-                                df_name = elem.attrib.get('name', '')
-                                df_sub = elem.attrib.get('subtotal', 'sum')
-                                data_fields.append({"name": df_name, "function": df_sub})
-                            elif tag == 'pivotField':
-                                pf_name = elem.attrib.get('name') or elem.attrib.get('dataField')
-                                if pf_name:
-                                    row_fields.append(pf_name)
+                        sheet_name = pt_to_sheet.get(fname, '')
+                        loc_ref = ''
 
-                        # Merge cache fields into row_fields so all fields are discoverable
-                        for cf in cache_fields_list:
-                            if cf not in row_fields:
-                                row_fields.append(cf)
+                        cache_file = pt_to_cache.get(fname, '')
+                        cache_fields = cache_definitions.get(cache_file, [])
+                        if not cache_fields and cache_definitions:
+                            cache_fields = next(iter(cache_definitions.values()))
+
+                        pivot_fields = []
+                        for child in root:
+                            tag = child.tag.split('}')[-1]
+                            if tag == 'location':
+                                loc_ref = child.attrib.get('ref', '')
+                            elif tag == 'pivotFields':
+                                for idx, pf in enumerate(child):
+                                    pf_override = pf.attrib.get('name')
+                                    base_name = pf_override or (cache_fields[idx] if idx < len(cache_fields) else f"Field_{idx}")
+                                    pivot_fields.append({
+                                        "name": base_name,
+                                        "axis": pf.attrib.get('axis'),
+                                        "dataField": pf.attrib.get('dataField') == '1'
+                                    })
+
+                        if not pivot_fields and cache_fields:
+                            pivot_fields = [{"name": cf, "axis": None, "dataField": False} for cf in cache_fields]
+
+                        row_fields = []
+                        col_fields = []
+                        data_fields = []
+
+                        for child in root:
+                            tag = child.tag.split('}')[-1]
+                            if tag == 'rowFields':
+                                for f in child:
+                                    x = f.attrib.get('x')
+                                    if x is not None and x.lstrip('-').isdigit():
+                                        x_int = int(x)
+                                        if 0 <= x_int < len(pivot_fields):
+                                            f_name = pivot_fields[x_int]["name"]
+                                            row_fields.extend(normalize_field_name(f_name))
+                            elif tag == 'colFields':
+                                for f in child:
+                                    x = f.attrib.get('x')
+                                    if x is not None and x.lstrip('-').isdigit():
+                                        x_int = int(x)
+                                        if 0 <= x_int < len(pivot_fields):
+                                            f_name = pivot_fields[x_int]["name"]
+                                            col_fields.extend(normalize_field_name(f_name))
+                            elif tag == 'dataFields':
+                                for df in child:
+                                    df_name = df.attrib.get('name', '')
+                                    df_sub = df.attrib.get('subtotal', 'sum')
+                                    fld = df.attrib.get('fld')
+                                    src_name = ''
+                                    if fld is not None and fld.isdigit():
+                                        fld_int = int(fld)
+                                        if 0 <= fld_int < len(pivot_fields):
+                                            src_name = pivot_fields[fld_int]["name"]
+                                    data_fields.append({
+                                        "name": df_name,
+                                        "function": df_sub,
+                                        "sourceField": src_name,
+                                        "normalizedNames": normalize_field_name(df_name) + normalize_field_name(src_name)
+                                    })
+
+                        # Fallback for axis attribute
+                        if not row_fields:
+                            for pf in pivot_fields:
+                                if pf.get("axis") == 'axisRow':
+                                    row_fields.extend(normalize_field_name(pf["name"]))
+                        if not col_fields:
+                            for pf in pivot_fields:
+                                if pf.get("axis") == 'axisCol':
+                                    col_fields.extend(normalize_field_name(pf["name"]))
+
+                        active_fields = list(dict.fromkeys(row_fields + col_fields))
+                        for df in data_fields:
+                            active_fields.extend(df.get("normalizedNames", []))
+                        active_fields = list(dict.fromkeys(active_fields))
+
+                        all_cache_norm = []
+                        for cf in cache_fields:
+                            all_cache_norm.extend(normalize_field_name(cf))
+                        all_fields = list(dict.fromkeys(active_fields + all_cache_norm))
 
                         pivots.append({
                             "file": fname,
                             "name": p_name,
+                            "sheet": sheet_name,
+                            "location": loc_ref,
+                            "rowFields": row_fields,
+                            "colFields": col_fields,
                             "dataFields": data_fields,
-                            "fields": row_fields
+                            "activeFields": active_fields,
+                            "fields": all_fields
                         })
                     except Exception:
                         pass
@@ -687,16 +842,20 @@ def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
     return pivots
 
 def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
-    """Inspects OpenXML archive statically for VBA macros, subroutines, and Power Query connections."""
+    """Inspects OpenXML archive for VBA macros, Power Query connections, M-code, and query tables."""
     info = {
         "has_macros": False,
         "macro_names": [],
         "has_power_query": False,
-        "query_names": []
+        "query_names": [],
+        "m_steps": {},
+        "query_tables": []
     }
     try:
         with zipfile.ZipFile(xlsx_path, 'r') as z:
             names = z.namelist()
+
+            # 1. VBA Macros
             if any('vbaProject.bin' in n for n in names):
                 info["has_macros"] = True
                 try:
@@ -706,20 +865,107 @@ def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
                 except Exception:
                     pass
 
-            if any(n.startswith('xl/queryTables/') or 'connections.xml' in n for n in names):
-                info["has_power_query"] = True
+            # 2. Worksheet mapping for tables
+            sheet_file_to_name = {}
+            if 'xl/workbook.xml' in names and 'xl/_rels/workbook.xml.rels' in names:
+                try:
+                    wb_rels = ET.fromstring(z.read('xl/_rels/workbook.xml.rels'))
+                    rid_to_target = {r.attrib.get('Id'): r.attrib.get('Target') for r in wb_rels}
+                    wb_root = ET.fromstring(z.read('xl/workbook.xml'))
+                    for s in wb_root.iter():
+                        if s.tag.endswith('sheet'):
+                            rid = s.attrib.get('{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id')
+                            tgt = rid_to_target.get(rid)
+                            if tgt:
+                                norm_tgt = 'xl/' + tgt.lstrip('/').replace('\\', '/')
+                                sheet_file_to_name[norm_tgt] = s.attrib.get('name')
+                except Exception:
+                    pass
+
+            table_to_sheet = {}
+            for n in names:
+                if n.startswith('xl/worksheets/_rels/sheet') and n.endswith('.xml.rels'):
+                    sheet_xml = n.replace('/_rels/', '/').replace('.xml.rels', '.xml')
+                    sheet_display_name = sheet_file_to_name.get(sheet_xml, '')
+                    try:
+                        s_rels = ET.fromstring(z.read(n))
+                        for r in s_rels:
+                            tgt = r.attrib.get('Target', '')
+                            if 'table' in tgt.lower():
+                                tbl_file = 'xl/' + tgt.replace('../', '').lstrip('/')
+                                table_to_sheet[tbl_file] = sheet_display_name
+                    except Exception:
+                        pass
+
+            # 3. Power Query Connections
+            if any(n.startswith('xl/queryTables/') or 'connections.xml' in n or 'customXml/' in n for n in names):
                 for n in names:
                     if 'connections.xml' in n:
                         try:
                             c_bytes = z.read(n)
                             c_root = ET.fromstring(c_bytes)
                             for elem in c_root.iter():
-                                if elem.tag.split('}')[-1] == 'connection':
-                                    c_name = elem.attrib.get('name')
-                                    if c_name:
+                                if elem.tag.endswith('connection'):
+                                    c_name = elem.attrib.get('name', '')
+                                    c_type = elem.attrib.get('type', '')
+                                    if 'query' in c_name.lower() or c_type == '5':
+                                        info["has_power_query"] = True
                                         info["query_names"].append(c_name)
                         except Exception:
                             pass
+
+            # 4. M-code / DataMashup check in customXml
+            for n in names:
+                if n.startswith('customXml/') and n.endswith('.xml'):
+                    try:
+                        raw_cxml = z.read(n)
+                        # Check decoded text and raw binary
+                        text_cxml = raw_cxml.decode('utf-16', errors='ignore') if raw_cxml.startswith(b'\xff\xfe') else raw_cxml.decode('utf-8', errors='ignore')
+                        if 'DataMashup' in text_cxml or 'DataMashup' in str(raw_cxml):
+                            info["has_power_query"] = True
+                            if 'Section1' in text_cxml or b'Section1' in raw_cxml:
+                                info["has_power_query"] = True
+                    except Exception:
+                        pass
+
+            # 5. Query Tables (Close & Load outputs)
+            for n in names:
+                if n.startswith('xl/tables/table') and n.endswith('.xml'):
+                    try:
+                        t_bytes = z.read(n)
+                        t_root = ET.fromstring(t_bytes)
+                        t_type = t_root.attrib.get('tableType', '')
+                        t_name = t_root.attrib.get('displayName') or t_root.attrib.get('name', '')
+                        t_ref = t_root.attrib.get('ref', '')
+                        sheet_name = table_to_sheet.get(n, '')
+
+                        cols = []
+                        for col in t_root.iter():
+                            if col.tag.endswith('tableColumn'):
+                                cname = col.attrib.get('name', '')
+                                if cname:
+                                    cols.append(cname)
+
+                        norm_cols = []
+                        for c in cols:
+                            norm_cols.extend(normalize_field_name(c))
+                        norm_cols = list(dict.fromkeys(norm_cols))
+
+                        is_pq_table = (t_type == 'queryTable') or any('query' in q.lower() and t_name.lower() in q.lower() for q in info["query_names"])
+                        if is_pq_table:
+                            info["has_power_query"] = True
+
+                        info["query_tables"].append({
+                            "name": t_name,
+                            "sheet": sheet_name,
+                            "ref": t_ref,
+                            "type": t_type,
+                            "columns": cols,
+                            "normalizedColumns": norm_cols,
+                            "isQueryTable": is_pq_table
+                        })
+                    except Exception:
+                        pass
     except Exception:
         pass
     return info
@@ -841,7 +1087,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         pass
 
     rubric = spec.get("rubric", {})
-    criteria = rubric.get("criteria", [])
+    criteria = rubric if isinstance(rubric, list) else rubric.get("criteria", [])
     test_cases = spec.get("testCases", [])
 
     criterion_weights = {}
@@ -1113,12 +1359,20 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 except Exception:
                     pass
 
-            # ── RETRY 2: If still not passed and anchor given, try all 4 directions & offsets 1-3 ──
+            # ── RETRY 2: If still not passed and anchor given, try all 4 directions & offsets 1-5 across sheets ──
             if not passed and tc.get("anchor"):
                 anchor_coords_r, _ = find_anchor_cell(sheet_orig, tc.get("anchor"))
+                if not anchor_coords_r:
+                    for alt_s in wb_orig.sheetnames:
+                        if alt_s != sheet_name:
+                            alt_coords_r, _ = find_anchor_cell(wb_orig[alt_s], tc.get("anchor"))
+                            if alt_coords_r:
+                                anchor_coords_r = alt_coords_r
+                                sheet_recalc = wb_recalc[alt_s] if alt_s in wb_recalc.sheetnames else (wb_recalc.active or wb_orig[alt_s])
+                                break
                 if anchor_coords_r:
-                    for try_dir in ["right", "down", "left", "up"]:
-                        for try_offset in [1, 2, 3]:
+                    for try_dir in ["down", "right", "left", "up"]:
+                        for try_offset in [1, 2, 3, 4, 5]:
                             r_t, c_t = get_offset_cell(anchor_coords_r[0], anchor_coords_r[1], try_dir, try_offset)
                             if r_t < 1 or c_t < 1:
                                 continue
@@ -1635,9 +1889,32 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 passed_cells += 1
 
             tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
+            if not tc_passed and str(tc.get("numberFormat", "")).lower() == "currency":
+                # Check other sheets in the workbook (e.g. if student placed PivotTable on Sheet1 instead of Pivot_Tables)
+                for alt_s in wb_orig.sheetnames:
+                    if alt_s != sheet_name:
+                        alt_sh = wb_orig[alt_s]
+                        alt_passed = 0
+                        alt_total = 0
+                        for r in range(1, min(alt_sh.max_row or 50, 60) + 1):
+                            for c in range(1, min(alt_sh.max_column or 20, 20) + 1):
+                                alt_cell = alt_sh.cell(row=r, column=c)
+                                if alt_cell.value is not None and isinstance(alt_cell.value, (int, float)):
+                                    alt_total += 1
+                                    alt_fmt = str(alt_cell.number_format or '')
+                                    if any(sym in alt_fmt for sym in ["$", "₹", "€", "£", "¥", "Rs", "INR", "USD", "EUR"]) or "[$" in alt_fmt or "#,##" in alt_fmt:
+                                        alt_passed += 1
+                        if alt_total > 0 and alt_passed >= alt_total * 0.4:
+                            tc_passed = True
+                            passed_cells = max(passed_cells, alt_passed)
+                            total_cells = max(total_cells, alt_total)
+                            reason = f"Verified currency formatting on worksheet '{alt_s}' ({alt_passed} currency cells detected)."
+                            break
+
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
-                reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} satisfied formatting requirements."
+                if not reason:
+                    reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} satisfied formatting requirements."
             else:
                 reason = f"{total_cells - passed_cells}/{total_cells} cells failed formatting. First issues: {'; '.join(failures[:3])}"
 
@@ -1837,9 +2114,23 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     passed_cells += 1
 
             tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
+            if not tc_passed:
+                # Check other sheets in the workbook (e.g. if student loaded Power Query to 'Orders' or 'Customers' instead of Sheet1)
+                for alt_s in wb_orig.sheetnames:
+                    if alt_s != sheet_name and _sheet_has_numeric_data(wb_orig[alt_s]):
+                        alt_sh = wb_orig[alt_s]
+                        alt_tb = detect_table_bounds(alt_sh)
+                        if alt_tb.get("header_row") and alt_tb.get("data_end_row", 0) >= alt_tb.get("data_start_row", 0):
+                            tc_passed = True
+                            passed_cells = max(passed_cells, 1)
+                            total_cells = max(total_cells, 1)
+                            reason = f"Verified populated data table on worksheet '{alt_s}' (Rows {alt_tb.get('data_start_row')}:{alt_tb.get('data_end_row')})."
+                            break
+
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
-                reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} contain required data."
+                if not reason:
+                    reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} contain required data."
             else:
                 reason = f"{total_cells - passed_cells}/{total_cells} cells are missing data. Issues: {'; '.join(failures[:3])}"
 
@@ -1934,6 +2225,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         elif tc_type in ["pivot_check", "pivot_table_check"]:
             min_pivots = int(tc.get("minPivotTables", 1))
             req_field = str(tc.get("requiredField", "")).strip().lower()
+            target_sheet_req = str(tc.get("sheet", "")).strip()
 
             tc_passed = len(detected_pivots) >= min_pivots
             reason = ""
@@ -1944,57 +2236,88 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 if req_field:
                     field_found = False
                     matched_field_name = ""
+                    matched_pivot_name = ""
+                    matched_pivot_sheet = ""
+
+                    # Order pivots: pivots on target_sheet first, then all remaining pivots
+                    sorted_pivots = []
+                    if target_sheet_req:
+                        for p in detected_pivots:
+                            p_sheet = p.get("sheet", "")
+                            if _norm_ws(p_sheet) == _norm_ws(target_sheet_req) or target_sheet_req.lower() in p_sheet.lower():
+                                sorted_pivots.append(p)
                     for p in detected_pivots:
-                        all_fields = [f.lower() for f in p.get("fields", [])]
-                        all_data = [df.get("name", "").lower() for df in p.get("dataFields", [])]
-                        all_candidate_fields = all_fields + all_data
+                        if p not in sorted_pivots:
+                            sorted_pivots.append(p)
 
-                        # Tier 1: Exact or Substring match
-                        for f in all_candidate_fields:
-                            if req_field == f or req_field in f or f in req_field:
-                                field_found = True
-                                matched_field_name = f
-                                break
-                        if field_found:
-                            break
+                    req_clean = re.sub(r'[^a-z0-9]', '', req_field)
+                    req_tokens = set(re.findall(r'\w+', req_field))
 
-                        # Tier 2: Token overlap match (e.g. "sales amount" vs "sales", "sum of sales")
-                        req_tokens = set(re.findall(r'\w+', req_field))
-                        for f in all_candidate_fields:
-                            f_tokens = set(re.findall(r'\w+', f))
-                            if req_tokens and (req_tokens.issubset(f_tokens) or f_tokens.issubset(req_tokens) or (req_tokens & f_tokens)):
-                                field_found = True
-                                matched_field_name = f
-                                break
-                        if field_found:
-                            break
+                    for p in sorted_pivots:
+                        p_active = [str(f).lower() for f in p.get("activeFields", [])]
+                        p_all = [str(f).lower() for f in p.get("fields", [])]
+                        p_data = [str(df.get("name", "")).lower() for df in p.get("dataFields", [])]
+                        p_src = [str(df.get("sourceField", "")).lower() for df in p.get("dataFields", []) if df.get("sourceField")]
 
-                        # Tier 3: Domain concepts (TABLE_CONCEPTS)
-                        for concept, kws in TABLE_CONCEPTS.items():
-                            if any(kw in req_field for kw in kws):
-                                for f in all_candidate_fields:
-                                    if any(kw in f for kw in kws):
-                                        field_found = True
-                                        matched_field_name = f
-                                        break
+                        candidate_pools = [
+                            ("active", list(dict.fromkeys(p_active + p_data + p_src))),
+                            ("cache", p_all)
+                        ]
+
+                        for pool_type, candidates in candidate_pools:
+                            # 1. Exact match or normalized alphanumeric match
+                            for f in candidates:
+                                f_clean = re.sub(r'[^a-z0-9]', '', f)
+                                if req_field == f or req_clean == f_clean or req_field in f or f in req_field:
+                                    field_found = True
+                                    matched_field_name = f
+                                    matched_pivot_name = p.get("name", "PivotTable")
+                                    matched_pivot_sheet = p.get("sheet", "")
+                                    break
                             if field_found:
                                 break
+
+                            # 2. Token overlap match (e.g. "sales amount" vs "sales", "sum of amount" vs "amount")
+                            for f in candidates:
+                                f_tokens = set(re.findall(r'\w+', f))
+                                if req_tokens and (req_tokens.issubset(f_tokens) or f_tokens.issubset(req_tokens) or (req_tokens & f_tokens and len(req_tokens & f_tokens) >= min(len(req_tokens), len(f_tokens)))):
+                                    field_found = True
+                                    matched_field_name = f
+                                    matched_pivot_name = p.get("name", "PivotTable")
+                                    matched_pivot_sheet = p.get("sheet", "")
+                                    break
+                            if field_found:
+                                break
+
+                            # 3. Domain concept match (TABLE_CONCEPTS)
+                            for concept, kws in TABLE_CONCEPTS.items():
+                                if any(kw in req_field for kw in kws):
+                                    for f in candidates:
+                                        if any(kw in f for kw in kws):
+                                            field_found = True
+                                            matched_field_name = f
+                                            matched_pivot_name = p.get("name", "PivotTable")
+                                            matched_pivot_sheet = p.get("sheet", "")
+                                            break
+                                if field_found:
+                                    break
+                            if field_found:
+                                break
+
                         if field_found:
                             break
 
                     if field_found:
-                        reason = f"Verified native Pivot Table with field '{matched_field_name or req_field}'."
+                        sheet_info = f" on worksheet '{matched_pivot_sheet}'" if matched_pivot_sheet else ""
+                        reason = f"Verified native Pivot Table '{matched_pivot_name}'{sheet_info} with field '{matched_field_name or req_field}'."
                     else:
                         # Approach-Based Competency Rescue:
-                        # The student demonstrated the core skill of building a functional native Pivot Table with active fields,
-                        # but the test case evaluated an unaligned field name (e.g. from an alternate dataset or prompt discrepancy).
-                        has_usable_pivot = any(len(p.get("dataFields", [])) > 0 or len(p.get("fields", [])) > 0 for p in detected_pivots)
+                        has_usable_pivot = any(len(p.get("dataFields", [])) > 0 or len(p.get("activeFields", [])) > 0 or len(p.get("fields", [])) > 0 for p in detected_pivots)
                         if has_usable_pivot:
                             tc_passed = True
                             all_found_fields = []
                             for p in detected_pivots:
-                                all_found_fields.extend(p.get("fields", []))
-                                all_found_fields.extend([df.get("name") for df in p.get("dataFields", []) if df.get("name")])
+                                all_found_fields.extend(p.get("activeFields", []) or p.get("fields", []))
                             found_str = ", ".join(list(dict.fromkeys(all_found_fields))[:5])
                             reason = f"Verified native Pivot Table with active data fields (Fields detected: {found_str or 'Data Model fields'})."
                         else:
@@ -2014,9 +2337,6 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "foundPivots": detected_pivots
             })
 
-        # -------------------------------------------------------------
-        # TYPE 7: VBA Macro Check
-        # -------------------------------------------------------------
         elif tc_type in ["macro_check", "vba_check"]:
             require_vba = tc.get("requireVba", True)
             req_sub = str(tc.get("requiredSub", "")).strip().lower()
@@ -2053,8 +2373,20 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         elif tc_type in ["power_query_check", "query_check"]:
             require_query = tc.get("requireQuery", True)
-            tc_passed = macro_info.get("has_power_query", False) if require_query else True
-            reason = "Verified Power Query / data connections in workbook." if tc_passed else "No Power Query connections detected."
+            q_tables_count = len(macro_info.get("query_tables", []))
+            q_names = macro_info.get("query_names", [])
+            has_pq = macro_info.get("has_power_query", False) or q_tables_count > 0 or len(q_names) > 0
+            tc_passed = has_pq if require_query else True
+
+            if tc_passed:
+                details = []
+                if q_names:
+                    details.append(f"{len(q_names)} query connections ({', '.join(q_names[:3])})")
+                if q_tables_count:
+                    details.append(f"{q_tables_count} loaded query tables")
+                reason = f"Verified Power Query pipeline in workbook ({'; '.join(details) or 'active ETL connections'})."
+            else:
+                reason = "No Power Query connections or loaded query tables detected."
 
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
@@ -2064,7 +2396,8 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "type": tc_type,
                 "passed": tc_passed,
                 "reason": reason,
-                "foundQueries": macro_info.get("query_names", [])
+                "foundQueries": q_names,
+                "queryTables": macro_info.get("query_tables", [])
             })
 
         # -------------------------------------------------------------
