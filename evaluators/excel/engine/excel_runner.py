@@ -233,8 +233,13 @@ def find_anchor_cell(sheet, anchor_text: str, max_rows: int = 200, max_cols: int
     if len(matches) == 1:
         return matches[0], None
     if len(matches) > 1:
-        match_addrs = [f"{get_column_letter(c)}{r}" for r, c in matches]
-        return None, f"Ambiguous anchor: '{anchor_text}' found {len(matches)} times at {', '.join(match_addrs)}. Flagged for review."
+        # Pedagogical disambiguation: pick candidate that has populated data cells below it (a real table header)
+        scored = []
+        for r, c in matches:
+            below_cnt = sum(1 for dr in range(1, 6) if sheet.cell(row=r+dr, column=c).value is not None)
+            scored.append((below_cnt, (r, c)))
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return scored[0][1], None
 
     # Fallback Tier: Substring or word-boundary / token match in top rows (rows 1-30)
     fallback_matches = []
@@ -253,8 +258,12 @@ def find_anchor_cell(sheet, anchor_text: str, max_rows: int = 200, max_cols: int
     if len(fallback_matches) == 1:
         return fallback_matches[0], None
     elif len(fallback_matches) > 1:
-        match_addrs = [f"{get_column_letter(c)}{r}" for r, c in fallback_matches]
-        return None, f"Ambiguous anchor fallback: '{anchor_text}' found {len(fallback_matches)} times at {', '.join(match_addrs)}."
+        scored_fb = []
+        for r, c in fallback_matches:
+            below_cnt = sum(1 for dr in range(1, 6) if sheet.cell(row=r+dr, column=c).value is not None)
+            scored_fb.append((below_cnt, (r, c)))
+        scored_fb.sort(key=lambda x: x[0], reverse=True)
+        return scored_fb[0][1], None
 
     return None, f"Anchor label '{anchor_text}' not found in sheet."
 
@@ -316,6 +325,24 @@ TABLE_CONCEPTS = {
     "margin": ["profit margin", "margin", "% margin", "margin %", "profit %", "markup"],
     "product": ["product", "product name", "product_name", "product id", "product_id", "productid", "item", "category", "product category"],
     "region": ["region", "geography", "territory", "location", "area", "zone", "country"]
+}
+
+FUNCTION_EQUIVALENTS = {
+    "VLOOKUP": ["VLOOKUP", "XLOOKUP", "INDEX", "MATCH", "LOOKUP", "FILTER"],
+    "XLOOKUP": ["XLOOKUP", "VLOOKUP", "INDEX", "MATCH", "LOOKUP"],
+    "HLOOKUP": ["HLOOKUP", "XLOOKUP", "INDEX", "MATCH"],
+    "IF": ["IF", "IFS", "SWITCH", "CHOOSE"],
+    "IFS": ["IFS", "IF", "SWITCH"],
+    "CONCATENATE": ["CONCATENATE", "CONCAT", "TEXTJOIN"],
+    "CONCAT": ["CONCAT", "CONCATENATE", "TEXTJOIN"],
+    "TEXTJOIN": ["TEXTJOIN", "CONCAT", "CONCATENATE"],
+    "SUM": ["SUM", "SUMIF", "SUMIFS"],
+    "AVERAGE": ["AVERAGE", "AVERAGEIF", "AVERAGEIFS"],
+    "COUNT": ["COUNT", "COUNTA", "COUNTIF", "COUNTIFS"],
+    "COUNTIF": ["COUNTIF", "COUNTIFS"],
+    "COUNTIFS": ["COUNTIFS", "COUNTIF"],
+    "SUMIF": ["SUMIF", "SUMIFS"],
+    "SUMIFS": ["SUMIFS", "SUMIF"]
 }
 
 def detect_table_bounds(sheet, max_scan_rows: int = 100, max_scan_cols: int = 60) -> Dict[str, Any]:
@@ -1410,6 +1437,12 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             range_str = tc.get("range", tc.get("cell", ""))
             anchor_text = tc.get("columnAnchor") or tc.get("anchor")
             accepted_funcs = [f.upper() for f in tc.get("acceptedFunctions", [])]
+            if accepted_funcs:
+                expanded_fns = set(accepted_funcs)
+                for fn in accepted_funcs:
+                    if fn in FUNCTION_EQUIVALENTS:
+                        expanded_fns.update(FUNCTION_EQUIVALENTS[fn])
+                accepted_funcs = list(expanded_fns)
             forbidden_constants = tc.get("forbiddenConstants", True)
             must_be_formula = tc.get("mustBeFormula", True)
             require_absolute = tc.get("requireAbsoluteReferences", False)
