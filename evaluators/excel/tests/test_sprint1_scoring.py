@@ -19,8 +19,9 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
 
     def _create_sample_workbook(self, original_val=100, cached_val=100, formula="=SUM(A1:A2)", sheet_name="Sheet1"):
         """Creates original and recalculated test workbooks."""
-        orig_path = os.path.join(self.temp_dir, "test_orig.xlsx")
-        recalc_path = os.path.join(self.temp_dir, "test_recalc.xlsx")
+        import time, zipfile, io
+        orig_path = os.path.join(self.temp_dir, f"test_orig_{int(time.time() * 1000)}_{os.getpid()}.xlsx")
+        recalc_path = os.path.join(self.temp_dir, f"test_recalc_{int(time.time() * 1000)}_{os.getpid()}.xlsx")
 
         wb_orig = openpyxl.Workbook()
         ws_orig = wb_orig.active
@@ -30,6 +31,22 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
         ws_orig["B1"] = formula if formula else original_val
         wb_orig.save(orig_path)
         wb_orig.close()
+
+        # If formula provided and original_val provided, inject cached value into orig_path OpenXML
+        if formula and original_val is not None:
+            buf = io.BytesIO()
+            with zipfile.ZipFile(orig_path, 'r') as zin, zipfile.ZipFile(buf, 'w') as zout:
+                for item in zin.infolist():
+                    if item.filename.startswith('xl/worksheets/sheet'):
+                        s_xml = zin.read(item.filename).decode('utf-8')
+                        clean_fn = formula.lstrip("=")
+                        if f"<f>{clean_fn}</f>" in s_xml:
+                            s_xml = s_xml.replace(f"<f>{clean_fn}</f>", f"<f>{clean_fn}</f><v>{original_val}</v>")
+                        zout.writestr(item, s_xml.encode('utf-8'))
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+            with open(orig_path, 'wb') as f:
+                f.write(buf.getvalue())
 
         wb_recalc = openpyxl.Workbook()
         ws_recalc = wb_recalc.active
@@ -285,6 +302,282 @@ class TestSprint1GradingSafetyAndScoring(unittest.TestCase):
         failed_a = [a for a in report["assertion_results"] if a.get("passed") is False]
         self.assertTrue(len(failed_a) > 0)
         self.assertIn("hardcoded", failed_a[0]["reason"].lower())
+
+
+    def test_t8_partially_unsupported_criterion(self):
+        """T8: Partially unsupported criterion separates verified and pending marks."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Mixed Capability", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "supported_calc",
+                    "criterion": "Mixed Capability",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 40,
+                    "weight": 50
+                },
+                {
+                    "id": "unsupported_dax",
+                    "criterion": "Mixed Capability",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A2",
+                    "expectedValue": 60,
+                    "weight": 50,
+                    "status": "UNSUPPORTED_FEATURE"
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        # Earned: 50, Pending: 50, Total Score: 50.0
+        self.assertEqual(report["score"], 50.0)
+        self.assertEqual(report["evaluation_status"], "MANUAL_REVIEW_REQUIRED")
+        self.assertEqual(report["rubric_breakdown_details"]["Mixed Capability"]["pending_marks"], 50.0)
+
+    def test_t9_dependency_skipped_preserves_denominator(self):
+        """T9 (Reviewer Core Case): Skipping downstream assertions does NOT shrink the denominator!"""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Dashboard & Table", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "source_table",
+                    "criterion": "Dashboard & Table",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 999,  # Fails
+                    "weight": 40
+                },
+                {
+                    "id": "chart_source",
+                    "criterion": "Dashboard & Table",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "B1",
+                    "expectedValue": 100,
+                    "weight": 30,
+                    "depends_on": ["source_table"],
+                    "dependency_mode": "skip_penalty"
+                },
+                {
+                    "id": "chart_title",
+                    "criterion": "Dashboard & Table",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 40,  # Passes
+                    "weight": 10
+                },
+                {
+                    "id": "currency_formatting",
+                    "criterion": "Dashboard & Table",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A2",
+                    "expectedValue": 60,  # Passes
+                    "weight": 20
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        # Math: Passing checks = 10 + 20 = 30.
+        # Total weight = 40 + 30 + 10 + 20 = 100.
+        # Score must be EXACTLY 30.0 / 100.0, NOT 42.8% (30/70)!
+        self.assertEqual(report["score"], 30.0)
+        self.assertEqual(report["rubric_breakdown"]["Dashboard & Table"], 30.0)
+
+    def test_t10_circular_dependency_detected(self):
+        """T10: Circular dependencies are caught and marked CONFIGURATION_ERROR."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Workflow", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "node_A",
+                    "criterion": "Workflow",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 40,
+                    "weight": 50,
+                    "depends_on": ["node_B"]
+                },
+                {
+                    "id": "node_B",
+                    "criterion": "Workflow",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A2",
+                    "expectedValue": 60,
+                    "weight": 50,
+                    "depends_on": ["node_A"]
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        self.assertEqual(report["evaluation_status"], "MANUAL_REVIEW_REQUIRED")
+        cfg_errs = [a for a in report["assertion_results"] if a.get("status") == "CONFIGURATION_ERROR"]
+        self.assertTrue(len(cfg_errs) > 0)
+
+    def test_t11_two_dependent_assertions_same_root(self):
+        """T11: Two downstream assertions dependent on same root do not double-penalize."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Reports", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "root_data",
+                    "criterion": "Reports",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 999,  # Fails
+                    "weight": 50
+                },
+                {
+                    "id": "downstream_pivot",
+                    "criterion": "Reports",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "B1",
+                    "expectedValue": 100,
+                    "weight": 25,
+                    "depends_on": ["root_data"],
+                    "dependency_mode": "skip_penalty"
+                },
+                {
+                    "id": "downstream_chart",
+                    "criterion": "Reports",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "B1",
+                    "expectedValue": 100,
+                    "weight": 25,
+                    "depends_on": ["root_data"],
+                    "dependency_mode": "skip_penalty"
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        # Root data failed, both dependents skipped without crashing, score is 0.0/100
+        self.assertEqual(report["score"], 0.0)
+        skipped = [a for a in report["assertion_results"] if a.get("status") == "DEPENDENCY_SKIPPED"]
+        self.assertEqual(len(skipped), 2)
+
+    def test_t12_all_assertions_pending_no_invented_score(self):
+        """T12: If all assertions are pending manual review, final score is 0.0 with 100% pending."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Instructor Section", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "manual_item",
+                    "criterion": "Instructor Section",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 40,
+                    "weight": 100,
+                    "status": "MANUAL_REVIEW_REQUIRED"
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        self.assertEqual(report["score"], 0.0)
+        self.assertEqual(report["scoring_summary"]["pending_review"], 100.0)
+        self.assertEqual(report["evaluation_status"], "MANUAL_REVIEW_REQUIRED")
+
+    def test_t13_zero_weights_handled_gracefully(self):
+        """T13: Zero assertion weights are handled safely without division by zero."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Zero Weight Test", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "zero_w",
+                    "criterion": "Zero Weight Test",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 40,
+                    "weight": 0.0
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        self.assertEqual(report["score"], 0.0)
+
+    def test_t14_critical_requirement_teacher_defined_partial_cap(self):
+        """T14: Critical requirement with a teacher-defined partial cap (e.g. 35.0 marks cap)."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=SUM(A1:A2)", cached_val=100)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Financial Modeling", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "id": "methodology",
+                    "criterion": "Financial Modeling",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A1",
+                    "expectedValue": 999,  # Fails
+                    "weight": 20,
+                    "is_critical": True,
+                    "score_cap": 35.0  # Teacher allows max 35.0 if methodology fails
+                },
+                {
+                    "id": "calculations",
+                    "criterion": "Financial Modeling",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "A2",
+                    "expectedValue": 60,  # Passes
+                    "weight": 80
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        # Even though calculations passed (80% of 100 = 80), cap restricts score to 35.0
+        self.assertEqual(report["score"], 35.0)
+
+    def test_t15_volatile_formula_cache_divergence(self):
+        """T15: Volatile formula divergence produces a CACHE_DIVERGENCE_VOLATILE warning without failure."""
+        orig_p, recalc_p = self._create_sample_workbook(formula="=TODAY()", original_val=40000, cached_val=45001)
+        spec = {
+            "rubric": {
+                "criteria": [{"name": "Date Logic", "weight": 100}]
+            },
+            "testCases": [
+                {
+                    "criterion": "Date Logic",
+                    "type": "value_check",
+                    "sheet": "Sheet1",
+                    "cell": "B1",
+                    "expectedValue": 45001
+                }
+            ]
+        }
+        report = inspect_and_evaluate(orig_p, recalc_p, spec)
+        # Verify that CACHE_DIVERGENCE_VOLATILE warning was registered
+        volatile_warnings = [w for w in report.get("calculation_warnings", []) if "CACHE_DIVERGENCE_VOLATILE" in w]
+        self.assertTrue(len(volatile_warnings) > 0)
 
 
 if __name__ == "__main__":

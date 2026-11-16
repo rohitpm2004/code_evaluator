@@ -1269,6 +1269,24 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
         tc_type = tc.get("type", "value_check")
 
+        # Check if test case is explicitly marked unsupported or requires manual review
+        if tc.get("status") in ["UNSUPPORTED_FEATURE", "MANUAL_REVIEW_REQUIRED"]:
+            needs_review = True
+            assertion_results.append({
+                "id": tc_id,
+                "criterion": crit_name,
+                "type": tc_type,
+                "passed": None,
+                "status": tc.get("status"),
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
+                "reason": f"Assertion explicitly flagged as '{tc.get('status')}' — deferred for manual review."
+            })
+            continue
+
         # Use intelligent 4-tier fuzzy sheet name resolver
         target_sheet_req = tc.get("sheet")
         sheet_name = resolve_sheet(wb_orig, target_sheet_req, anchor_hint=tc.get("anchor"))
@@ -1294,8 +1312,6 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         sheet_recalc = wb_recalc[sheet_name] if sheet_name in wb_recalc.sheetnames else (wb_recalc.active or sheet_orig)
         table_bounds = detect_table_bounds(sheet_orig)
         col_map = table_bounds.get("col_map", {})
-
-        tc_type = tc.get("type", "value_check")
 
         # -------------------------------------------------------------
         # TYPE 1: Value Check (Explicit Cell or Anchor-Based)
@@ -1341,14 +1357,21 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             abs_tol = float(tc.get("absTolerance", tc.get("tolerance", 0.05)))
             rel_tol = float(tc.get("relTolerance", 0.001))
 
-            # Stale formula cache detection (Amendment 7)
+            # Stale formula cache & divergence classification (Amendment 7 / Check 3)
             if cached_val is not None and cell_val is not None and isinstance(formula_expr, str) and formula_expr.startswith("="):
                 num_c = parse_number(cached_val)
                 num_r = parse_number(cell_val)
                 if num_c is not None and num_r is not None and not check_dual_tolerance(num_c, num_r, abs_tol, rel_tol):
-                    calculation_warnings.append(
-                        f"STALE_FORMULA_CACHE in {sheet_name}!{target_cell_coord}: student saved '{num_c}' but recalculated value is '{num_r}'."
-                    )
+                    f_upper = formula_expr.upper()
+                    is_volatile = any(vf in f_upper for vf in ["NOW(", "TODAY(", "RAND(", "RANDBETWEEN(", "OFFSET(", "INDIRECT("])
+                    if is_volatile:
+                        calculation_warnings.append(
+                            f"CACHE_DIVERGENCE_VOLATILE in {sheet_name}!{target_cell_coord}: saved value '{num_c}' differs from recalculated value '{num_r}' due to volatile function ({formula_expr}). Normal behavior."
+                        )
+                    else:
+                        calculation_warnings.append(
+                            f"CACHE_DIVERGENCE_STATIC in {sheet_name}!{target_cell_coord}: student saved '{num_c}' but recalculated value is '{num_r}' for formula {formula_expr}."
+                        )
 
             passed = False
             reason = ""
@@ -2661,7 +2684,25 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
             # Check upstream dependencies to prevent double deduction
             dep_failed = False
+            has_cycle = False
+
+            def _detect_cycle(cur_id, visited=None):
+                if visited is None:
+                    visited = set()
+                if cur_id in visited:
+                    return True
+                visited.add(cur_id)
+                t_obj = assertion_results_by_id.get(cur_id)
+                if t_obj:
+                    for d_sub in t_obj.get("depends_on", []):
+                        if _detect_cycle(d_sub, visited.copy()):
+                            return True
+                return False
+
             for dep in deps:
+                if _detect_cycle(dep, {a.get("id")}):
+                    has_cycle = True
+                    break
                 target_a = assertion_results_by_id.get(dep)
                 if target_a and target_a.get("passed") is False:
                     dep_failed = True
@@ -2671,10 +2712,28 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     dep_failed = True
                     break
 
-            if dep_failed and dep_mode == "skip_penalty":
+            if has_cycle:
+                a["status"] = "CONFIGURATION_ERROR"
+                a["reason"] = f"Circular dependency detected in 'depends_on' configuration involving '{dep}'."
+                needs_review = True
+                has_pending_assertion = True
+                total_assertion_weights += w_i
+                continue
+
+            if dep_failed:
                 a["dependency_failed"] = True
                 a["status"] = "DEPENDENCY_SKIPPED"
-                a["reason"] = f"(Prerequisite '{dep}' failed — skipped duplicate secondary penalty) {a.get('reason', '')}"
+                a["reason"] = f"(Prerequisite '{dep}' failed — downstream assertion unverified) {a.get('reason', '')}"
+                # CRITICAL (Check 1): Never shrink the denominator! Keep w_i in total_assertion_weights!
+                total_assertion_weights += w_i
+                if dep_mode == "pending_review":
+                    has_pending_assertion = True
+                elif dep_mode == "partial_credit":
+                    p_cred = float(a.get("partial_credit", 0.5))
+                    weighted_sum += (w_i * p_cred)
+                else:
+                    s_i = 0.0
+                    weighted_sum += (w_i * s_i)
                 continue
 
             total_assertion_weights += w_i
