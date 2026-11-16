@@ -15,7 +15,8 @@ import tempfile
 import shutil
 import zipfile
 import re
-from typing import Dict, Any, List
+import datetime
+from typing import Dict, Any, List, Optional
 
 import openpyxl
 
@@ -30,12 +31,13 @@ class ManifestValidator:
         pass
 
     def certify(self, reference_workbook_path: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
-        """Runs full certification pipeline: master solution validation and negative fixture checks."""
+        """Runs full certification pipeline: master solution validation, completeness check, and negative fixture checks."""
         master_res = self.validate_master_solution(reference_workbook_path, manifest)
         neg_res = self.validate_negative_fixtures(reference_workbook_path, manifest)
 
         is_valid = master_res["passed"] and (neg_res["passed_tests"] == neg_res["total_tests"])
-        status = "APPROVED" if is_valid else "REJECTED"
+        # Lifecycle state: READY_FOR_TEACHER_APPROVAL on success, never automatically published
+        status = "READY_FOR_TEACHER_APPROVAL" if is_valid else "VALIDATION_FAILED"
         manifest["status"] = status
 
         return {
@@ -51,13 +53,22 @@ class ManifestValidator:
         }
 
     def validate_master_solution(self, reference_workbook_path: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
-        """Validates that the teacher reference solution scores 100.0 on its own manifest."""
+        """Validates that the teacher reference solution scores 100.0 and satisfies all rubric criteria."""
         report = inspect_and_evaluate(reference_workbook_path, reference_workbook_path, manifest)
         score = report.get("score", 0.0)
         passed = abs(score - 100.0) < 0.05
 
         issues = []
-        if not passed:
+        # Completeness Check: Ensure every original rubric criterion is covered by assertions
+        rubric_criteria = manifest.get("rubric", [])
+        mapped_criteria = {tc.get("criterion") for tc in manifest.get("testCases", [])}
+        unmapped = [c.get("name") for c in rubric_criteria if c.get("name") not in mapped_criteria]
+        if unmapped:
+            passed = False
+            issues.append(f"Rubric Completeness Failure: Criteria {unmapped} have no mapped assertions in manifest.")
+            manifest["manual_review_criteria"] = unmapped
+
+        if not passed and not unmapped:
             for a in report.get("assertion_results", []):
                 if not a.get("passed"):
                     issues.append(f"Criterion '{a.get('criterion')}' ({a.get('type')}): {a.get('reason')}")
@@ -68,6 +79,34 @@ class ManifestValidator:
             "issues": issues,
             "report": report
         }
+
+    @staticmethod
+    def approve_manifest(manifest: Dict[str, Any], approved_by: str, notes: Optional[str] = None) -> Dict[str, Any]:
+        """Explicit instructor sign-off promoting manifest to TEACHER_APPROVED."""
+        current_status = manifest.get("status")
+        if current_status not in ["READY_FOR_TEACHER_APPROVAL", "APPROVED"]:
+            raise ValueError(f"Cannot approve manifest in state '{current_status}'. Must be READY_FOR_TEACHER_APPROVAL.")
+        if not approved_by or not str(approved_by).strip():
+            raise ValueError("approved_by instructor identifier is required for manifest approval.")
+
+        manifest["status"] = "TEACHER_APPROVED"
+        manifest["approval_record"] = {
+            "approved_by": approved_by,
+            "approved_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "notes": notes or "Teacher verified and approved manifest criteria and weightings."
+        }
+        return manifest
+
+    @staticmethod
+    def publish_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+        """Activates manifest for student submissions, promoting status to PUBLISHED."""
+        current_status = manifest.get("status")
+        if current_status != "TEACHER_APPROVED":
+            raise ValueError(f"Cannot publish manifest in state '{current_status}'. Must be TEACHER_APPROVED first.")
+
+        manifest["status"] = "PUBLISHED"
+        manifest["published_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        return manifest
 
     def validate_negative_fixtures(self, reference_workbook_path: str, manifest: Dict[str, Any]) -> Dict[str, Any]:
         """Generates synthetic defective workbooks and confirms the manifest triggers deductions."""

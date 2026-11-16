@@ -199,24 +199,109 @@ class TestSprint4TeacherSolutionIngestion(unittest.TestCase):
         self.assertTrue(anti_cheat_test["defect_detected"])
         self.assertLess(anti_cheat_test["score"], 100.0)
 
-    # ── Test 7: Full Certification Pipeline ──
+    # ── Test 7: Full Certification & Teacher Approval Lifecycle Pipeline ──
     def test_full_manifest_certification_pipeline(self):
-        """Certifies manifest, promoting status from PROPOSED to APPROVED."""
+        """Certifies manifest through lifecycle: DRAFT -> READY_FOR_TEACHER_APPROVAL -> TEACHER_APPROVED -> PUBLISHED."""
         ref_path = self._create_master_reference_workbook()
         rubric = [
             {"name": "Calculate Commission", "weight": 50},
             {"name": "Rep Performance Chart", "weight": 50}
         ]
         manifest = ingest_teacher_solution(ref_path, rubric)
-        self.assertEqual(manifest["status"], "PROPOSED")
+        self.assertEqual(manifest["status"], "DRAFT")
 
+        # 1. Automated validation certifies readiness
         cert_report = validate_and_certify_manifest(ref_path, manifest)
         self.assertTrue(cert_report["is_valid"])
-        self.assertEqual(cert_report["status"], "APPROVED")
-        self.assertEqual(manifest["status"], "APPROVED")
+        self.assertEqual(cert_report["status"], "READY_FOR_TEACHER_APPROVAL")
+        self.assertEqual(manifest["status"], "READY_FOR_TEACHER_APPROVAL")
         self.assertEqual(cert_report["master_score"], 100.0)
         self.assertTrue(cert_report["negative_tests_passed"] >= 2)
+
+        # 2. Publishing before teacher approval is forbidden
+        with self.assertRaises(ValueError):
+            ManifestValidator.publish_manifest(manifest)
+
+        # 3. Explicit Teacher Approval
+        ManifestValidator.approve_manifest(manifest, approved_by="prof_smith@university.edu", notes="Verified criteria and formulas.")
+        self.assertEqual(manifest["status"], "TEACHER_APPROVED")
+        self.assertIn("approval_record", manifest)
+        self.assertEqual(manifest["approval_record"]["approved_by"], "prof_smith@university.edu")
+
+        # 4. Publication Activation
+        ManifestValidator.publish_manifest(manifest)
+        self.assertEqual(manifest["status"], "PUBLISHED")
+        self.assertIn("published_at", manifest)
+
+    # ── Test 8: Completeness Check Catches Missing Rubric Criterion ──
+    def test_completeness_check_catches_missing_rubric_criterion(self):
+        """Fails certification if a teacher criterion is omitted from generated assertions (prevents circular confidence)."""
+        ref_path = self._create_master_reference_workbook()
+        manifest = {
+            "assignment_id": "test_asgn",
+            "status": "DRAFT",
+            "rubric": [
+                {"name": "Calculate Commission", "weight": 50},
+                {"name": "Unmapped Power Query", "weight": 50}  # Not in testCases
+            ],
+            "testCases": [
+                {
+                    "criterion": "Calculate Commission",
+                    "type": "formula_check",
+                    "range": "D2:D4",
+                    "columnAnchor": "Commission"
+                }
+            ]
+        }
+        validator = ManifestValidator()
+        res = validator.validate_master_solution(ref_path, manifest)
+        self.assertFalse(res["passed"])
+        self.assertTrue(any("Rubric Completeness Failure" in issue for issue in res["issues"]))
+        self.assertIn("Unmapped Power Query", manifest.get("manual_review_criteria", []))
+
+    # ── Test 9: Original Marks Preserved (No Silent Inflation to 100) ──
+    def test_original_marks_preservation(self):
+        """Preserves exact 60-mark assignment total without inflating to 100 points."""
+        ref_path = self._create_master_reference_workbook()
+        rubric_60 = [
+            {"name": "Formulas", "marks": 20.0},
+            {"name": "Charts", "marks": 10.0},
+            {"name": "Data Analysis", "marks": 30.0}
+        ]
+        manifest = ingest_teacher_solution(ref_path, rubric_60)
+        self.assertEqual(manifest["original_max_score"], 60.0)
+        self.assertEqual(manifest["total_marks"], 60.0)
+        self.assertEqual(manifest["scoring_scale"], "ORIGINAL_POINTS")
+
+        crit_a = manifest["rubric"][0]
+        self.assertEqual(crit_a["original_marks"], 20.0)
+        # Normalized proportion stored separately
+        self.assertEqual(crit_a["normalized_proportion"], 33.33)
+
+    # ── Test 10: Strict Method Requirement Forbids Substitutions ──
+    def test_strict_teacher_method_forbids_substitutions(self):
+        """When teacher specifies strict_method, candidate alternatives are rejected."""
+        wb_path = os.path.join(self.tmp_dir, "strict_xlookup.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws["A1"] = "ID"
+        ws["B1"] = "Price"
+        ws["A2"] = 101
+        ws["B2"] = "=XLOOKUP(A2, D:D, E:E)"
+        wb.save(wb_path)
+        wb.close()
+
+        rubric_strict = [
+            {"name": "Lookup Price", "marks": 100, "description": "Must use XLOOKUP strictly; no VLOOKUP allowed.", "strict_method": True}
+        ]
+        manifest = ingest_teacher_solution(wb_path, rubric_strict)
+        f_tc = [tc for tc in manifest["testCases"] if tc.get("type") == "formula_check"][0]
+
+        self.assertTrue(f_tc["strictMethod"])
+        self.assertEqual(f_tc["acceptedFunctions"], ["XLOOKUP"])
+        self.assertEqual(f_tc["candidateAlternatives"], [])
 
 
 if __name__ == "__main__":
     unittest.main()
+

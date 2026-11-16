@@ -45,8 +45,9 @@ class TeacherSolutionIngestionEngine:
         if not os.path.exists(reference_workbook_path):
             raise FileNotFoundError(f"Reference workbook not found: {reference_workbook_path}")
 
-        # 1. Normalize rubric criteria
+        # 1. Normalize rubric criteria, preserving exact original marks
         normalized_criteria = self._normalize_rubric_criteria(rubric)
+        total_original_marks = sum(float(c.get("original_marks", 10.0)) for c in normalized_criteria)
 
         # 2. Extract deep workbook features via WorkbookObjectRegistry
         features = self.extract_reference_features(reference_workbook_path)
@@ -54,30 +55,32 @@ class TeacherSolutionIngestionEngine:
         # 3. Generate canonical assertions matching rubric criteria to discovered features
         test_cases = self._generate_canonical_assertions(normalized_criteria, features, instructions)
 
-        # 4. Normalize weights so rubric sums to exactly 100.0
-        normalized_criteria = self._normalize_weights(normalized_criteria)
+        # 4. Store normalized percentage proportions separately without mutating original marks
+        normalized_criteria = self._compute_normalized_proportions(normalized_criteria, total_original_marks)
 
-        # 5. Compute cryptographic manifest hash
+        # 5. Compute cryptographic manifest hash from canonical semantic content (excluding volatile timestamps)
+        canonical_str = json.dumps({
+            "rubric": [{"name": c["name"], "original_marks": c.get("original_marks"), "description": c.get("description", "")} for c in normalized_criteria],
+            "testCases": test_cases
+        }, sort_keys=True)
+        manifest_hash = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
+
         created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
         manifest_payload = {
             "assignment_id": assignment_id or f"asgn_{hashlib.md5(reference_workbook_path.encode()).hexdigest()[:8]}",
             "version": "1.0.0",
             "created_at": created_at,
-            "status": "PROPOSED",
+            "status": "DRAFT",
+            "original_max_score": total_original_marks,
+            "total_marks": total_original_marks,
+            "scoring_scale": "ORIGINAL_POINTS" if total_original_marks != 100.0 else "PERCENTAGE",
             "rubric": normalized_criteria,
             "testCases": test_cases,
             "supported_features": features.get("supported_features", []),
-            "unsupported_features": features.get("unsupported_features", [])
+            "unsupported_features": features.get("unsupported_features", []),
+            "manifest_hash": manifest_hash
         }
 
-        # Canonical hash excludes volatile timestamps
-        canonical_str = json.dumps({
-            "rubric": normalized_criteria,
-            "testCases": test_cases
-        }, sort_keys=True)
-        manifest_hash = hashlib.sha256(canonical_str.encode("utf-8")).hexdigest()
-
-        manifest_payload["manifest_hash"] = manifest_hash
         return manifest_payload
 
     def extract_reference_features(self, reference_workbook_path: str) -> Dict[str, Any]:
@@ -231,38 +234,39 @@ class TeacherSolutionIngestionEngine:
         }
 
     def _normalize_rubric_criteria(self, rubric: Any) -> List[Dict[str, Any]]:
-        """Normalizes teacher rubric input into structured criteria list."""
+        """Normalizes teacher rubric input into structured criteria list, preserving exact original marks."""
         if isinstance(rubric, dict):
             raw_criteria = rubric.get("criteria", [])
         elif isinstance(rubric, list):
             raw_criteria = rubric
         else:
-            raw_criteria = [{"name": "Standard Evaluation", "weight": 100}]
+            raw_criteria = [{"name": "Standard Evaluation", "marks": 100}]
 
         criteria = []
         for idx, crit in enumerate(raw_criteria):
             if isinstance(crit, str):
-                crit = {"name": crit, "weight": 100.0 / len(raw_criteria)}
+                crit = {"name": crit, "marks": 100.0 / len(raw_criteria)}
             name = crit.get("name", f"Criterion {idx + 1}")
-            weight = float(crit.get("weight", 10.0))
+            original_marks = float(crit.get("marks", crit.get("original_marks", crit.get("weight", 10.0))))
             desc = crit.get("description", crit.get("desc", ""))
+            strict_m = bool(crit.get("strict_method", False))
             criteria.append({
                 "name": name,
-                "weight": weight,
-                "description": desc
+                "original_marks": original_marks,
+                "weight": original_marks,  # Preserved for runner calculation compatibility
+                "description": desc,
+                "strict_method": strict_m
             })
         return criteria
 
-    def _normalize_weights(self, criteria: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Ensures criteria weights sum to exactly 100.0."""
-        tot = sum(float(c.get("weight", 0)) for c in criteria)
-        if tot <= 0:
+    def _compute_normalized_proportions(self, criteria: List[Dict[str, Any]], total_marks: float) -> List[Dict[str, Any]]:
+        """Computes normalized percentage proportions separately without mutating original assignment marks."""
+        if total_marks <= 0:
             for c in criteria:
-                c["weight"] = round(100.0 / max(len(criteria), 1), 2)
-        elif abs(tot - 100.0) > 0.01:
-            factor = 100.0 / tot
+                c["normalized_proportion"] = round(100.0 / max(len(criteria), 1), 2)
+        else:
             for c in criteria:
-                c["weight"] = round(float(c.get("weight", 0)) * factor, 2)
+                c["normalized_proportion"] = round((float(c.get("original_marks", 0)) / total_marks) * 100.0, 2)
         return criteria
 
     def _generate_canonical_assertions(
@@ -381,13 +385,27 @@ class TeacherSolutionIngestionEngine:
                         break
 
             if matched_col:
+                is_strict_method = crit.get("strict_method", False) or any(phrase in crit_text for phrase in ["must use", "only use", "strictly", "no vlookup", "no xlookup", "required method"])
+                primary_funcs = matched_col.get("functions_used", [])
+                primary_fn = primary_funcs[0] if primary_funcs else "CELL_ARITHMETIC"
+
+                if is_strict_method:
+                    accepted_fns = primary_funcs if primary_funcs else ["CELL_ARITHMETIC"]
+                    candidate_alts = []
+                else:
+                    accepted_fns = matched_col.get("accepted_functions", primary_funcs)
+                    candidate_alts = [f for f in accepted_fns if f not in primary_funcs]
+
                 # Primary formula structure check
                 tc_formula = {
                     "criterion": crit_name,
                     "type": "formula_check",
                     "range": matched_col["range"],
                     "columnAnchor": matched_col["header"],
-                    "acceptedFunctions": matched_col["accepted_functions"],
+                    "primaryFunction": primary_fn,
+                    "candidateAlternatives": candidate_alts,
+                    "strictMethod": is_strict_method,
+                    "acceptedFunctions": accepted_fns,
                     "mustBeFormula": True,
                     "forbiddenConstants": True,
                     "weight": 0.7
@@ -436,3 +454,4 @@ def ingest_teacher_solution(
     """Convenience helper to ingest teacher reference files and return canonical manifest."""
     engine = TeacherSolutionIngestionEngine()
     return engine.ingest(reference_workbook_path, rubric, instructions, assignment_id)
+
