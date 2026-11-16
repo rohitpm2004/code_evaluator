@@ -326,16 +326,34 @@ class WorkbookObjectRegistry:
                                         bar_dir = (child.attrib.get("val") or child.attrib.get("barDir") or "").lower()
                                         break
                                 ch_type = "ColumnChart" if bar_dir in ("col", "column") else "BarChart"
-                            elif t_tag in ["lineChart", "pieChart", "doughnutChart", "scatterChart", "areaChart", "radarChart"]:
+                            if t_tag in ["lineChart", "pieChart", "doughnutChart", "scatterChart", "areaChart", "radarChart"]:
                                 ch_type = t_tag.replace("Chart", "").capitalize() + "Chart"
-                            if t_tag in ["numRef", "strRef"]:
-                                f_node = node.find(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f")
-                                if f_node is not None and f_node.text:
-                                    ref_str = f_node.text.strip()
-                                    if t_tag == "numRef":
-                                        num_refs.append(ref_str)
-                                    else:
-                                        cat_refs.append(ref_str)
+
+                        # Extract series value (val) and category (cat) references accurately by parent tag
+                        for ser in c_elem.iter():
+                            ser_tag = ser.tag.split("}")[-1] if "}" in ser.tag else ser.tag
+                            if ser_tag == "ser":
+                                for val_elem in ser.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}val"):
+                                    for f in val_elem.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f"):
+                                        if f is not None and f.text:
+                                            num_refs.append(f.text.strip())
+                                for cat_elem in ser.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}cat"):
+                                    for f in cat_elem.findall(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f"):
+                                        if f is not None and f.text:
+                                            cat_refs.append(f.text.strip())
+
+                        # Fallback scan for generic numRef and strRef if ser-specific was empty
+                        if not num_refs and not cat_refs:
+                            for node in c_elem.iter():
+                                t_tag = node.tag.split("}")[-1] if "}" in node.tag else node.tag
+                                if t_tag in ["numRef", "strRef"]:
+                                    f_node = node.find(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f")
+                                    if f_node is not None and f_node.text:
+                                        ref_str = f_node.text.strip()
+                                        if t_tag == "numRef":
+                                            num_refs.append(ref_str)
+                                        else:
+                                            cat_refs.append(ref_str)
 
                         series_count = sum(1 for el in c_elem.iter() if el.tag.endswith("}ser"))
                         sheet_assigned = chart_to_sheet.get(name, list(self.worksheets.keys())[0] if self.worksheets else "Sheet1")

@@ -598,7 +598,7 @@ def _sheet_has_numeric_data(sheet) -> bool:
                     return True
     return False
 
-def resolve_sheet(wb, target_name: Optional[str] = None, anchor_hint: Optional[str] = None) -> Optional[str]:
+def resolve_sheet(wb, target_name: Optional[str] = None, anchor_hint: Optional[str] = None, fallback_to_default: bool = True) -> Optional[str]:
     """
     6-tier resilient sheet resolver (Phase 1 upgrade):
       T1: Exact name match
@@ -681,7 +681,10 @@ def resolve_sheet(wb, target_name: Optional[str] = None, anchor_hint: Optional[s
                     return s
             return anchor_matches[0]
 
-    # T6: First sheet with real data (skip blank cover pages)
+    # T6: First sheet with real data (skip blank cover pages) if fallback allowed
+    if not fallback_to_default:
+        return None
+
     data_sheets = [s for s in wb.sheetnames if _sheet_has_numeric_data(wb[s])]
     if data_sheets:
         return data_sheets[0]
@@ -1152,16 +1155,22 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     criterion_weights = {}
     total_rubric_weight = sum(float(c.get("weight", 0)) for c in criteria)
 
-    # ── WEIGHT NORMALIZATION (Phase 7): Always ensure weights sum to exactly 100 ──
-    if total_rubric_weight == 0:
-        total_rubric_weight = 100.0
-        for crit in criteria:
-            crit["weight"] = 100.0 / max(len(criteria), 1)
-    elif abs(total_rubric_weight - 100.0) > 0.5:
-        factor = 100.0 / total_rubric_weight
-        for crit in criteria:
-            crit["weight"] = float(crit.get("weight", 0)) * factor
-        total_rubric_weight = 100.0
+    # ── SPRINT 4/6: Preserve original teacher rubric scale without silent 100-point inflation ──
+    orig_max_score = None
+    if isinstance(rubric, dict) and rubric.get("original_max_score") is not None:
+        orig_max_score = float(rubric["original_max_score"])
+    preserve_scale = bool(isinstance(rubric, dict) and rubric.get("preserve_original_marks", orig_max_score is not None))
+
+    if not preserve_scale:
+        if total_rubric_weight == 0:
+            total_rubric_weight = 100.0
+            for crit in criteria:
+                crit["weight"] = 100.0 / max(len(criteria), 1)
+        elif abs(total_rubric_weight - 100.0) > 0.5:
+            factor = 100.0 / total_rubric_weight
+            for crit in criteria:
+                crit["weight"] = float(crit.get("weight", 0)) * factor
+            total_rubric_weight = 100.0
 
     for crit in criteria:
         criterion_weights[crit.get("name", "")] = float(crit.get("weight", 0))
@@ -1341,16 +1350,20 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
         # Use intelligent 4-tier fuzzy sheet name resolver
         target_sheet_req = tc.get("sheet")
-        sheet_name = resolve_sheet(wb_orig, target_sheet_req, anchor_hint=tc.get("anchor"))
+        strict_sheet = bool(tc.get("strict_sheet", tc.get("require_sheet", False)))
+        sheet_name = resolve_sheet(wb_orig, target_sheet_req, anchor_hint=tc.get("anchor"), fallback_to_default=not strict_sheet)
         if not sheet_name or sheet_name not in wb_orig.sheetnames:
             # Global structural checks (Pivots, Macros) inspect the OpenXML package and do not require a specific sheet
             if tc_type in ["pivot_check", "pivot_table_check", "macro_check", "vba_check"] and wb_orig.sheetnames:
                 sheet_name = wb_orig.sheetnames[0]
             else:
                 assertion_results.append({
+                    "id": tc.get("id", f"{crit_name}_{len(assertion_results)}"),
                     "criterion": crit_name,
                     "type": tc_type,
+                    "weight": tc_weight,
                     "passed": False,
+                    "status": "VERIFIED_FAIL",
                     "reason": f"Sheet '{target_sheet_req or 'default'}' not found in workbook.",
                     "target": target_sheet_req
                 })
@@ -1548,8 +1561,9 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         elif tc_type in ["formula_range_check", "formula_check", "function_check", "formula_structure"]:
             range_str = tc.get("range", tc.get("cell", ""))
             anchor_text = tc.get("columnAnchor") or tc.get("anchor")
-            accepted_funcs = [f.upper() for f in tc.get("acceptedFunctions", [])]
-            if accepted_funcs:
+            accepted_funcs = [f.upper() for f in tc.get("acceptedFunctions", tc.get("accepted_functions", []))]
+            strict_method = tc.get("strictMethod", tc.get("strict_method_required", False))
+            if accepted_funcs and not strict_method:
                 expanded_fns = set(accepted_funcs)
                 for fn in accepted_funcs:
                     if fn in FUNCTION_EQUIVALENTS:
@@ -2081,6 +2095,33 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # TYPE 4: Data Check / Non-Empty Table Data
         # -------------------------------------------------------------
         elif tc_type in ["data_check", "non_empty_check", "table_check"]:
+            exp_table_name = tc.get("expectedTable") or tc.get("tableName")
+            if exp_table_name and registry is not None:
+                found_tab = any(t.get("name", "").lower() == exp_table_name.lower() for t in registry.tables)
+                if not found_tab:
+                    assertion_results.append({
+                        "id": tc.get("id", f"{crit_name}_{len(assertion_results)}"),
+                        "criterion": crit_name,
+                        "type": tc_type,
+                        "weight": tc_weight,
+                        "passed": False,
+                        "status": "VERIFIED_FAIL",
+                        "reason": f"Expected Excel ListObject Table '{exp_table_name}' not found in workbook."
+                    })
+                    continue
+                elif not tc.get("range") and not tc.get("cell"):
+                    criterion_passes[crit_name]["passed"] += 1
+                    assertion_results.append({
+                        "id": tc.get("id", f"{crit_name}_{len(assertion_results)}"),
+                        "criterion": crit_name,
+                        "type": tc_type,
+                        "weight": tc_weight,
+                        "passed": True,
+                        "status": "VERIFIED_PASS",
+                        "reason": f"Verified Excel Table '{exp_table_name}' exists in workbook."
+                    })
+                    continue
+
             range_str = tc.get("range", tc.get("cell", ""))
             cells_to_check = []
             if ":" in range_str:
@@ -2298,8 +2339,8 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         elif tc_type in ["chart_check", "graph_check"]:
             min_charts = int(tc.get("minCharts", 1))
-            req_type = str(tc.get("chartType", "")).strip().lower()
-            req_title_raw = str(tc.get("title", "")).strip()
+            req_type = str(tc.get("chartType", tc.get("expectedChartType", ""))).strip().lower()
+            req_title_raw = str(tc.get("title", tc.get("expectedTitle", ""))).strip()
             req_title = req_title_raw.lower()
             req_title_tokens = set(re.findall(r'\w+', req_title)) if req_title else set()
 
@@ -2354,7 +2395,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         reason = f"Expected chart title containing '{req_title_raw}', found: {found_titles or 'Untitled'}."
 
                 # ── SPRINT 3: Chart Data Source & Rendered Series Verification ──
-                req_source_range = tc.get("expectedSourceRange") or tc.get("valueRange") or tc.get("sourceRange")
+                req_source_range = tc.get("expectedSourceRange") or tc.get("expectedDataRange") or tc.get("valueRange") or tc.get("sourceRange")
                 req_cat_range = tc.get("expectedCategoryRange") or tc.get("categoryRange")
                 req_values = tc.get("expectedValues")
 
@@ -2390,7 +2431,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     req_cat_col_range = norm_req_cat.split("!")[-1] if "!" in norm_req_cat else norm_req_cat
                     cat_matched = False
                     for c in target_sheet_charts:
-                        c_cats = c.get("cat_refs", [])
+                        c_cats = list(dict.fromkeys(c.get("cat_refs", []) + c.get("num_refs", [])))
                         for cc in c_cats:
                             norm_cc = _norm_r(cc)
                             cc_col_range = norm_cc.split("!")[-1] if "!" in norm_cc else norm_cc
@@ -3154,7 +3195,8 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         }
 
     # ── Final Overall Score Calculation (Never shrink the denominator) ──
-    total_score = min(100.0, max(0.0, round(verified_earned_total, 2)))
+    effective_max = orig_max_score if (preserve_scale and orig_max_score is not None) else 100.0
+    total_score = min(effective_max, max(0.0, round(verified_earned_total, 2)))
 
     eval_status = "COMPLETED"
     if needs_review or pending_review_total > 0:

@@ -230,6 +230,20 @@ class DuckDBAnalyticalAdapter:
         self.conn.commit()
         wb.close()
 
+    def close(self):
+        """Closes the in-memory SQL database connection."""
+        try:
+            if hasattr(self, "conn") and self.conn:
+                self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
     def query_scalar(self, sql_query: str) -> Any:
         """Executes a scalar aggregation SQL query and returns the numeric or text result."""
         self.cursor.execute(sql_query)
