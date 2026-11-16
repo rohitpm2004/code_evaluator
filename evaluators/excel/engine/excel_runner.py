@@ -1672,6 +1672,9 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
                         if accepted_funcs:
                             has_accepted = any(fn in clean_formula for fn in accepted_funcs)
+                            if not has_accepted and any(k in accepted_funcs for k in ["CELL_ARITHMETIC", "ARITHMETIC"]):
+                                if any(op in clean_formula for op in ['*', '+', '-', '/', '^']) and re.search(r'[A-Z]+[0-9]+', clean_formula):
+                                    has_accepted = True
                             if not has_accepted:
                                 fails.append(f"{coord}: Formula '{formula_str}' does not use required functions: {', '.join(accepted_funcs)}.")
                                 continue

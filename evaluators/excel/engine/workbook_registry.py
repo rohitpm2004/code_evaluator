@@ -318,7 +318,15 @@ class WorkbookObjectRegistry:
                         cat_refs = []
                         for node in c_elem.iter():
                             t_tag = node.tag.split("}")[-1] if "}" in node.tag else node.tag
-                            if t_tag in ["barChart", "columnChart", "lineChart", "pieChart", "doughnutChart", "scatterChart", "areaChart", "radarChart"]:
+                            if t_tag in ["barChart", "bar3DChart"]:
+                                bar_dir = None
+                                for child in node.iter():
+                                    c_tag = child.tag.split("}")[-1]
+                                    if c_tag == "barDir":
+                                        bar_dir = (child.attrib.get("val") or child.attrib.get("barDir") or "").lower()
+                                        break
+                                ch_type = "ColumnChart" if bar_dir in ("col", "column") else "BarChart"
+                            elif t_tag in ["lineChart", "pieChart", "doughnutChart", "scatterChart", "areaChart", "radarChart"]:
                                 ch_type = t_tag.replace("Chart", "").capitalize() + "Chart"
                             if t_tag in ["numRef", "strRef"]:
                                 f_node = node.find(".//{http://schemas.openxmlformats.org/drawingml/2006/chart}f")
