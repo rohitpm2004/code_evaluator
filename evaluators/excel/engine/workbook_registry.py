@@ -177,10 +177,13 @@ class WorkbookObjectRegistry:
 
                         record_count = pc_elem.attrib.get("recordCount", "0")
                         fields = []
-                        cache_fields = pc_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cacheFields")
-                        if cache_fields is not None:
-                            for cf in cache_fields:
-                                fields.append(cf.attrib.get("name", ""))
+                        # Extract standard cacheFields as well as OLAP / Data Model dimensions, hierarchies, levels, measures, and KPIs
+                        for elem in pc_elem.iter():
+                            tag = elem.tag.split('}')[-1]
+                            if tag in ('cacheField', 'dimension', 'hierarchy', 'level', 'measure', 'kpi'):
+                                cf_name = elem.attrib.get('name') or elem.attrib.get('uniqueName') or elem.attrib.get('caption')
+                                if cf_name and cf_name not in fields:
+                                    fields.append(cf_name)
 
                         src_elem = pc_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cacheSource")
                         src_type = src_elem.attrib.get("type", "") if src_elem is not None else ""
@@ -219,6 +222,21 @@ class WorkbookObjectRegistry:
                     except Exception:
                         pass
 
+            # Map each pivotTable to its specific cacheDefinition
+            pt_to_cache = {}
+            for fname in namelist:
+                if fname.startswith("xl/pivotTables/_rels/pivotTable") and fname.endswith(".xml.rels"):
+                    pt_file = fname.replace("/_rels/", "/").replace(".xml.rels", ".xml")
+                    try:
+                        pt_rels = ET.fromstring(z.read(fname))
+                        for r in pt_rels:
+                            tgt = r.attrib.get("Target", "")
+                            if "pivotCache" in tgt:
+                                cache_file = "xl/" + tgt.replace("../", "").lstrip("/")
+                                pt_to_cache[pt_file] = cache_file
+                    except Exception:
+                        pass
+
             for name in namelist:
                 if name.startswith("xl/pivotTables/pivotTable") and name.endswith(".xml"):
                     try:
@@ -228,40 +246,113 @@ class WorkbookObjectRegistry:
                         loc_elem = pt_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}location")
                         loc_ref = loc_elem.attrib.get("ref", "") if loc_elem is not None else ""
 
+                        cache_file = pt_to_cache.get(name, "")
+                        cache_meta = self.pivot_caches.get(str(cache_id), {})
+                        cache_fields = cache_meta.get("fields", [])
+                        if not cache_fields and cache_file:
+                            c_id_match = re.search(r'pivotCacheDefinition(\d+)\.xml', cache_file)
+                            if c_id_match:
+                                cache_meta = self.pivot_caches.get(c_id_match.group(1), cache_meta)
+                                cache_fields = cache_meta.get("fields", [])
+
                         # Extract row/col/data fields
                         pivot_fields = []
                         pf_elem = pt_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}pivotFields")
                         if pf_elem is not None:
-                            for pf in pf_elem:
+                            for idx, pf in enumerate(pf_elem):
                                 axis = pf.attrib.get("axis", "")
-                                pivot_fields.append({"axis": axis, "name": pf.attrib.get("name", "")})
+                                pf_override = pf.attrib.get("name")
+                                base_name = pf_override or (cache_fields[idx] if idx < len(cache_fields) else f"Field_{idx}")
+                                pivot_fields.append({
+                                    "axis": axis,
+                                    "name": base_name,
+                                    "dataField": pf.attrib.get("dataField") == "1"
+                                })
+
+                        if not pivot_fields and cache_fields:
+                            pivot_fields = [{"axis": None, "name": cf, "dataField": False} for cf in cache_fields]
 
                         row_fields = []
                         rf_elem = pt_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}rowFields")
                         if rf_elem is not None:
                             for rf in rf_elem:
-                                row_fields.append(rf.attrib.get("x", ""))
+                                x = rf.attrib.get("x")
+                                if x is not None and x.lstrip('-').isdigit():
+                                    x_int = int(x)
+                                    if 0 <= x_int < len(pivot_fields):
+                                        row_fields.append(pivot_fields[x_int]["name"])
+                                    elif 0 <= x_int < len(cache_fields):
+                                        row_fields.append(cache_fields[x_int])
+
+                        col_fields = []
+                        cf_elem = pt_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}colFields")
+                        if cf_elem is not None:
+                            for cf in cf_elem:
+                                x = cf.attrib.get("x")
+                                if x is not None and x.lstrip('-').isdigit():
+                                    x_int = int(x)
+                                    if 0 <= x_int < len(pivot_fields):
+                                        col_fields.append(pivot_fields[x_int]["name"])
+                                    elif 0 <= x_int < len(cache_fields):
+                                        col_fields.append(cache_fields[x_int])
 
                         data_fields = []
                         df_elem = pt_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}dataFields")
                         if df_elem is not None:
                             for df in df_elem:
+                                df_name = df.attrib.get("name", "")
+                                df_sub = df.attrib.get("subtotal", "sum")
+                                fld = df.attrib.get("fld")
+                                src_name = ""
+                                if fld is not None and fld.isdigit():
+                                    fld_int = int(fld)
+                                    if 0 <= fld_int < len(pivot_fields):
+                                        src_name = pivot_fields[fld_int]["name"]
+                                    elif 0 <= fld_int < len(cache_fields):
+                                        src_name = cache_fields[fld_int]
                                 data_fields.append({
-                                    "name": df.attrib.get("name", ""),
-                                    "fld": df.attrib.get("fld", ""),
-                                    "subtotal": df.attrib.get("subtotal", "sum")
+                                    "name": df_name,
+                                    "fld": fld,
+                                    "sourceField": src_name,
+                                    "subtotal": df_sub,
+                                    "function": df_sub
                                 })
 
+                        # Fallback for axis attribute
+                        if not row_fields:
+                            for pf in pivot_fields:
+                                if pf.get("axis") == "axisRow":
+                                    row_fields.append(pf["name"])
+                        if not col_fields:
+                            for pf in pivot_fields:
+                                if pf.get("axis") == "axisCol":
+                                    col_fields.append(pf["name"])
+
+                        active_fields = list(dict.fromkeys(
+                            [f for f in (row_fields + col_fields + [df.get("name") for df in data_fields] + [df.get("sourceField") for df in data_fields]) if f]
+                        ))
+
+                        all_fields = list(dict.fromkeys(
+                            [f for f in (active_fields + [pf["name"] for pf in pivot_fields] + cache_fields) if f]
+                        ))
+
                         sheet_assigned = pt_to_sheet.get(name, list(self.worksheets.keys())[0] if self.worksheets else "Sheet1")
-                        cache_meta = self.pivot_caches.get(str(cache_id), {})
                         self.pivot_tables.append({
                             "name": pt_name,
                             "cache_id": cache_id,
                             "sheet": sheet_assigned,
                             "location_ref": loc_ref,
-                            "fields": pivot_fields,
+                            "location": loc_ref,
+                            "fields": all_fields,            # list of string field names!
+                            "pivot_fields": pivot_fields,    # list of structured dicts
                             "row_fields": row_fields,
+                            "rowFields": row_fields,
+                            "col_fields": col_fields,
+                            "colFields": col_fields,
                             "data_fields": data_fields,
+                            "dataFields": data_fields,
+                            "active_fields": active_fields,
+                            "activeFields": active_fields,
                             "record_count": cache_meta.get("record_count", 0),
                             "source_sheet": cache_meta.get("source_sheet", ""),
                             "source_ref": cache_meta.get("source_ref", ""),

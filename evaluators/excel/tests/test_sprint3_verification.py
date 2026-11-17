@@ -249,6 +249,36 @@ class TestSprint3DeepWorkbookVerification(unittest.TestCase):
         self.assertIn("50 records", stale_warns[0])
         self.assertIn("100 rows", stale_warns[0])
 
+    # ── Test 6B: Data Model Pivot & Unhashable Dict Safety Regression Test ──
+    def test_pivot_check_dict_safety_and_data_model_resilience(self):
+        """Regression test: Pivot table check must not throw TypeError: unhashable type: 'dict' on Data Model pivots."""
+        wb_p = self._create_pivot_workbook(grand_total=150000.0, cache_records=100, table_rows=100)
+        spec = {
+            "rubric": [{"name": "Data Model Ingestion", "weight": 100}],
+            "testCases": [
+                {
+                    "criterion": "Data Model Ingestion",
+                    "type": "pivot_check",
+                    "requiredField": "Product_ID",
+                    "minPivotTables": 1
+                },
+                {
+                    "criterion": "Data Model Ingestion",
+                    "type": "pivot_check",
+                    "requiredField": "NonExistentField_TriggerFallback",
+                    "minPivotTables": 1
+                }
+            ]
+        }
+        # Must execute cleanly without unhashable dict exception
+        report = inspect_and_evaluate(wb_p, wb_p, spec)
+        self.assertIn("rubric_breakdown", report)
+        self.assertTrue(report.get("success"))
+        assertions = report.get("assertion_results", [])
+        self.assertEqual(len(assertions), 2)
+        # Verify fallback reason string extracted cleanly without exception
+        self.assertFalse(any("Inspection runtime exception" in a.get("reason", "") for a in assertions))
+
     # ── Test 7: Power Query Output Headers & Freshness Contract Tagging ──
     def test_power_query_output_headers_and_freshness_tag(self):
         """Power Query destination table verified with required headers and freshness contract tagged."""

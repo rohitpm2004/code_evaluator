@@ -2531,10 +2531,26 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                     req_tokens = set(re.findall(r'\w+', req_field))
 
                     for p in sorted_pivots:
-                        p_active = [str(f).lower() for f in p.get("activeFields", [])]
-                        p_all = [str(f).lower() for f in p.get("fields", [])]
-                        p_data = [str(df.get("name", "")).lower() for df in p.get("dataFields", [])]
-                        p_src = [str(df.get("sourceField", "")).lower() for df in p.get("dataFields", []) if df.get("sourceField")]
+                        p_active = [
+                            str(f.get("name") or f.get("caption") if isinstance(f, dict) else f).lower()
+                            for f in (p.get("activeFields") or p.get("active_fields") or [])
+                            if f
+                        ]
+                        p_all = [
+                            str(f.get("name") or f.get("caption") if isinstance(f, dict) else f).lower()
+                            for f in (p.get("fields") or [])
+                            if f
+                        ]
+                        p_data = [
+                            str(df.get("name", "")).lower()
+                            for df in (p.get("dataFields") or p.get("data_fields") or [])
+                            if isinstance(df, dict) and df.get("name")
+                        ]
+                        p_src = [
+                            str(df.get("sourceField", "")).lower()
+                            for df in (p.get("dataFields") or p.get("data_fields") or [])
+                            if isinstance(df, dict) and df.get("sourceField")
+                        ]
 
                         candidate_pools = [
                             ("active", list(dict.fromkeys(p_active + p_data + p_src))),
@@ -2589,12 +2605,19 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         reason = f"Verified native Pivot Table '{matched_pivot_name}'{sheet_info} with field '{matched_field_name or req_field}'."
                     else:
                         # Approach-Based Competency Rescue:
-                        has_usable_pivot = any(len(p.get("dataFields", [])) > 0 or len(p.get("activeFields", [])) > 0 or len(p.get("fields", [])) > 0 for p in detected_pivots)
+                        has_usable_pivot = any(len(p.get("dataFields") or p.get("data_fields") or []) > 0 or len(p.get("activeFields") or p.get("active_fields") or []) > 0 or len(p.get("fields") or []) > 0 for p in detected_pivots)
                         if has_usable_pivot:
                             tc_passed = True
                             all_found_fields = []
                             for p in detected_pivots:
-                                all_found_fields.extend(p.get("activeFields", []) or p.get("fields", []))
+                                raw_pool = (p.get("activeFields") or p.get("active_fields") or []) or p.get("fields", [])
+                                for f in raw_pool:
+                                    if isinstance(f, dict):
+                                        fn = f.get("name") or f.get("caption") or f.get("sourceField")
+                                        if fn:
+                                            all_found_fields.append(str(fn).strip())
+                                    elif f is not None and str(f).strip():
+                                        all_found_fields.append(str(f).strip())
                             found_str = ", ".join(list(dict.fromkeys(all_found_fields))[:5])
                             reason = f"Verified native Pivot Table with active data fields (Fields detected: {found_str or 'Data Model fields'})."
                         else:
