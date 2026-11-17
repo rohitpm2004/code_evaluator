@@ -1316,6 +1316,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 existing_keys.add((oc.get('type'), oc.get('title')))
 
     for idx, tc in enumerate(test_cases):
+        reason = ""
         crit_name = tc.get("criterion", criteria[0].get("name") if criteria else "Standard Evaluation")
         if crit_name not in criterion_passes:
             criterion_passes[crit_name] = {"total": 0, "passed": 0}
@@ -1841,6 +1842,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # TYPE 3: Format & Style Check (Headers, Borders, Bold, Alignment, Currency)
         # -------------------------------------------------------------
         elif tc_type in ["format_check", "style_check"]:
+            reason = ""
             range_str = tc.get("range", tc.get("cell", ""))
             anchor_text = tc.get("columnAnchor") or tc.get("anchor")
             req_bold = tc.get("bold")
@@ -2095,6 +2097,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # TYPE 4: Data Check / Non-Empty Table Data
         # -------------------------------------------------------------
         elif tc_type in ["data_check", "non_empty_check", "table_check"]:
+            reason = ""
             exp_table_name = tc.get("expectedTable") or tc.get("tableName")
             if exp_table_name and registry is not None:
                 found_tab = any(t.get("name", "").lower() == exp_table_name.lower() for t in registry.tables)
