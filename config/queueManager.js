@@ -70,8 +70,13 @@ const QUEUE_CONFIG = {
 
   excel: {
     jobName: 'excel-job',
-    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 5), 5),
-    timeout: 35000,       // 35s Excel ceiling
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 3), 3),
+    timeout: 120000,       // 120s ceiling (covers Google/OneDrive download + LibreOffice recalculation + openpyxl/DuckDB inspection)
+    limiter: {
+      max: 10,
+      duration: 5000
+    },
+    attempts: 2,
     description: 'Excel Spreadsheet Evaluation'
   },
 
@@ -111,19 +116,19 @@ class QueueManager {
       const sharedConnection = redisConnection.connect();
 
       for (const [type, config] of Object.entries(QUEUE_CONFIG)) {
-        this.queues[type] = new Queue(type + '-evaluation', {
+        const queueOpts = {
           connection: sharedConnection,
           prefix: process.env.QUEUE_PREFIX || 'local',
           
           // Default job options: strictly cap retained jobs to prevent Redis Cloud 30MB OOM
           defaultJobOptions: {
-            attempts: 1,
+            attempts: config.attempts || 1,
             backoff: {
               type: 'exponential',
-              delay: 2000
+              delay: 3000
             },
             removeOnComplete: {
-              count: 100,
+              count: 50,
               age: 3600 // 1 hour
             },
             removeOnFail: {
@@ -131,7 +136,13 @@ class QueueManager {
               age: 7200 // 2 hours
             }
           }
-        });
+        };
+
+        if (config.limiter) {
+          queueOpts.limiter = config.limiter;
+        }
+
+        this.queues[type] = new Queue(type + '-evaluation', queueOpts);
 
         // Add error listener
         this.setupQueueListeners(type);
@@ -314,11 +325,26 @@ class QueueManager {
         jobOptions.priority = payload.priority;
       }
 
-      const job = await queue.add(
-        config.jobName,
-        payload,
-        jobOptions
-      );
+      let job;
+      try {
+        job = await queue.add(
+          config.jobName,
+          payload,
+          jobOptions
+        );
+      } catch (addErr) {
+        if (addErr.message && (addErr.message.includes('OOM') || addErr.message.includes('maxmemory'))) {
+          logger.warn(`Redis memory limit reached during addEvaluation for ${type}. Performing emergency prune and retrying...`);
+          await this.pruneStaleRedisJobs();
+          job = await queue.add(
+            config.jobName,
+            payload,
+            jobOptions
+          );
+        } else {
+          throw addErr;
+        }
+      }
 
       logger.info(`Job added: ${type}/${job.id}`, {
         evaluator: type,
