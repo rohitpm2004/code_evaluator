@@ -303,8 +303,8 @@ class QueueManager {
           type: 'exponential',
           delay: 5000,
         },
-        removeOnComplete: { count: 2000, age: 86400 },
-        removeOnFail: { count: 2000, age: 86400 }
+        removeOnComplete: { count: 50, age: 3600 },
+        removeOnFail: { count: 50, age: 7200 }
       };
 
       // Only assign explicit positive numeric priority if explicitly requested.
