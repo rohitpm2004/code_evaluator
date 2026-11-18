@@ -265,11 +265,15 @@ export async function evaluateExcelSubmission(jobData, jobId) {
   try {
     const engineRunnerSrc = path.resolve(__dirname, "engine/excel_runner.py");
     const engineRecalcSrc = path.resolve(__dirname, "engine/recalculate.py");
+    const engineRegistrySrc = path.resolve(__dirname, "engine/workbook_registry.py");
     if (fs.existsSync(engineRunnerSrc)) {
       await fsp.copyFile(engineRunnerSrc, path.join(tempWorkspace, "excel_runner.py"));
     }
     if (fs.existsSync(engineRecalcSrc)) {
       await fsp.copyFile(engineRecalcSrc, path.join(tempWorkspace, "recalculate.py"));
+    }
+    if (fs.existsSync(engineRegistrySrc)) {
+      await fsp.copyFile(engineRegistrySrc, path.join(tempWorkspace, "workbook_registry.py"));
     }
   } catch (copyErr) {
     logger.warn(`Failed to copy engine scripts to temp workspace: ${copyErr.message}`);
@@ -362,6 +366,7 @@ export async function evaluateExcelSubmission(jobData, jobId) {
 
     // Phase 3: Prepare test specification
     const spec = {
+      title: jobData.assignmentTitle || jobData.title || jobData.assignment?.title || "Excel Assessment",
       rubric: rubric || { criteria: [] },
       testCases: testCases || []
     };
@@ -397,15 +402,25 @@ export async function evaluateExcelSubmission(jobData, jobId) {
       throw new Error(`Excel inspection failed: ${errReason}`);
     }
 
-    // Phase 5: Generate AI Explanatory Feedback
-    const feedback = await generateExcelFeedback(report, rubric);
+    // Phase 5: Generate AI Explanatory Feedback & Academic Arbitration
+    const feedback = await generateExcelFeedback(report, rubric, spec);
+
+    // Apply arbitrated final score and breakdown if validated by the AI layer
+    const finalScore = (typeof feedback?.final_score === "number" && !isNaN(feedback.final_score))
+      ? feedback.final_score
+      : (report.score ?? 0);
+
+    const finalBreakdown = (feedback?.rubric_breakdown && typeof feedback.rubric_breakdown === "object" && Object.keys(feedback.rubric_breakdown).length > 0)
+      ? feedback.rubric_breakdown
+      : (report.rubric_breakdown || {});
 
     const durationMs = Date.now() - startTime;
-    logger.info(`[ExcelEvaluator] Completed Job ${jobId} in ${durationMs}ms with score: ${report.score ?? 0}`);
+    logger.info(`[ExcelEvaluator] Completed Job ${jobId} in ${durationMs}ms with final arbitrated score: ${finalScore} (Engine draft: ${report.score ?? 0})`);
 
     return {
-      score: report.score ?? 0,
-      rubric_breakdown: report.rubric_breakdown || {},
+      score: finalScore,
+      rubric_breakdown: finalBreakdown,
+      arbitration_adjustments: feedback?.arbitration_adjustments || [],
       feedback,
       evaluation_status: report.evaluation_status || "COMPLETED",
       detected_formulas: report.detected_formulas || [],

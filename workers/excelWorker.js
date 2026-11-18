@@ -21,15 +21,15 @@ export async function initializeExcelWorker() {
       attempts: 2
     };
 
-    // P2 Resilience Safeguard: Limit concurrency to os.cpus().length or max 5 concurrent workers
-    // to prevent memory spikes from parallel openpyxl / LibreOffice recalculation processes.
-    const cpuCount = os.cpus()?.length || 2;
-    const maxSafeConcurrency = Math.min(Math.max(1, cpuCount), 5);
+    // P2 Resilience Safeguard: Limit concurrency to os.cpus().length or max 6 concurrent workers
+    // to balance throughput for 150+ submissions with memory safety.
+    const cpuCount = os.cpus()?.length || 4;
+    const maxSafeConcurrency = Math.min(Math.max(1, cpuCount), 6);
     const envConcurrency = parseInt(process.env.EXCEL_CONCURRENCY, 10);
-    const targetConcurrency = !isNaN(envConcurrency) ? envConcurrency : (config.concurrency || 2);
+    const targetConcurrency = !isNaN(envConcurrency) ? envConcurrency : (config.concurrency || 4);
     const effectiveConcurrency = Math.min(Math.max(1, targetConcurrency), maxSafeConcurrency);
 
-    logger.info(`Excel Worker concurrency set to ${effectiveConcurrency} (detected cores: ${cpuCount}, max safe cap: 5) [env: ${process.env.EXCEL_CONCURRENCY || 'default'}]`);
+    logger.info(`Excel Worker concurrency set to ${effectiveConcurrency} (detected cores: ${cpuCount}, max safe cap: 6) [env: ${process.env.EXCEL_CONCURRENCY || 'default'}]`);
 
     excelWorker = new Worker(
       'excel-evaluation',

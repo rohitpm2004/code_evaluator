@@ -70,10 +70,10 @@ const QUEUE_CONFIG = {
 
   excel: {
     jobName: 'excel-job',
-    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 3), 3),
-    timeout: 120000,       // 120s ceiling (covers Google/OneDrive download + LibreOffice recalculation + openpyxl/DuckDB inspection)
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 4), 6),
+    timeout: 180000,       // 180s ceiling (covers Google/OneDrive download + LibreOffice recalculation + openpyxl/DuckDB inspection)
     limiter: {
-      max: 10,
+      max: 30,
       duration: 5000
     },
     attempts: 2,
@@ -192,9 +192,9 @@ class QueueManager {
         const failedKey = `${prefix}:${queueName}:failed`;
         const eventsKey = `${prefix}:${queueName}:events`;
 
-        // 1. Remove completed jobs keeping at most 100
+        // 1. Remove completed jobs keeping at most 50 (prevents Redis Cloud 30MB exhaustion)
         try {
-          const completedJobIds = await conn.zrange(completedKey, 0, -101);
+          const completedJobIds = await conn.zrange(completedKey, 0, -51);
           if (completedJobIds.length > 0) {
             const keysToDelete = [];
             for (const id of completedJobIds) {
@@ -202,7 +202,7 @@ class QueueManager {
               keysToDelete.push(prefix + ':' + queueName + ':' + id + ':logs');
             }
             await conn.unlink(...keysToDelete).catch(() => {});
-            await conn.zremrangebyrank(completedKey, 0, -101).catch(() => {});
+            await conn.zremrangebyrank(completedKey, 0, -51).catch(() => {});
           }
         } catch {}
 
@@ -225,6 +225,30 @@ class QueueManager {
           await conn.xtrim(eventsKey, 'MAXLEN', '~', 10);
         } catch {}
       }
+
+      // Proactive High Memory Guard: if used memory > 18MB (out of 30MB free tier), aggressively prune to 10
+      try {
+        const memInfo = await conn.info('memory');
+        const usedMatch = memInfo.match(/used_memory:(\d+)/);
+        const usedBytes = usedMatch ? parseInt(usedMatch[1], 10) : 0;
+        if (usedBytes > 18 * 1024 * 1024) {
+          logger.warn(`⚠️ High Redis memory (${(usedBytes / 1024 / 1024).toFixed(1)}MB). Running aggressive queue cleanup...`);
+          for (const type of Object.keys(QUEUE_CONFIG)) {
+            const qName = `${type}-evaluation`;
+            const compKey = `${prefix}:${qName}:completed`;
+            const failKey = `${prefix}:${qName}:failed`;
+            const extraComp = await conn.zrange(compKey, 0, -11);
+            const extraFail = await conn.zrange(failKey, 0, -11);
+            const toDel = [...extraComp, ...extraFail].flatMap(id => [
+              `${prefix}:${qName}:${id}`,
+              `${prefix}:${qName}:${id}:logs`
+            ]);
+            if (toDel.length > 0) await conn.unlink(...toDel).catch(() => {});
+            if (extraComp.length > 0) await conn.zrem(compKey, ...extraComp).catch(() => {});
+            if (extraFail.length > 0) await conn.zrem(failKey, ...extraFail).catch(() => {});
+          }
+        }
+      } catch {}
 
       // Also unlink any orphaned logs or legacy keys if Redis is tight on memory
       try {
@@ -314,8 +338,8 @@ class QueueManager {
           type: 'exponential',
           delay: 5000,
         },
-        removeOnComplete: { count: 50, age: 3600 },
-        removeOnFail: { count: 50, age: 7200 }
+        removeOnComplete: { count: 2000, age: 86400 },
+        removeOnFail: { count: 1000, age: 86400 }
       };
 
       // Only assign explicit positive numeric priority if explicitly requested.
@@ -379,7 +403,9 @@ class QueueManager {
         data: job.data,
         result: job.returnvalue,
         failedReason: job.failedReason,
-        stacktrace: job.stacktrace
+        stacktrace: job.stacktrace,
+        processedOn: job.processedOn || null,
+        timestamp: job.timestamp || null
       };
 
     } catch (err) {
@@ -420,7 +446,9 @@ class QueueManager {
                 state: await job.getState(),
                 progress: job.progress ?? 0,
                 result: job.returnvalue,
-                failedReason: job.failedReason
+                failedReason: job.failedReason,
+                processedOn: job.processedOn || null,
+                timestamp: job.timestamp || null
               };
             }
           }
@@ -437,7 +465,9 @@ class QueueManager {
                   state: await job.getState(),
                   progress: job.progress ?? 0,
                   result: job.returnvalue,
-                  failedReason: job.failedReason
+                  failedReason: job.failedReason,
+                  processedOn: job.processedOn || null,
+                  timestamp: job.timestamp || null
                 };
               }
             } catch {}
@@ -471,6 +501,66 @@ class QueueManager {
       logger.error(`Failed to remove job: ${type}/${jobId}`, err);
       throw err;
     }
+  }
+
+  /**
+   * Cancel and remove pending/waiting jobs for an assignment, specific job IDs, or an evaluation.
+   */
+  async cancelEvaluationJobs({ type, assignmentId, evaluationId, jobIds = [] }) {
+    let cancelledCount = 0;
+    const targetTypes = type && this.queues[type] ? [type] : Object.keys(this.queues);
+
+    for (const qType of targetTypes) {
+      const queue = this.queues[qType];
+      if (!queue) continue;
+
+      // 1. If explicit jobIds provided, cancel them directly
+      if (Array.isArray(jobIds) && jobIds.length > 0) {
+        for (const jId of jobIds) {
+          try {
+            const job = await queue.getJob(jId);
+            if (job) {
+              const state = await job.getState();
+              if (state === 'waiting' || state === 'delayed') {
+                await job.remove();
+                cancelledCount++;
+              } else if (state === 'active') {
+                await job.discard();
+                cancelledCount++;
+              }
+            }
+          } catch {}
+        }
+      }
+
+      // 2. Scan waiting and delayed jobs in the queue for matching assignmentId or evaluationId
+      try {
+        const jobs = await queue.getJobs(['waiting', 'delayed']);
+        for (const job of jobs) {
+          const data = job.data || {};
+          const matchAssignment = assignmentId && (
+            data.assignmentId === assignmentId ||
+            data.submission?.assignment_id === assignmentId ||
+            data.submission?.assignmentId === assignmentId
+          );
+          const matchEvaluation = evaluationId && (
+            data.evaluationId === evaluationId ||
+            data.submission?.evaluation_id === evaluationId ||
+            data.submission?.evaluationId === evaluationId
+          );
+
+          if (matchAssignment || matchEvaluation) {
+            await job.remove().catch(() => {});
+            cancelledCount++;
+          }
+        }
+      } catch (err) {
+        logger.warn(`Failed scanning ${qType} jobs for cancellation: ${err.message}`);
+      }
+    }
+
+    logger.info(`Cancelled ${cancelledCount} jobs across queues`, { type, assignmentId, evaluationId });
+    return cancelledCount;
   }
 
   /**

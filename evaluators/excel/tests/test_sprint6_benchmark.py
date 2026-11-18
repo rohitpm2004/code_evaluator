@@ -22,7 +22,7 @@ import shutil
 
 # Add engine to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "../engine")))
-from benchmark_harness import ExcelBenchmarkHarness
+from benchmark_harness import ExcelBenchmarkHarness  # type: ignore[import-not-found]  # pyright: ignore[reportMissingImports]
 
 
 class TestSprint6BenchmarkCertification(unittest.TestCase):

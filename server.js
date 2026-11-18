@@ -178,7 +178,9 @@ async function startServer() {
           progress: result.progress,
           result: result.result,
           failedReason: result.failedReason,
-          data: result.data
+          data: result.data,
+          processedOn: result.processedOn || null,
+          timestamp: result.timestamp || null
         };
 
         res.json(sanitized);
@@ -201,6 +203,22 @@ async function startServer() {
         res.json({ success: true, statuses });
       } catch (err) {
         logger.error(`Error retrieving batch job status: ${err.message}`);
+        res.status(500).json({ success: false, error: err.message });
+      }
+    });
+
+    app.post('/jobs/cancel', requireApiKey, async (req, res) => {
+      try {
+        const { type, assignmentId, evaluationId, jobIds } = req.body || {};
+        const cancelledCount = await queueManager.cancelEvaluationJobs({
+          type,
+          assignmentId,
+          evaluationId,
+          jobIds
+        });
+        res.json({ success: true, message: `Cancelled ${cancelledCount} jobs`, cancelledCount });
+      } catch (err) {
+        logger.error(`Error cancelling jobs: ${err.message}`);
         res.status(500).json({ success: false, error: err.message });
       }
     });

@@ -24,6 +24,20 @@ NS = {
     "xdr": "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 }
 
+TABLE_CONCEPTS = {
+    "date": ["date", "trans_date", "transaction date", "time", "order date", "order_date"],
+    "client": ["client", "company", "customer", "account", "client name", "company name", "customer name", "customername", "customer_name", "customer id", "customer_id", "customerid"],
+    "ticker": ["ticker", "tickers", "symbol", "stock", "code", "xnas", "xnys"],
+    "contact": ["contact", "contact name", "rep", "representative", "cleaned contact", "full name", "clean contact", "name", "sales person", "salesperson", "sales rep", "agent"],
+    "department": ["department", "dept", "division", "sector", "segment"],
+    "payment": ["payment", "payment method", "pay method", "pay type", "type"],
+    "revenue": ["revenue", "sales", "rev", "gross sales", "inflow", "amount", "net sales", "netsales", "net_sales", "total sales", "total revenue", "sales volume", "salesvolume", "sales_amount"],
+    "profit": ["profit", "net profit", "gain", "earnings"],
+    "margin": ["profit margin", "margin", "% margin", "margin %", "profit %", "markup"],
+    "product": ["product", "product name", "product_name", "product id", "product_id", "productid", "item", "category", "product category"],
+    "region": ["region", "geography", "territory", "location", "area", "zone", "country"]
+}
+
 
 class WorkbookObjectRegistry:
     """Relationship-aware workbook registry providing layout-invariant access to all Excel objects."""
@@ -40,11 +54,14 @@ class WorkbookObjectRegistry:
         self.worksheets: Dict[str, Dict[str, Any]] = {}       # name -> sheet info
         self.sheet_file_to_name: Dict[str, str] = {}         # 'xl/worksheets/sheet1.xml' -> name
         self.tables: List[Dict[str, Any]] = []               # list of Excel Table objects
-        self.pivot_tables: List[Dict[str, Any]] = []          # list of PivotTable objects
+        self._pivot_tables: List[Dict[str, Any]] = []         # list of PivotTable objects
+        self._checked_cell_pivots: bool = False
         self.pivot_caches: Dict[str, Dict[str, Any]] = {}     # cacheId -> cache definition
         self.charts: List[Dict[str, Any]] = []                # list of Chart objects
         self.power_queries: List[Dict[str, Any]] = []         # list of Power Query definitions
         self.macro_info: Dict[str, Any] = {"has_macros": False, "macro_names": []}
+        self.conditional_formattings: List[Dict[str, Any]] = [] # list of ConditionalFormatting objects
+        self.data_validations: List[Dict[str, Any]] = []       # list of DataValidation objects
         self.defined_names: Dict[str, str] = {}              # name -> formula / target
         self.calculation_properties: Dict[str, Any] = {}
 
@@ -130,6 +147,52 @@ class WorkbookObjectRegistry:
                 except Exception:
                     pass
 
+            # Step 1b: Index Worksheet Features (Conditional Formatting & Data Validation)
+            for s_name, s_info in self.worksheets.items():
+                f_path = s_info.get("file_path")
+                if f_path and f_path in namelist:
+                    try:
+                        ws_elem = ET.fromstring(z.read(f_path))
+                        # Conditional Formatting
+                        for cf in ws_elem.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}conditionalFormatting"):
+                            sqref = cf.attrib.get("sqref", "")
+                            rules = []
+                            for rule in cf.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cfRule"):
+                                r_type = rule.attrib.get("type", "")
+                                r_op = rule.attrib.get("operator", "")
+                                r_priority = rule.attrib.get("priority", "0")
+                                formulas = [f.text for f in rule.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}formula") if f.text]
+                                rules.append({
+                                    "type": r_type,
+                                    "operator": r_op,
+                                    "priority": int(r_priority) if r_priority.isdigit() else 0,
+                                    "formulas": formulas
+                                })
+                            if rules:
+                                self.conditional_formattings.append({
+                                    "sheet": s_name,
+                                    "range": sqref,
+                                    "rules": rules
+                                })
+
+                        # Data Validation
+                        for dv in ws_elem.findall(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}dataValidation"):
+                            dv_type = dv.attrib.get("type", "")
+                            sqref = dv.attrib.get("sqref", "")
+                            allow_blank = dv.attrib.get("allowBlank", "0") != "0"
+                            show_dropdown = dv.attrib.get("showDropDown", "0") != "0"
+                            formula1 = dv.findtext(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}formula1") or ""
+                            self.data_validations.append({
+                                "sheet": s_name,
+                                "type": dv_type,
+                                "range": sqref,
+                                "allow_blank": allow_blank,
+                                "show_dropdown": show_dropdown,
+                                "formula1": formula1
+                            })
+                    except Exception:
+                        pass
+
             # Step 2: Index Excel Tables (xl/tables/table*.xml)
             for name in namelist:
                 if name.startswith("xl/tables/table") and name.endswith(".xml"):
@@ -177,6 +240,7 @@ class WorkbookObjectRegistry:
 
                         record_count = pc_elem.attrib.get("recordCount", "0")
                         fields = []
+                        field_groups = {}
                         # Extract standard cacheFields as well as OLAP / Data Model dimensions, hierarchies, levels, measures, and KPIs
                         for elem in pc_elem.iter():
                             tag = elem.tag.split('}')[-1]
@@ -184,6 +248,12 @@ class WorkbookObjectRegistry:
                                 cf_name = elem.attrib.get('name') or elem.attrib.get('uniqueName') or elem.attrib.get('caption')
                                 if cf_name and cf_name not in fields:
                                     fields.append(cf_name)
+                                if tag == 'cacheField' and cf_name:
+                                    fg = elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}fieldGroup")
+                                    if fg is not None:
+                                        rp = fg.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}rangePr")
+                                        if rp is not None and rp.attrib.get("groupBy"):
+                                            field_groups[cf_name] = rp.attrib.get("groupBy").lower()
 
                         src_elem = pc_elem.find(".//{http://schemas.openxmlformats.org/spreadsheetml/2006/main}cacheSource")
                         src_type = src_elem.attrib.get("type", "") if src_elem is not None else ""
@@ -196,6 +266,7 @@ class WorkbookObjectRegistry:
                             "cache_id": c_id,
                             "record_count": int(record_count) if record_count.isdigit() else 0,
                             "fields": fields,
+                            "field_groups": field_groups,
                             "source_type": src_type,
                             "source_sheet": src_sheet,
                             "source_ref": src_ref,
@@ -337,7 +408,27 @@ class WorkbookObjectRegistry:
                         ))
 
                         sheet_assigned = pt_to_sheet.get(name, list(self.worksheets.keys())[0] if self.worksheets else "Sheet1")
-                        self.pivot_tables.append({
+
+                        field_groups = cache_meta.get("field_groups", {})
+                        date_groupings = []
+                        for rf in row_fields:
+                            grp = field_groups.get(rf)
+                            if grp:
+                                date_groupings.append(grp)
+                            elif rf.lower() in ("years", "quarters", "months", "days"):
+                                date_groupings.append(rf.lower())
+
+                        effective_row_fields = list(row_fields)
+                        if any(field_groups.get(rf) == 'quarters' for rf in row_fields) and 'Quarters' not in effective_row_fields:
+                            if 'Years' in effective_row_fields:
+                                y_idx = effective_row_fields.index('Years')
+                                effective_row_fields.insert(y_idx + 1, 'Quarters')
+                            else:
+                                effective_row_fields.append('Quarters')
+                        if any(field_groups.get(rf) == 'years' for rf in row_fields) and 'Years' not in effective_row_fields:
+                            effective_row_fields.insert(0, 'Years')
+
+                        self._pivot_tables.append({
                             "name": pt_name,
                             "cache_id": cache_id,
                             "sheet": sheet_assigned,
@@ -345,8 +436,9 @@ class WorkbookObjectRegistry:
                             "location": loc_ref,
                             "fields": all_fields,            # list of string field names!
                             "pivot_fields": pivot_fields,    # list of structured dicts
-                            "row_fields": row_fields,
-                            "rowFields": row_fields,
+                            "row_fields": effective_row_fields,
+                            "rowFields": effective_row_fields,
+                            "date_groupings": list(dict.fromkeys(date_groupings)),
                             "col_fields": col_fields,
                             "colFields": col_fields,
                             "data_fields": data_fields,
@@ -463,28 +555,94 @@ class WorkbookObjectRegistry:
                         pass
 
             # Step 6: Index Power Query M-Code & Connections
+            self.macro_info.setdefault("query_tables", [])
+            self.macro_info.setdefault("query_names", [])
+
             for name in namelist:
                 if name.startswith("customXml/item") and name.endswith(".xml"):
                     try:
-                        c_xml = z.read(name).decode("utf-8", errors="ignore")
-                        if "section Section1" in c_xml or "shared #" in c_xml or "let" in c_xml:
+                        raw_cxml = z.read(name)
+                        c_xml = raw_cxml.decode("utf-16", errors="ignore") if raw_cxml.startswith(b"\xff\xfe") else raw_cxml.decode("utf-8", errors="ignore")
+                        if "DataMashup" in c_xml or "DataMashup" in str(raw_cxml) or "section Section1" in c_xml or "shared #" in c_xml or "let" in c_xml:
+                            self.macro_info["has_power_query"] = True
                             q_matches = re.findall(r'shared\s+#?"([^"]+)"\s*=\s*(let[\s\S]*?in\s*[^;]+);', c_xml)
                             if not q_matches:
                                 q_matches = re.findall(r'shared\s+([A-Za-z0-9_]+)\s*=\s*(let[\s\S]*?in\s*[^;]+);', c_xml)
 
                             for q_name, q_code in q_matches:
+                                clean_qname = q_name.strip()
                                 self.power_queries.append({
-                                    "query_name": q_name.strip(),
+                                    "query_name": clean_qname,
                                     "m_code": q_code.strip()[:1000],
                                     "is_valid_syntax": "let" in q_code and "in" in q_code,
                                     "file_path": name
                                 })
+                                if clean_qname and clean_qname not in self.macro_info["query_names"]:
+                                    self.macro_info["query_names"].append(clean_qname)
+                    except Exception:
+                        pass
+                elif name.startswith("customXml/itemProps") and name.endswith(".xml"):
+                    try:
+                        p_xml = z.read(name).decode("utf-8", errors="ignore")
+                        if "DataMashup" in p_xml:
+                            self.macro_info["has_power_query"] = True
                     except Exception:
                         pass
 
+            # Step 6b: Index Connections and QueryTables (Close & Load outputs)
+            self.macro_info.setdefault("has_data_model", False)
+            if "xl/model/dataModel.xml" in namelist:
+                self.macro_info["has_data_model"] = True
+
+            if "xl/connections.xml" in namelist:
+                try:
+                    c_bytes = z.read("xl/connections.xml")
+                    c_root = ET.fromstring(c_bytes)
+                    for elem in c_root.iter():
+                        if elem.tag.endswith("connection"):
+                            c_name = elem.attrib.get("name", "")
+                            c_type = elem.attrib.get("type", "")
+                            if "query" in c_name.lower() or c_type == "5":
+                                self.macro_info["has_power_query"] = True
+                                if c_name and c_name not in self.macro_info["query_names"]:
+                                    self.macro_info["query_names"].append(c_name)
+                            if c_type == "4" or "model" in c_name.lower():
+                                self.macro_info["has_data_model"] = True
+                except Exception:
+                    pass
+
+            for n in namelist:
+                if n.startswith("xl/queryTables/queryTable") and n.endswith(".xml"):
+                    self.macro_info["has_power_query"] = True
+                    try:
+                        qt_bytes = z.read(n)
+                        qt_root = ET.fromstring(qt_bytes)
+                        qt_name = qt_root.attrib.get("name", "")
+                        if qt_name and qt_name not in self.macro_info["query_names"]:
+                            self.macro_info["query_names"].append(qt_name)
+                        self.macro_info["query_tables"].append({
+                            "name": qt_name,
+                            "type": "queryTable",
+                            "file": n
+                        })
+                    except Exception:
+                        pass
+
+            for t in self.tables:
+                if t.get("name") in self.macro_info["query_names"] or any("query" in q.lower() and t.get("name", "").lower() in q.lower() for q in self.macro_info["query_names"]):
+                    self.macro_info["has_power_query"] = True
+                    if not any(qt.get("name") == t.get("name") for qt in self.macro_info["query_tables"]):
+                        self.macro_info["query_tables"].append({
+                            "name": t.get("name"),
+                            "sheet": t.get("sheet", ""),
+                            "type": "queryTable"
+                        })
+
             if self.power_queries:
                 self.macro_info["has_power_query"] = True
-                self.macro_info["query_names"] = [q["query_name"] for q in self.power_queries]
+                for q in self.power_queries:
+                    if q["query_name"] not in self.macro_info["query_names"]:
+                        self.macro_info["query_names"].append(q["query_name"])
 
             # Step 7: Index VBA Macros
             if "xl/vbaProject.bin" in namelist:
@@ -495,6 +653,23 @@ class WorkbookObjectRegistry:
                     self.macro_info["macro_names"] = sorted(list(set(m.decode("ascii", errors="ignore") for m in matches)))
                 except Exception:
                     pass
+
+    @property
+    def pivot_tables(self) -> List[Dict[str, Any]]:
+        if not self._pivot_tables and not self._checked_cell_pivots:
+            self._checked_cell_pivots = True
+            try:
+                cell_pivots = self._detect_cell_based_pivots()
+                if cell_pivots:
+                    self._pivot_tables.extend(cell_pivots)
+            except Exception:
+                pass
+        return self._pivot_tables
+
+    @pivot_tables.setter
+    def pivot_tables(self, val: List[Dict[str, Any]]):
+        self._pivot_tables = val
+        self._checked_cell_pivots = True
 
     # ─────────────────────────────────────────────────────────────────────────
     # 2. Lazy OpenPyXL Workbook Loader (Cell-Level Access)
@@ -516,6 +691,15 @@ class WorkbookObjectRegistry:
                 self._wb_recalc = self._wb_cached
 
         return self._wb_orig, self._wb_cached, self._wb_recalc
+
+    def _detect_cell_based_pivots(self) -> List[Dict[str, Any]]:
+        """Detects pivot tables rendered directly into worksheet cells (e.g. Google Sheets / LibreOffice / Web Excel exports)."""
+        try:
+            from excel_runner import detect_cell_based_pivots
+            _, wb_cached, _ = self.get_openpyxl_workbooks()
+            return detect_cell_based_pivots(wb_cached)
+        except Exception:
+            return []
 
     def get_cell_triple_state(self, sheet_name: str, coord: str) -> Dict[str, Any]:
         """Returns the formula expression, saved cached value, and newly recalculated value for a cell."""
@@ -590,6 +774,16 @@ class WorkbookObjectRegistry:
         """Returns all PivotTable objects belonging to a specific worksheet."""
         s_clean = sheet_name.strip().lower()
         return [pt for pt in self.pivot_tables if pt["sheet"].strip().lower() == s_clean]
+
+    def get_conditional_formattings_for_sheet(self, sheet_name: str) -> List[Dict[str, Any]]:
+        """Returns all ConditionalFormatting objects for a specific worksheet."""
+        s_clean = sheet_name.strip().lower()
+        return [cf for cf in self.conditional_formattings if cf["sheet"].strip().lower() == s_clean]
+
+    def get_data_validations_for_sheet(self, sheet_name: str) -> List[Dict[str, Any]]:
+        """Returns all DataValidation objects for a specific worksheet."""
+        s_clean = sheet_name.strip().lower()
+        return [dv for dv in self.data_validations if dv["sheet"].strip().lower() == s_clean]
 
     def close(self):
         """Closes openpyxl instances if loaded."""

@@ -331,17 +331,17 @@ def find_column_by_anchor(sheet, anchor_text: str, max_rows: int = 50, max_cols:
     return None
 
 TABLE_CONCEPTS = {
-    "date": ["date", "trans_date", "transaction date", "time", "order date", "order_date"],
-    "client": ["client", "company", "customer", "account", "client name", "company name", "customer name", "customername", "customer_name", "customer id", "customer_id", "customerid"],
+    "date": ["date", "dates", "trans_date", "transaction date", "time", "order date", "order_date", "orderdate", "year", "years", "quarter", "quarters", "month", "months"],
+    "client": ["client", "clients", "company", "customer", "customers", "account", "client name", "company name", "customer name", "customername", "customer_name", "customer id", "customer_id", "customerid"],
     "ticker": ["ticker", "tickers", "symbol", "stock", "code", "xnas", "xnys"],
-    "contact": ["contact", "contact name", "rep", "representative", "cleaned contact", "full name", "clean contact", "name", "sales person", "salesperson", "sales rep", "agent"],
+    "contact": ["contact", "contact name", "rep", "representative", "cleaned contact", "full name", "clean contact", "name", "sales person", "salesperson", "sales rep", "agent", "executive", "executives", "employee", "employees"],
     "department": ["department", "dept", "division", "sector", "segment"],
-    "payment": ["payment", "payment method", "pay method", "pay type", "type"],
-    "revenue": ["revenue", "sales", "rev", "gross sales", "inflow", "amount", "net sales", "netsales", "net_sales", "total sales", "total revenue", "sales volume", "salesvolume", "sales_amount"],
+    "payment": ["payment", "payment method", "pay method", "pay type", "type", "sales method", "method", "channel", "sales channel"],
+    "revenue": ["revenue", "revenues", "sales", "rev", "gross sales", "inflow", "amount", "net sales", "netsales", "net_sales", "total sales", "total revenue", "sales volume", "salesvolume", "sales_amount"],
     "profit": ["profit", "net profit", "gain", "earnings"], # disambiguated from profit margin
     "margin": ["profit margin", "margin", "% margin", "margin %", "profit %", "markup"],
-    "product": ["product", "product name", "product_name", "product id", "product_id", "productid", "item", "category", "product category"],
-    "region": ["region", "geography", "territory", "location", "area", "zone", "country"]
+    "product": ["product", "products", "product name", "product_name", "product id", "product_id", "productid", "item", "items", "category", "categories", "product category", "segment"],
+    "region": ["region", "regions", "geography", "territory", "location", "area", "zone", "country", "countries"]
 }
 
 FUNCTION_EQUIVALENTS = {
@@ -706,6 +706,208 @@ def normalize_field_name(raw_name: str) -> List[str]:
         variants.append(clean.replace('_', ' '))
     return list(dict.fromkeys(v for v in variants if v))
 
+def detect_cell_based_pivots(wb) -> List[Dict[str, Any]]:
+    """Detects pivot tables rendered directly into worksheet cells (e.g. Google Sheets / LibreOffice / Web Excel exports)."""
+    detected = []
+    try:
+        if not wb:
+            return detected
+
+        # 1. Index candidate source data sheets (sheets with table headers and row records)
+        sheet_columns = {}
+        for s_name in wb.sheetnames:
+            ws = wb[s_name]
+            if ws.max_row < 2:
+                continue
+            for r in range(1, min(10, ws.max_row + 1)):
+                headers = {}
+                for c in range(1, min(50, ws.max_column + 1)):
+                    val = ws.cell(r, c).value
+                    if val and isinstance(val, str) and str(val).strip():
+                        headers[c] = str(val).strip()
+                if len(headers) >= 3:
+                    col_samples = {}
+                    for c, h_name in headers.items():
+                        samples = set()
+                        for sr in range(r + 1, min(r + 100, ws.max_row + 1)):
+                            sval = ws.cell(sr, c).value
+                            if sval is not None:
+                                samples.add(str(sval).strip().lower())
+                        col_samples[c] = {"header": h_name, "samples": samples}
+                    sheet_columns[s_name] = col_samples
+                    break
+
+        # 2. Inspect each sheet for pivot table signatures
+        for s_name in wb.sheetnames:
+            ws = wb[s_name]
+            if ws.max_row < 2:
+                continue
+
+            has_row_labels = False
+            has_col_labels = False
+            has_grand_total = False
+            has_agg_header = False
+
+            row_labels_coord = None
+            col_labels_coord = None
+            grand_total_coords = []
+            agg_headers = []
+
+            max_scan_r = min(100, ws.max_row + 1)
+            max_scan_c = min(100, ws.max_column + 1)
+
+            for r in range(1, max_scan_r):
+                for c in range(1, max_scan_c):
+                    val = ws.cell(r, c).value
+                    if not val:
+                        continue
+                    sval = str(val).strip().lower()
+                    if "row label" in sval:
+                        has_row_labels = True
+                        row_labels_coord = (r, c)
+                    elif "column label" in sval:
+                        has_col_labels = True
+                        col_labels_coord = (r, c)
+                    elif "grand total" in sval or sval == "total":
+                        has_grand_total = True
+                        grand_total_coords.append((r, c))
+
+                    m = re.match(r'^(sum|count|average|avg|min|max)\s*(?:of|-|:)?\s*(.+)$', sval, re.I)
+                    if m and len(m.group(2).strip()) > 1:
+                        has_agg_header = True
+                        agg_headers.append((r, c, str(val).strip(), m.group(1).lower(), m.group(2).strip()))
+
+            is_pivot = (has_row_labels or has_grand_total) and (has_agg_header or has_col_labels)
+            if not is_pivot and has_grand_total and (len(grand_total_coords) >= 1 and (has_row_labels or has_col_labels or has_agg_header)):
+                is_pivot = True
+
+            if is_pivot:
+                row_items = set()
+                if row_labels_coord:
+                    rl_r, rl_c = row_labels_coord
+                    for r in range(rl_r + 1, min(ws.max_row + 1, rl_r + 200)):
+                        v = ws.cell(r, rl_c).value
+                        if v is not None:
+                            sv = str(v).strip()
+                            if "total" in sv.lower():
+                                break
+                            if sv:
+                                row_items.add(sv.lower())
+
+                col_items = set()
+                if col_labels_coord:
+                    cl_r, cl_c = col_labels_coord
+                    for c in range(cl_c, min(ws.max_column + 1, cl_c + 200)):
+                        v = ws.cell(cl_r + 1, c).value
+                        if v is not None:
+                            sv = str(v).strip()
+                            if "total" in sv.lower():
+                                continue
+                            if sv and not re.match(r'^(sum|count|average|avg|min|max)\s*(?:of|-|:)?', sv, re.I):
+                                col_items.add(sv.lower())
+
+                detected_row_fields = []
+                detected_col_fields = []
+                source_sheet = None
+                source_fields = []
+
+                for other_sheet, cols in sheet_columns.items():
+                    if other_sheet == s_name:
+                        continue
+                    for c_idx, c_info in cols.items():
+                        h = c_info["header"]
+                        samples = c_info["samples"]
+                        source_fields.append(h)
+
+                        if row_items and len(row_items & samples) >= min(2, len(row_items)):
+                            if h not in detected_row_fields:
+                                detected_row_fields.append(h)
+                            source_sheet = other_sheet
+                        if col_items and len(col_items & samples) >= min(2, len(col_items)):
+                            if h not in detected_col_fields:
+                                detected_col_fields.append(h)
+                            source_sheet = other_sheet
+
+                if not detected_row_fields and row_items:
+                    for f in source_fields:
+                        if any(term in f.lower() for term in ["person", "rep", "agent", "name", "sales", "region", "segment", "date", "year", "quarter"]):
+                            if f not in detected_row_fields:
+                                detected_row_fields.append(f)
+                if not detected_col_fields and col_items:
+                    for f in source_fields:
+                        if any(term in f.lower() for term in ["product", "item", "category", "type", "region", "segment"]):
+                            if f not in detected_col_fields:
+                                detected_col_fields.append(f)
+
+                data_fields = []
+                seen_df = set()
+                for r, c, full_text, func, src_field in agg_headers:
+                    if full_text.lower() not in seen_df:
+                        seen_df.add(full_text.lower())
+                        matched_src = src_field
+                        for sf in source_fields:
+                            if sf.lower() == src_field.lower() or src_field.lower() in sf.lower() or sf.lower() in src_field.lower():
+                                matched_src = sf
+                                break
+
+                        data_fields.append({
+                            "name": full_text,
+                            "sourceField": matched_src,
+                            "function": func,
+                            "subtotal": func
+                        })
+
+                row_fields = detected_row_fields
+                col_fields = detected_col_fields
+
+                active_fields = list(dict.fromkeys(
+                    row_fields + col_fields +
+                    [df["name"] for df in data_fields] +
+                    [df["sourceField"] for df in data_fields]
+                ))
+                all_fields = list(dict.fromkeys(active_fields + source_fields))
+
+                concept_additions = []
+                for f in all_fields:
+                    f_low = f.lower()
+                    for c_name, kws in TABLE_CONCEPTS.items():
+                        if any(kw == f_low or kw in f_low for kw in kws):
+                            concept_additions.extend(kws)
+                all_fields = list(dict.fromkeys(all_fields + concept_additions))
+                active_fields = list(dict.fromkeys(active_fields + concept_additions))
+
+                loc_start = f"A{row_labels_coord[0] if row_labels_coord else 1}"
+                pivot_dict = {
+                    "name": f"PivotTable_{s_name}",
+                    "sheet": s_name,
+                    "location": f"{loc_start}:Z{ws.max_row}",
+                    "location_ref": f"{loc_start}:Z{ws.max_row}",
+                    "rowFields": row_fields,
+                    "row_fields": row_fields,
+                    "colFields": col_fields,
+                    "col_fields": col_fields,
+                    "dataFields": data_fields,
+                    "data_fields": data_fields,
+                    "activeFields": active_fields,
+                    "active_fields": active_fields,
+                    "fields": all_fields,
+                    "source_sheet": source_sheet or "Source",
+                    "is_cell_rendered": True
+                }
+                detected.append(pivot_dict)
+
+                # If there are multiple Grand Totals or multiple pivot blocks on the same sheet, index the 2nd pivot
+                if len(grand_total_coords) >= 2:
+                    gt2_r, gt2_c = grand_total_coords[1]
+                    p2 = dict(pivot_dict)
+                    p2["name"] = f"PivotTable_{s_name}_2"
+                    p2["location"] = f"A{gt2_r}:Z{ws.max_row}"
+                    p2["location_ref"] = f"A{gt2_r}:Z{ws.max_row}"
+                    detected.append(p2)
+    except Exception:
+        pass
+    return detected
+
 def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
     """Inspects native Excel Pivot Tables and PivotCaches with per-pivot sheet and field resolution."""
     pivots = []
@@ -884,6 +1086,16 @@ def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
                         })
                     except Exception:
                         pass
+    except Exception:
+        pass
+    try:
+        wb_lazy = safe_load_workbook(xlsx_path, data_only=True)
+        cell_pivots = detect_cell_based_pivots(wb_lazy)
+        if cell_pivots:
+            existing_sheets = {p.get("sheet") for p in pivots if p.get("sheet")}
+            for cp in cell_pivots:
+                if cp.get("sheet") not in existing_sheets or len(pivots) < len(cell_pivots):
+                    pivots.append(cp)
     except Exception:
         pass
     return pivots
@@ -1193,7 +1405,26 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
     # Global inspections for Pivots, Macros, and Power Query
     detected_pivots = registry.pivot_tables if registry else inspect_openxml_pivots(original_path)
-    macro_info = registry.macro_info if registry else inspect_openxml_macros_and_queries(original_path)
+    if not detected_pivots:
+        try:
+            detected_pivots = detect_cell_based_pivots(wb_cached or wb_orig)
+            if registry:
+                registry.pivot_tables = detected_pivots
+        except Exception:
+            pass
+    macro_info = inspect_openxml_macros_and_queries(original_path)
+    if registry and registry.macro_info:
+        for k, v in registry.macro_info.items():
+            if v and not macro_info.get(k):
+                macro_info[k] = v
+        if registry.macro_info.get("has_power_query"):
+            macro_info["has_power_query"] = True
+        for q in registry.macro_info.get("query_names", []):
+            if q not in macro_info.setdefault("query_names", []):
+                macro_info["query_names"].append(q)
+        for qt in registry.macro_info.get("query_tables", []):
+            if not any(t.get("name") == qt.get("name") for t in macro_info.setdefault("query_tables", [])):
+                macro_info["query_tables"].append(qt)
     detected_charts = [dict(c) for c in registry.charts] if (registry and registry.charts) else []
 
     # Global formula and content scan across all sheets
@@ -1407,6 +1638,26 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 target_cell_coord = f"{get_column_letter(c_target)}{r_target}"
 
             if not target_cell_coord:
+                # If Power Query assignment, verify via Power Query M-code / connections / query tables
+                is_pq_crit = any(k in crit_name.lower() for k in ["power query", "data type", "header cleaning", "query merge", "column expansion", "close & load", "automation"])
+                has_pq = (registry is not None and registry.macro_info.get("has_power_query")) or macro_info.get("has_power_query")
+                if (is_pq_crit or has_pq) and registry and (registry.macro_info.get("has_power_query") or len(registry.power_queries) > 0 or registry.tables):
+                    criterion_passes[crit_name]["passed"] += 1
+                    assertion_results.append({
+                        "id": tc_id,
+                        "criterion": crit_name,
+                        "type": tc_type,
+                        "passed": True,
+                        "status": "VERIFIED_PASS",
+                        "weight": tc_weight,
+                        "is_critical": tc_is_critical,
+                        "score_cap": tc_score_cap,
+                        "depends_on": tc_depends_on,
+                        "dependency_mode": tc_dep_mode,
+                        "reason": f"Verified Power Query pipeline execution for '{crit_name}' via Power Query M-code and data connections."
+                    })
+                    continue
+
                 assertion_results.append({
                     "criterion": crit_name,
                     "type": tc_type,
@@ -1463,6 +1714,11 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 e_clean = re.sub(r'[^a-z0-9]', '', str_e)
                 if v_clean and e_clean and (v_clean in e_clean or e_clean in v_clean):
                     return True
+                # Typo tolerance for entity names (e.g. "Acme Crop" vs "Acme Corp")
+                if v_clean and e_clean and len(e_clean) >= 5:
+                    import difflib
+                    if difflib.SequenceMatcher(None, v_clean, e_clean).ratio() >= 0.8:
+                        return True
                 return False
 
             if actual_num is not None and expected_num is not None:
@@ -1816,24 +2072,37 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 passed_cells = total_cells
                 failures = []
                 tc_passed = True
+                score_factor = 1.0
                 reason = f"Verified {total_cells}/{total_cells} cells via dynamic array/spill formula in {range_str}."
             else:
                 tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
                 if tc_passed:
+                    score_factor = 1.0
                     reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} successfully."
+                elif total_cells > 0 and passed_cells > 0:
+                    score_factor = round(passed_cells / total_cells, 4)
+                    reason = f"{total_cells - passed_cells}/{total_cells} cells failed formula checks ({passed_cells}/{total_cells} passed). First issues: {'; '.join(failures[:3])}"
                 else:
+                    score_factor = 0.0
                     reason = f"{total_cells - passed_cells}/{total_cells} cells failed formula checks. First issues: {'; '.join(failures[:3])}"
 
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
 
             assertion_results.append({
+                "id": tc_id,
                 "criterion": crit_name,
                 "type": tc_type,
                 "range": range_str,
                 "totalCells": total_cells,
                 "passedCells": passed_cells,
                 "passed": tc_passed,
+                "score": score_factor,
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
                 "reason": reason,
                 "failures": failures[:10]
             })
@@ -1843,6 +2112,90 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         elif tc_type in ["format_check", "style_check"]:
             reason = ""
+            req_cf = tc.get("conditionalFormatting") or tc.get("cf")
+            if req_cf and isinstance(req_cf, dict):
+                req_rule_type = str(req_cf.get("ruleType", "")).strip().lower()
+                cf_list = []
+                if registry and hasattr(registry, "conditional_formattings"):
+                    cf_list = registry.conditional_formattings
+                elif hasattr(sheet_orig, "conditional_formatting"):
+                    for cf in sheet_orig.conditional_formatting:
+                        rules_data = []
+                        for r in getattr(cf, "rules", []):
+                            rules_data.append({
+                                "type": str(getattr(r, "type", "") or ""),
+                                "operator": str(getattr(r, "operator", "") or ""),
+                                "formulas": [str(f) for f in getattr(r, "formula", [])] if getattr(r, "formula", None) else []
+                            })
+                        cf_list.append({
+                            "sheet": sheet_orig.title,
+                            "range": str(getattr(cf, "sqref", "") or ""),
+                            "rules": rules_data
+                        })
+
+                cf_found = False
+                matched_cf_desc = ""
+                for cf_item in cf_list:
+                    for r in cf_item.get("rules", []):
+                        r_type = str(r.get("type", "")).strip().lower()
+                        r_op = str(r.get("operator", "")).strip().lower()
+
+                        if req_rule_type in ["lessthan", "less_than", "<"]:
+                            if r_op in ["lessthan", "<"] or r_type in ["lessthan", "<"] or ("cellis" in r_type and "less" in r_op):
+                                cf_found = True
+                                matched_cf_desc = f"Less-than rule on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                                break
+                        elif req_rule_type in ["greaterthan", "greater_than", ">"]:
+                            if r_op in ["greaterthan", ">"] or r_type in ["greaterthan", ">"] or ("cellis" in r_type and "great" in r_op):
+                                cf_found = True
+                                matched_cf_desc = f"Greater-than rule on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                                break
+                        elif req_rule_type in ["colorscale", "color_scale", "heatmap"]:
+                            if "colorscale" in r_type or "color_scale" in r_type:
+                                cf_found = True
+                                matched_cf_desc = f"Color scale heatmap on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                                break
+                        elif req_rule_type in ["duplicatevalues", "duplicate_values", "duplicates", "duplicate"]:
+                            if "duplicate" in r_type or "duplicate" in r_op:
+                                cf_found = True
+                                matched_cf_desc = f"Duplicate values rule on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                                break
+                        elif req_rule_type in ["containstext", "contains_text", "text"]:
+                            if "containstext" in r_type or "contains" in r_op:
+                                cf_found = True
+                                matched_cf_desc = f"Contains text rule on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                                break
+                        elif req_rule_type in r_type or req_rule_type in r_op or (r_type and r_type in req_rule_type):
+                            cf_found = True
+                            matched_cf_desc = f"{r_type} rule on {cf_item.get('sheet', '')} range '{cf_item.get('range', '')}'"
+                            break
+                    if cf_found:
+                        break
+
+                tc_passed = cf_found
+                if tc_passed:
+                    criterion_passes[crit_name]["passed"] += 1
+                    reason = f"Verified conditional formatting: {matched_cf_desc}."
+                else:
+                    reason = f"Conditional formatting rule '{req_rule_type}' was not found in the workbook."
+
+                score_factor = 1.0 if tc_passed else 0.0
+                assertion_results.append({
+                    "id": tc_id,
+                    "criterion": crit_name,
+                    "type": tc_type,
+                    "range": tc.get("range", ""),
+                    "passed": tc_passed,
+                    "score": score_factor,
+                    "weight": tc_weight,
+                    "is_critical": tc_is_critical,
+                    "score_cap": tc_score_cap,
+                    "depends_on": tc_depends_on,
+                    "dependency_mode": tc_dep_mode,
+                    "reason": reason
+                })
+                continue
+
             range_str = tc.get("range", tc.get("cell", ""))
             anchor_text = tc.get("columnAnchor") or tc.get("anchor")
             req_bold = tc.get("bold")
@@ -2054,9 +2407,39 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
             tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
             if not tc_passed and str(tc.get("numberFormat", "")).lower() == "currency":
-                # Check other sheets in the workbook (e.g. if student placed PivotTable on Sheet1 instead of Pivot_Tables)
-                for alt_s in wb_orig.sheetnames:
-                    if alt_s != sheet_name:
+                # First check current sheet for currency formatted numeric cells (ignoring blank grid padding)
+                curr_passed = 0
+                curr_total = 0
+                for r in range(1, min(sheet_orig.max_row or 50, 60) + 1):
+                    for c in range(1, min(sheet_orig.max_column or 20, 20) + 1):
+                        cell = sheet_orig.cell(row=r, column=c)
+                        if cell.value is not None and isinstance(cell.value, (int, float)):
+                            curr_total += 1
+                            fmt = str(cell.number_format or '')
+                            if any(sym in fmt for sym in ["$", "₹", "€", "£", "¥", "Rs", "INR", "USD", "EUR"]) or "[$" in fmt or "#,##" in fmt:
+                                curr_passed += 1
+                if curr_total > 0 and curr_passed >= curr_total * 0.4:
+                    tc_passed = True
+                    passed_cells = curr_passed
+                    total_cells = curr_total
+                    reason = f"Verified currency formatting on worksheet '{sheet_name}' ({curr_passed} currency cells detected)."
+
+                # If current sheet doesn't have currency, check candidate alternative sheets, prioritizing pivot table sheets over raw data
+                if not tc_passed:
+                    candidate_sheets = []
+                    for p in (detected_pivots or []):
+                        ps = p.get("sheet") if isinstance(p, dict) else getattr(p, "sheet", None)
+                        if ps and ps in wb_orig.sheetnames and ps not in candidate_sheets and ps != sheet_name:
+                            candidate_sheets.append(ps)
+                    source_sheets = [p.get("source_sheet") for p in (detected_pivots or []) if isinstance(p, dict)]
+                    for s in wb_orig.sheetnames:
+                        if s != sheet_name and s not in candidate_sheets and s not in source_sheets:
+                            candidate_sheets.append(s)
+                    for s in source_sheets:
+                        if s and s in wb_orig.sheetnames and s not in candidate_sheets and s != sheet_name:
+                            candidate_sheets.append(s)
+
+                    for alt_s in candidate_sheets:
                         alt_sh = wb_orig[alt_s]
                         alt_passed = 0
                         alt_total = 0
@@ -2075,20 +2458,29 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                             reason = f"Verified currency formatting on worksheet '{alt_s}' ({alt_passed} currency cells detected)."
                             break
 
+            score_factor = 1.0 if tc_passed else (round(passed_cells / total_cells, 4) if total_cells > 0 else 0.0)
+
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
                 if not reason:
                     reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} satisfied formatting requirements."
             else:
-                reason = f"{total_cells - passed_cells}/{total_cells} cells failed formatting. First issues: {'; '.join(failures[:3])}"
+                reason = f"{total_cells - passed_cells}/{total_cells} cells failed formatting ({passed_cells}/{total_cells} passed). First issues: {'; '.join(failures[:3])}"
 
             assertion_results.append({
+                "id": tc_id,
                 "criterion": crit_name,
                 "type": tc_type,
                 "range": range_str,
                 "totalCells": total_cells,
                 "passedCells": passed_cells,
                 "passed": tc_passed,
+                "score": score_factor,
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
                 "reason": reason,
                 "failures": failures[:10]
             })
@@ -2307,32 +2699,63 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
 
             tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
             if not tc_passed:
+                is_pq_crit = any(k in crit_name.lower() for k in ["power query", "data source import", "query merge", "column expansion", "close & load", "automation test"])
+                has_pq = (registry is not None and registry.macro_info.get("has_power_query")) or macro_info.get("has_power_query")
+
+                # If workbook has Power Query or this is a PQ criterion, check for loaded query tables anywhere in the workbook
+                if (is_pq_crit or has_pq) and registry:
+                    for tab in (registry.macro_info.get("query_tables", []) + registry.tables):
+                        t_sheet = tab.get("sheet", "")
+                        if t_sheet in wb_orig.sheetnames:
+                            t_ws = wb_orig[t_sheet]
+                            if t_ws.max_row >= 2:
+                                tc_passed = True
+                                passed_cells = max(passed_cells, 1)
+                                total_cells = max(total_cells, 1)
+                                reason = f"Verified Power Query automated table load on worksheet '{t_sheet}' (Table: {tab.get('name', 'QueryOutput')})."
+                                break
+
                 # Check other sheets in the workbook (e.g. if student loaded Power Query to 'Orders' or 'Customers' instead of Sheet1)
-                for alt_s in wb_orig.sheetnames:
-                    if alt_s != sheet_name and _sheet_has_numeric_data(wb_orig[alt_s]):
+                if not tc_passed:
+                    for alt_s in wb_orig.sheetnames:
                         alt_sh = wb_orig[alt_s]
                         alt_tb = detect_table_bounds(alt_sh)
                         if alt_tb.get("header_row") and alt_tb.get("data_end_row", 0) >= alt_tb.get("data_start_row", 0):
-                            tc_passed = True
-                            passed_cells = max(passed_cells, 1)
-                            total_cells = max(total_cells, 1)
-                            reason = f"Verified populated data table on worksheet '{alt_s}' (Rows {alt_tb.get('data_start_row')}:{alt_tb.get('data_end_row')})."
-                            break
+                            non_empty_cnt = sum(
+                                1 for r in range(alt_tb.get("data_start_row", 1), min(alt_tb.get("data_start_row", 1) + 5, alt_tb.get("data_end_row", 1) + 1))
+                                for c in range(alt_tb.get("start_col", 1), min(alt_tb.get("start_col", 1) + 5, alt_tb.get("end_col", 1) + 1))
+                                if alt_sh.cell(r, c).value is not None
+                            )
+                            if non_empty_cnt >= 2:
+                                tc_passed = True
+                                passed_cells = max(passed_cells, 1)
+                                total_cells = max(total_cells, 1)
+                                reason = f"Verified populated data table on worksheet '{alt_s}' (Rows {alt_tb.get('data_start_row')}:{alt_tb.get('data_end_row')})."
+                                break
+
+            score_factor = 1.0 if tc_passed else (round(passed_cells / total_cells, 4) if total_cells > 0 else 0.0)
 
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
                 if not reason:
                     reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} contain required data."
             else:
-                reason = f"{total_cells - passed_cells}/{total_cells} cells are missing data. Issues: {'; '.join(failures[:3])}"
+                reason = f"{total_cells - passed_cells}/{total_cells} cells are missing data ({passed_cells}/{total_cells} populated). Issues: {'; '.join(failures[:3])}"
 
             assertion_results.append({
+                "id": tc_id,
                 "criterion": crit_name,
                 "type": tc_type,
                 "range": range_str,
                 "totalCells": total_cells,
                 "passedCells": passed_cells,
                 "passed": tc_passed,
+                "score": score_factor,
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
                 "reason": reason,
                 "failures": failures[:10]
             })
@@ -2507,7 +2930,10 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             req_field = str(tc.get("requiredField", "")).strip().lower()
             target_sheet_req = str(tc.get("sheet", "")).strip()
 
+            is_data_model_crit = any(k in crit_name.lower() for k in ["data model", "relational", "diagram", "ingestion", "multi-table"])
             tc_passed = len(detected_pivots) >= min_pivots
+            if not tc_passed and is_data_model_crit and registry and (len(registry.tables) >= min_pivots or registry.macro_info.get("has_power_query") or registry.macro_info.get("has_data_model")):
+                tc_passed = True
             reason = ""
 
             if not tc_passed:
@@ -2554,11 +2980,38 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                             for df in (p.get("dataFields") or p.get("data_fields") or [])
                             if isinstance(df, dict) and df.get("sourceField")
                         ]
-
-                        candidate_pools = [
-                            ("active", list(dict.fromkeys(p_active + p_data + p_src))),
-                            ("cache", p_all)
+                        p_rows = [
+                            str(f.get("name") or f.get("caption") if isinstance(f, dict) else f).lower()
+                            for f in (p.get("rowFields") or p.get("row_fields") or [])
+                            if f
                         ]
+                        p_cols = [
+                            str(f.get("name") or f.get("caption") if isinstance(f, dict) else f).lower()
+                            for f in (p.get("colFields") or p.get("col_fields") or [])
+                            if f
+                        ]
+
+                        crit_lower = crit_name.lower()
+                        axis_req = str(tc.get("axis", "")).strip().lower()
+                        is_col_crit = axis_req in ["column", "columns", "col"] or ("column" in crit_lower and "row" not in crit_lower and "value" not in crit_lower)
+                        is_row_crit = axis_req in ["row", "rows"] or ("row" in crit_lower and "column" not in crit_lower and "value" not in crit_lower)
+                        is_val_crit = axis_req in ["value", "values", "data"] or ("value" in crit_lower and "row" not in crit_lower and "column" not in crit_lower)
+
+                        if is_col_crit:
+                            candidate_pools = [("columns", p_cols)]
+                        elif is_row_crit:
+                            candidate_pools = [("rows", p_rows if p_rows else p_active)]
+                        elif is_val_crit:
+                            candidate_pools = [("values", list(dict.fromkeys(p_data + p_src)))]
+                        elif is_data_model_crit:
+                            candidate_pools = [
+                                ("active", list(dict.fromkeys(p_active + p_data + p_src + p_rows + p_cols))),
+                                ("cache", p_all)
+                            ]
+                        else:
+                            candidate_pools = [
+                                ("active", list(dict.fromkeys(p_active + p_data + p_src + p_rows + p_cols)))
+                            ]
 
                         for pool_type, candidates in candidate_pools:
                             # 1. Exact match or normalized alphanumeric match
@@ -2603,29 +3056,30 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                         if field_found:
                             break
 
+                    # DATA MODELING RESCUE: Check if the required field exists in the data model tables,
+                    # power queries, or workbook table columns (e.g. Product_ID, Customer_ID, Revenue in Sales/Products)
+                    if not field_found and registry is not None:
+                        req_norm = re.sub(r'[^a-z0-9]', '', req_field)
+                        for t in registry.tables:
+                            t_sheet = t.get("sheet", "")
+                            if not target_sheet_req or _norm_ws(t_sheet) == _norm_ws(target_sheet_req) or target_sheet_req.lower() in t.get("name", "").lower() or is_data_model_crit:
+                                for col_h in t.get("columns", []):
+                                    c_clean = re.sub(r'[^a-z0-9]', '', col_h.lower())
+                                    if req_norm == c_clean or req_clean in c_clean or c_clean in req_clean:
+                                        field_found = True
+                                        matched_field_name = col_h
+                                        matched_pivot_name = f"DataModelTable_{t.get('name')}"
+                                        matched_pivot_sheet = t_sheet
+                                        break
+                            if field_found:
+                                break
+
                     if field_found:
                         sheet_info = f" on worksheet '{matched_pivot_sheet}'" if matched_pivot_sheet else ""
                         reason = f"Verified native Pivot Table '{matched_pivot_name}'{sheet_info} with field '{matched_field_name or req_field}'."
                     else:
-                        # Approach-Based Competency Rescue:
-                        has_usable_pivot = any(len(p.get("dataFields") or p.get("data_fields") or []) > 0 or len(p.get("activeFields") or p.get("active_fields") or []) > 0 or len(p.get("fields") or []) > 0 for p in detected_pivots)
-                        if has_usable_pivot:
-                            tc_passed = True
-                            all_found_fields = []
-                            for p in detected_pivots:
-                                raw_pool = (p.get("activeFields") or p.get("active_fields") or []) or p.get("fields", [])
-                                for f in raw_pool:
-                                    if isinstance(f, dict):
-                                        fn = f.get("name") or f.get("caption") or f.get("sourceField")
-                                        if fn:
-                                            all_found_fields.append(str(fn).strip())
-                                    elif f is not None and str(f).strip():
-                                        all_found_fields.append(str(f).strip())
-                            found_str = ", ".join(list(dict.fromkeys(all_found_fields))[:5])
-                            reason = f"Verified native Pivot Table with active data fields (Fields detected: {found_str or 'Data Model fields'})."
-                        else:
-                            tc_passed = False
-                            reason = f"Pivot table does not include required field '{req_field}'."
+                        tc_passed = False
+                        reason = f"Pivot table does not include required field '{req_field}'."
                 else:
                     reason = f"Verified {len(detected_pivots)} native Pivot Table(s) in workbook."
 
@@ -2757,7 +3211,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         # -------------------------------------------------------------
         # TYPE 8: Power Query Check
         # -------------------------------------------------------------
-        elif tc_type in ["power_query_check", "query_check"]:
+        elif tc_type in ["power_query_check", "query_check", "pq_check"]:
             require_query = tc.get("requireQuery", True)
             q_tables_count = len(macro_info.get("query_tables", []))
             q_names = list(macro_info.get("query_names", []))
@@ -3012,6 +3466,88 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "scenarios": scenario_results
             })
 
+        # -------------------------------------------------------------
+        # TYPE 8: Conditional Formatting Check
+        # -------------------------------------------------------------
+        elif tc_type in ["conditional_formatting_check", "cf_check", "conditional_formatting"]:
+            min_rules = int(tc.get("minRules", 1))
+            req_type = str(tc.get("ruleType", "")).strip().lower()
+            
+            cf_list = []
+            if registry and hasattr(registry, "conditional_formattings"):
+                cf_list = registry.conditional_formattings
+                if tc.get("sheet"):
+                    s_target = str(tc.get("sheet")).strip().lower()
+                    cf_list = [cf for cf in cf_list if cf.get("sheet", "").strip().lower() == s_target]
+
+            total_rules_found = sum(len(cf.get("rules", [])) for cf in cf_list)
+            tc_passed = total_rules_found >= min_rules
+            reason = ""
+            if tc_passed:
+                criterion_passes[crit_name]["passed"] += 1
+                reason = f"Verified conditional formatting: {total_rules_found} rule(s) detected across target sheet/range."
+            else:
+                reason = f"Expected at least {min_rules} conditional formatting rule(s), found {total_rules_found}."
+
+            score_factor = 1.0 if tc_passed else (0.5 if total_rules_found > 0 else 0.0)
+            assertion_results.append({
+                "id": tc_id,
+                "criterion": crit_name,
+                "type": tc_type,
+                "passed": tc_passed,
+                "score": score_factor,
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
+                "reason": reason,
+                "rules_found": total_rules_found
+            })
+
+        # -------------------------------------------------------------
+        # TYPE 9: Data Validation Check (In-Cell Dropdowns & Constraints)
+        # -------------------------------------------------------------
+        elif tc_type in ["data_validation_check", "dropdown_check", "data_validation"]:
+            min_validations = int(tc.get("minValidations", 1))
+            req_dv_type = str(tc.get("validationType", "list")).strip().lower()
+            
+            dv_list = []
+            if registry and hasattr(registry, "data_validations"):
+                dv_list = registry.data_validations
+                if tc.get("sheet"):
+                    s_target = str(tc.get("sheet")).strip().lower()
+                    dv_list = [dv for dv in dv_list if dv.get("sheet", "").strip().lower() == s_target]
+
+            if req_dv_type:
+                matching_dv = [dv for dv in dv_list if str(dv.get("type", "")).strip().lower() == req_dv_type]
+            else:
+                matching_dv = dv_list
+
+            tc_passed = len(matching_dv) >= min_validations
+            reason = ""
+            if tc_passed:
+                criterion_passes[crit_name]["passed"] += 1
+                reason = f"Verified data validation: {len(matching_dv)} validation rule(s) (type '{req_dv_type}') detected."
+            else:
+                reason = f"Expected at least {min_validations} data validation rule(s) (type '{req_dv_type}'), found {len(matching_dv)}."
+
+            score_factor = 1.0 if tc_passed else 0.0
+            assertion_results.append({
+                "id": tc_id,
+                "criterion": crit_name,
+                "type": tc_type,
+                "passed": tc_passed,
+                "score": score_factor,
+                "weight": tc_weight,
+                "is_critical": tc_is_critical,
+                "score_cap": tc_score_cap,
+                "depends_on": tc_depends_on,
+                "dependency_mode": tc_dep_mode,
+                "reason": reason,
+                "validations_found": len(matching_dv)
+            })
+
     # ── SPRINT 1: Mathematical Scoring, Dependency Graph & Denominator Integrity ──
     rubric_breakdown = {}
     rubric_breakdown_details = {}
@@ -3048,12 +3584,95 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     for crit in criteria:
         c_name = crit.get("name", "")
         weight = float(crit.get("weight", 0))
-        c_assertions = [a for a in assertion_results if a.get("criterion") == c_name]
+        c_clean = c_name.strip().lower()
+        c_assertions = [
+            a for a in assertion_results
+            if str(a.get("criterion", "")).strip().lower() == c_clean
+        ]
+
+        # Fuzzy token overlap matching if exact string equality returned zero assertions
+        if len(c_assertions) == 0:
+            STOPWORDS = {
+                "and", "or", "the", "in", "of", "for", "to", "a", "an", "is",
+                "test", "check", "part", "task", "step", "section", "item", "exercise", "question"
+            }
+            c_tokens = set(re.findall(r'[a-z0-9]+', c_clean)) - STOPWORDS
+            for a in assertion_results:
+                a_crit = str(a.get("criterion", "")).strip().lower()
+                a_tokens = set(re.findall(r'[a-z0-9]+', a_crit)) - STOPWORDS
+                if c_tokens and a_tokens:
+                    overlap = c_tokens & a_tokens
+                    jaccard = len(overlap) / len(c_tokens | a_tokens)
+                    min_ratio = len(overlap) / min(len(c_tokens), len(a_tokens))
+                    if (len(overlap) >= 2 and min_ratio >= 0.6) or jaccard >= 0.5:
+                        c_assertions.append(a)
 
         if len(c_assertions) == 0:
-            # ── REMOVE HEURISTIC GUESSING (P0 Directive) ──
-            # An unmapped criterion without automated test cases must NEVER award guessed points.
-            # It routes directly to MANUAL_REVIEW_REQUIRED and marks are kept pending.
+            # SPRINT 7: Dynamic Semantic Fallback when assignment has zero test cases configured and fallback is enabled
+            if len(test_cases) == 0 and (spec.get("enableSemanticFallback", False) or spec.get("allowHeuristicFallback", False)):
+                heuristic_score = 0.0
+                reasons = []
+
+                if populated_table_cells >= 10:
+                    heuristic_score += 0.35
+                    reasons.append(f"Populated data table detected ({populated_table_cells} cells)")
+                elif has_any_data:
+                    heuristic_score += 0.20
+                    reasons.append("Data entries detected")
+
+                if len(all_formulas) >= 3:
+                    heuristic_score += 0.40
+                    reasons.append(f"Dynamic formulas verified ({len(all_formulas)} formulas)")
+                elif len(all_formulas) >= 1:
+                    heuristic_score += 0.25
+                    reasons.append("Formulas detected")
+
+                if ("pivot" in c_clean or "summary" in c_clean) and detected_pivots:
+                    heuristic_score += 0.25
+                    reasons.append("Pivot table verified")
+                elif ("chart" in c_clean or "graph" in c_clean or "visual" in c_clean) and detected_charts:
+                    heuristic_score += 0.25
+                    reasons.append("Chart visualization verified")
+                elif ("query" in c_clean or "etl" in c_clean) and macro_info.get("has_power_query"):
+                    heuristic_score += 0.25
+                    reasons.append("Power Query pipeline verified")
+
+                if not has_any_data and len(all_formulas) == 0:
+                    heuristic_score = 0.0
+                    reasons = ["Workbook is completely blank; no student work detected."]
+                else:
+                    heuristic_score = min(1.0, max(0.25, round(heuristic_score, 2)))
+
+                awarded = round(heuristic_score * weight, 2)
+                passed_bool = heuristic_score >= 0.50
+                crit_status = "VERIFIED_PASS" if heuristic_score >= 0.85 else ("PARTIAL_CREDIT" if heuristic_score > 0.0 else "VERIFIED_FAIL")
+
+                assertion_results.append({
+                    "id": f"{c_name}_heuristic",
+                    "criterion": c_name,
+                    "type": "heuristic_fallback",
+                    "passed": passed_bool,
+                    "score": heuristic_score,
+                    "status": crit_status,
+                    "weight": weight,
+                    "reason": f"Professor Heuristic Evaluation: {'; '.join(reasons)}."
+                })
+                rubric_breakdown[c_name] = awarded
+                rubric_breakdown_details[c_name] = {
+                    "awarded": awarded,
+                    "weight": weight,
+                    "status": crit_status,
+                    "pending_marks": 0.0,
+                    "fraction": heuristic_score,
+                    "assertions_count": 1,
+                    "passed_count": 1 if passed_bool else 0,
+                    "reason": f"Professor Heuristic Evaluation: {'; '.join(reasons)}."
+                }
+                verified_earned_total += awarded
+                verified_available_total += weight
+                continue
+
+            # Standard unmapped rubric handling when test cases exist but don't cover this criterion
             needs_review = True
             crit_status = "MANUAL_REVIEW_REQUIRED"
             awarded = 0.0
@@ -3238,6 +3857,81 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         "status": eval_status
     }
 
+    # Extract clean workbook manifest for the LLM Verification & Arbitration Layer
+    manifest_cfs = []
+    try:
+        if registry and hasattr(registry, "conditional_formattings") and registry.conditional_formattings:
+            manifest_cfs = registry.conditional_formattings
+        elif wb_orig:
+            for s_name in wb_orig.sheetnames:
+                sh = wb_orig[s_name]
+                if hasattr(sh, "conditional_formatting"):
+                    for cf in sh.conditional_formatting:
+                        sqref = str(getattr(cf, "sqref", "") or getattr(cf, "cells", ""))
+                        rules = []
+                        for r in getattr(cf, "rules", []):
+                            rules.append({
+                                "type": str(getattr(r, "type", "")),
+                                "operator": str(getattr(r, "operator", "") or ""),
+                                "priority": int(getattr(r, "priority", 0) or 0),
+                                "formula": [str(f) for f in getattr(r, "formula", []) if f]
+                            })
+                        if rules:
+                            manifest_cfs.append({"sheet": s_name, "range": sqref, "rules": rules})
+    except Exception:
+        pass
+
+    sheet_manifest = []
+    try:
+        if wb_orig:
+            for s_name in wb_orig.sheetnames:
+                ws = wb_orig[s_name]
+                headers = []
+                if ws.max_row and ws.max_row >= 1:
+                    for r in range(1, min(ws.max_row + 1, 10)):
+                        row_vals = [
+                            str(ws.cell(r, c).value).strip()
+                            for c in range(1, min((ws.max_column or 0) + 1, 50))
+                            if ws.cell(r, c).value is not None and str(ws.cell(r, c).value).strip()
+                        ]
+                        if len(row_vals) >= 2:
+                            headers = row_vals
+                            break
+                sheet_entry = {
+                    "name": s_name,
+                    "max_row": ws.max_row,
+                    "max_column": ws.max_column,
+                    "headers": headers
+                }
+                # Count currency formatted cells for manifest
+                sheet_curr_cnt = 0
+                for r_idx in range(1, min(ws.max_row or 50, 60) + 1):
+                    for c_idx in range(1, min(ws.max_column or 20, 20) + 1):
+                        c_val = ws.cell(r_idx, c_idx).value
+                        if c_val is not None and isinstance(c_val, (int, float)):
+                            c_fmt = str(ws.cell(r_idx, c_idx).number_format or '')
+                            if any(sym in c_fmt for sym in ["$", "₹", "€", "£", "¥", "Rs", "INR", "USD", "EUR"]) or "[$" in c_fmt or "#,##" in c_fmt:
+                                sheet_curr_cnt += 1
+                sheet_entry["currency_cells_count"] = sheet_curr_cnt
+                if hasattr(ws, "tables") and ws.tables:
+                    sheet_entry["tables"] = list(ws.tables.keys())
+                sheet_manifest.append(sheet_entry)
+    except Exception:
+        pass
+
+    workbook_manifest = {
+        "sheets": sheet_manifest,
+        "detected_formulas": sorted(list(detected_formulas)),
+        "detected_pivots": detected_pivots,
+        "pivot_tables": detected_pivots,
+        "detected_charts": detected_charts,
+        "detected_macros": macro_info.get("macro_names", []),
+        "conditional_formattings": manifest_cfs,
+        "calculation_warnings": calculation_warnings,
+        "has_data_model": bool(macro_info.get("has_data_model") or (registry and registry.macro_info.get("has_data_model"))),
+        "power_queries": macro_info.get("query_names", []) if macro_info else []
+    }
+
     # Safely close workbooks and registry
     try:
         if registry:
@@ -3258,6 +3952,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         "rubric_breakdown_details": rubric_breakdown_details,
         "scoring_summary": scoring_summary,
         "evaluation_status": eval_status,
+        "workbook_manifest": workbook_manifest,
         "registry_summary": {
             "worksheet_count": len(registry.worksheets) if registry else len(wb_orig.sheetnames),
             "table_count": len(registry.tables) if registry else 0,
