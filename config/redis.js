@@ -18,9 +18,14 @@ const redisConfig = {
   // (BZPOPMIN/BRPOPLPUSH); a command timeout would abort them.
   // Connection options
   retryStrategy: (times) => {
-    const delay = Math.min(times * 50, 2000);
-    logger.warn(`Redis retry attempt ${times}, delay: ${delay}ms`);
+    // Keep reconnecting on network or DNS blips with exponential backoff (up to 3s)
+    const delay = Math.min(times * 100, 3000);
+    logger.warn(`Redis reconnect attempt ${times}, retry delay: ${delay}ms`);
     return delay;
+  },
+  reconnectOnError: (err) => {
+    const targetErrors = ['READONLY', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND'];
+    return targetErrors.some((code) => err?.message?.includes(code));
   },
   
   enableReadyCheck: false,

@@ -59,12 +59,12 @@ export async function initializeVisualWorker() {
                 }
               }
 
-              // Phase 0: Check if Docker Sandbox is enabled and available
+              // Phase 0: Local Playwright execution for visual evaluation
               const sandboxMode = (process.env.SANDBOX_MODE || "docker").toLowerCase();
-              const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
+              const canUseLocal = sandboxMode !== "github";
 
-              if (canUseDocker) {
-                logger.info(`🐳 Visual Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
+              if (canUseLocal) {
+                logger.info(`🖥️ Visual Job ${job.id}: Running local Playwright evaluation. Skipping GitHub Actions.`);
                 const submission = job.data.submission || job.data;
                 const repoUrl = submission.repoUrl || submission.submission_link;
                 const payload = {
@@ -80,7 +80,7 @@ export async function initializeVisualWorker() {
                 return await evaluateVisualProject(payload, job.id, "Local Execution - Visual and DOM evaluation.");
               }
 
-              logger.info(`☁️ Visual Job ${job.id}: Docker not available or SANDBOX_MODE=github. Using GitHub Actions.`);
+              logger.info(`☁️ Visual Job ${job.id}: SANDBOX_MODE=github. Using GitHub Actions.`);
 
               // Phase 1: Wait for webhook & Dispatch to GitHub Actions
               const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
@@ -144,9 +144,9 @@ export async function initializeVisualWorker() {
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,
-          stalledInterval: 10000,
-          lockDuration: 60000,
-          lockRenewTime: 20000
+          stalledInterval: 30000,
+          lockDuration: 300000,
+          lockRenewTime: 30000
         }
       }
     );

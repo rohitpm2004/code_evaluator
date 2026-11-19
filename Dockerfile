@@ -5,8 +5,11 @@ FROM mcr.microsoft.com/playwright:v1.60.0-noble
 
 WORKDIR /app
 
-COPY package*.json ./
+COPY package*.json requirements.txt ./
 RUN npm ci --omit=dev
+RUN apt-get update && apt-get install -y --no-install-recommends python3 python3-pip && \
+    (pip install --no-cache-dir -r requirements.txt --break-system-packages 2>/dev/null || pip install --no-cache-dir -r requirements.txt) && \
+    rm -rf /var/lib/apt/lists/*
 
 COPY . .
 

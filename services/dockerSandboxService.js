@@ -23,12 +23,7 @@ export async function isDockerAvailable() {
     dockerAvailableCache = true;
     return true;
   } catch (err) {
-    if (process.env.SANDBOX_MODE === "docker") {
-      logger.warn(`Docker check warning: ${err.message}. Retaining docker mode as configured.`);
-      dockerAvailableCache = true;
-      return true;
-    }
-    logger.warn(`Docker not reachable: ${err.message}. Will fall back to GitHub Actions.`);
+    logger.warn(`Docker not reachable: ${err.message}. Falling back to local execution.`);
     dockerAvailableCache = false;
     return false;
   }
@@ -56,8 +51,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
   const normalizedPath = path.resolve(repoPath).replace(/\\/g, "/");
 
   let containerCmd = options.command;
-  let dockerImage = "node:18-alpine";
-  let cacheVolume = "central-eval-npm-cache:/root/.npm";
+  let dockerImage = options.image || (language === "python" ? "python:3.11-alpine" : (process.env.NODE_SANDBOX_IMAGE || "node:20-slim"));
+  let cacheVolume = language === "python" ? "central-eval-pip-cache:/root/.cache/pip" : "central-eval-npm-cache:/root/.npm";
 
   if (language === "python") {
     dockerImage = "python:3.11-alpine";
@@ -83,8 +78,8 @@ export async function runInDockerSandbox(repoPath, options = {}) {
       }
 
       containerCmd = hasBuildScript
-        ? "npm install --prefer-offline --no-audit --progress=false && npm run build"
-        : "npm install --prefer-offline --no-audit --progress=false";
+        ? "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false && npm run build"
+        : "npm install --legacy-peer-deps --ignore-engines --no-audit --progress=false";
     }
   }
 
@@ -557,7 +552,7 @@ import { createRequire } from 'module';
 
   fs.writeFileSync(harnessFilePath, harnessCode, "utf-8");
   const containerName = `eval-js-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:18-alpine node ${harnessFileName}`;
+  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app node:20-slim node ${harnessFileName}`;
 
   let studentCode = "";
   try {
@@ -565,13 +560,30 @@ import { createRequire } from 'module';
   } catch {}
 
   try {
-    const { stdout } = await execPromise(dockerCmd, { timeout: 60000 });
+    const { stdout } = await execPromise(dockerCmd, { timeout: 20000 });
     const match = stdout.match(/__EVAL_RESULT_START__([\s\S]*?)__EVAL_RESULT_END__/);
     const rawJson = match ? match[1].trim() : stdout.trim();
     const parsed = JSON.parse(rawJson);
     return { ...parsed, studentCode };
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
+    const isTimeout = err.killed || (err.message && err.message.toLowerCase().includes('timed out'));
+    if (isTimeout) {
+      logger.warn(`Docker JS execution timed out in ${containerName} (infinite loop detected).`);
+      return {
+        results: [{
+          passed: false,
+          error: "Execution timed out (possible infinite loop or excessive computation). Ensure all loops have valid termination conditions."
+        }],
+        score: 0,
+        passedCount: 0,
+        totalCount: 1,
+        passed: false,
+        feedback: "Execution timed out after exceeding maximum time limit (20s). Check for infinite loops (e.g. while loops without exit conditions or non-terminating recursion).",
+        error: "Execution timed out (possible infinite loop).",
+        studentCode
+      };
+    }
     logger.error(`Docker JS test runner infrastructure error: ${err.message}`);
     throw new Error(`Docker JS execution failed: ${err.message}`);
   } finally {
@@ -581,102 +593,583 @@ import { createRequire } from 'module';
 }
 
 /**
- * Runs Python algorithm / function test cases inside a safe Python container.
+ * Runs Python algorithm / function / script test cases inside a safe Python container.
+ * Supports:
+ *   1. 'script' mode: console/print output capture with fuzzy matching & mock input()
+ *   2. 'function' mode: unit test assertions on exported or defined functions
+ *   3. 'multi-function' mode: unit tests across multiple functions
  */
-export async function runPythonInDocker(repoPath, { testCases = [], entryFunction = "solution", evaluationMode = "function" }) {
+export async function runPythonInDocker(repoPath, options = {}) {
   const normalizedPath = path.resolve(repoPath).replace(/\\/g, "/");
 
-  // Find primary Python file (root or src/)
-  const fullTarget = findTargetFile(repoPath, f => f.endsWith(".py") && !f.includes("test") && !f.includes("spec") && !f.startsWith("."))
-    || path.join(repoPath, "main.py");
+  let testCases = options.testCases || [];
+  while (typeof testCases === 'string') {
+    try { testCases = JSON.parse(testCases); } catch { break; }
+  }
+  let expectedLogs = options.expectedLogs || [];
+  while (typeof expectedLogs === 'string') {
+    try { expectedLogs = JSON.parse(expectedLogs); } catch { break; }
+  }
+  let functions = options.functions || null;
+  while (typeof functions === 'string') {
+    try { functions = JSON.parse(functions); } catch { break; }
+  }
+  let inputs = options.inputs || [];
+  while (typeof inputs === 'string') {
+    try { inputs = JSON.parse(inputs); } catch { break; }
+  }
+
+  // Auto-detect evaluationMode if not provided
+  let evaluationMode = options.evaluationMode;
+  if (!evaluationMode) {
+    if (Array.isArray(expectedLogs) && expectedLogs.length > 0 && (!Array.isArray(testCases) || testCases.length === 0)) {
+      evaluationMode = 'script';
+    } else if (Array.isArray(functions) && functions.length > 0) {
+      evaluationMode = 'multi-function';
+    } else {
+      evaluationMode = 'function';
+    }
+  }
+
+  let entryFunction = options.entryFunction || null;
+
+  // Find primary Python file (check explicit options.entryFile first, then auto-discover)
+  let fullTarget = null;
+  if (options.entryFile) {
+    const candidate = path.resolve(repoPath, options.entryFile);
+    if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+      fullTarget = candidate;
+    }
+  }
+  if (!fullTarget) {
+    fullTarget = findTargetFile(repoPath, f => f.endsWith(".py") && !f.includes("test") && !f.includes("spec") && !f.startsWith("."))
+      || path.join(repoPath, "main.py");
+  }
   const moduleName = path.basename(fullTarget, ".py");
   const relativeTarget = path.relative(repoPath, fullTarget).replace(/\\/g, "/");
 
+  // Read student code for AST pre-flight safety & LLM feedback context
+  let studentCode = "";
+  try {
+    studentCode = fs.readFileSync(fullTarget, "utf-8");
+  } catch {}
+
+  // Write test cases & configuration to a separate JSON file on disk
   const testCasesFileName = `.eval_py_tc_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.json`;
   const testCasesFilePath = path.join(repoPath, testCasesFileName);
-  fs.writeFileSync(testCasesFilePath, JSON.stringify(Array.isArray(testCases) ? testCases : []), "utf-8");
+  fs.writeFileSync(testCasesFilePath, JSON.stringify({
+    testCases: Array.isArray(testCases) ? testCases : [],
+    entryFunction,
+    evaluationMode,
+    expectedLogs: Array.isArray(expectedLogs) ? expectedLogs : [],
+    functions: Array.isArray(functions) ? functions : null,
+    inputs: Array.isArray(inputs) ? inputs : (inputs !== undefined && inputs !== null ? [inputs] : [])
+  }), "utf-8");
 
+  // Create Python harness script on disk
   const harnessFileName = `.eval_harness_${Date.now()}_${crypto.randomBytes(3).toString('hex')}.py`;
   const harnessFilePath = path.join(repoPath, harnessFileName);
 
   const harnessPython = `
-import json, sys, os, inspect
-
-try:
-    with open('${testCasesFileName}', 'r', encoding='utf-8') as f:
-        test_cases = json.load(f)
-except Exception as e:
-    print(json.dumps({'error': 'Failed to load test cases: ' + str(e), 'results': []}))
-    sys.exit(0)
-
-fn = None
-try:
-    import ${moduleName} as student_module
-    fn = getattr(student_module, '${entryFunction}', None)
-    if fn is None and hasattr(student_module, 'default'):
-        fn = student_module.default
-except Exception:
-    pass
+import json, sys, os, inspect, io, re, builtins
 
 def output_result(data):
     print('__EVAL_RESULT_START__' + json.dumps(data) + '__EVAL_RESULT_END__')
 
-if fn is None:
-    try:
-        with open('${relativeTarget}', 'r', encoding='utf-8') as f:
-            code = f.read()
-        ns = {}
-        exec(code, ns)
-        fn = ns.get('${entryFunction}')
-    except Exception as e:
-        output_result({'error': 'Failed to load function: ' + str(e), 'results': []})
-        sys.exit(0)
-
-if not callable(fn):
-    output_result({'error': 'Function ${entryFunction} not found', 'results': []})
+# Load test cases configuration
+try:
+    with open('${testCasesFileName}', 'r', encoding='utf-8') as f:
+        config = json.load(f)
+except Exception as e:
+    output_result({'error': 'Failed to load test cases configuration: ' + str(e), 'results': [], 'score': 0})
     sys.exit(0)
 
-try:
-    sig = inspect.signature(fn)
-    num_params = len(sig.parameters)
-except Exception:
-    num_params = 1
+evaluation_mode = config.get('evaluation_mode') or config.get('evaluationMode') or 'function'
+expected_logs = config.get('expectedLogs') or []
+test_cases = config.get('testCases') or []
+target_rel = '${relativeTarget}'
 
-results = []
-for tc in test_cases:
+# AST Pre-flight Safety Guard
+def check_ast_safety(file_path):
+    import ast
     try:
-        inp = tc.get('input')
-        expected = tc.get('expected')
-        if isinstance(inp, list) and num_params > 1:
-            actual = fn(*inp)
-        elif inp is not None:
-            actual = fn(inp)
-        else:
-            actual = fn()
-        passed = (actual == expected)
-        results.append({'passed': passed, 'input': inp, 'expected': expected, 'actual': actual})
-    except Exception as err:
-        results.append({'passed': False, 'input': tc.get('input'), 'expected': tc.get('expected'), 'error': str(err)})
+        with open(file_path, 'r', encoding='utf-8') as sf:
+            tree = ast.parse(sf.read(), filename=file_path)
+    except Exception:
+        return True, None
+    FORBIDDEN_MODULES = {'subprocess', 'pty', 'socket', 'ctypes'}
+    FORBIDDEN_CALL_NAMES = {'system', 'popen', 'kill', 'execfile'}
+    FORBIDDEN_FROM_IMPORTS = {
+        'os': {'system', 'popen', 'kill', 'remove', 'unlink', 'rmdir', 'execl', 'execv', 'spawn'},
+        'shutil': {'rmtree', 'move'},
+        'sys': {'exit', '_getframe'}
+    }
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root_pkg = alias.name.split('.')[0]
+                if root_pkg in FORBIDDEN_MODULES:
+                    return False, f"Import of restricted module '{alias.name}' is prohibited in sandbox."
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                root_pkg = node.module.split('.')[0]
+                if root_pkg in FORBIDDEN_MODULES:
+                    return False, f"Import from restricted module '{node.module}' is prohibited in sandbox."
+                if root_pkg in FORBIDDEN_FROM_IMPORTS:
+                    for alias in node.names:
+                        if alias.name in FORBIDDEN_FROM_IMPORTS[root_pkg]:
+                            return False, f"Importing '{alias.name}' from '{node.module}' is prohibited in sandbox."
+        elif isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                if node.func.id in FORBIDDEN_CALL_NAMES:
+                    return False, f"Call to '{node.func.id}' is prohibited in sandbox."
+                if node.func.id == '__import__':
+                    return False, "Dynamic __import__ is prohibited in sandbox."
+            elif isinstance(node.func, ast.Attribute):
+                if node.func.attr in FORBIDDEN_CALL_NAMES:
+                    return False, f"Call to '{node.func.attr}' is prohibited in sandbox."
+                if isinstance(node.func.value, ast.Name) and (node.func.value.id, node.func.attr) in {('shutil', 'rmtree'), ('os', 'system')}:
+                    return False, f"Call to '{node.func.value.id}.{node.func.attr}' is prohibited in sandbox."
+    return True, None
 
-output_result({'results': results})
+is_safe, safety_error = check_ast_safety(target_rel)
+if not is_safe:
+    output_result({
+        'error': safety_error,
+        'results': [{'passed': False, 'error': safety_error}],
+        'score': 0,
+        'passedCount': 0,
+        'totalCount': 1,
+        'passed': False
+    })
+    sys.exit(0)
+
+# Setup mock interactive input queue
+raw_inputs = config.get('inputs') or []
+input_queue = [str(x) for x in raw_inputs]
+def custom_input(prompt=None):
+    if prompt is not None:
+        try:
+            sys.__stdout__.write(str(prompt))
+        except Exception:
+            pass
+    if input_queue:
+        return input_queue.pop(0)
+    return ""
+
+builtins.input = custom_input
+
+# Fuzzy log-matching helper
+def is_value_match(actual_line, exp_val):
+    if actual_line is None:
+        return False
+    str_actual = str(actual_line).strip()
+    str_exp = str(exp_val).strip()
+    if not str_exp:
+        return False
+
+    # 1. Direct exact or case-insensitive match
+    if str_actual == str_exp or str_actual.lower() == str_exp.lower():
+        return True
+
+    # 2. Delimiter extraction (e.g. "Full Name: Rohit Sharma", "Age = 25", "name - Rohit Sharma", "Course is B.Tech")
+    delim_match = re.match(r'^[^:=]+(?::\\s*|=\\s*|-\\s*|\\bis\\b\\s*)(.+)$', str_actual, re.IGNORECASE)
+    if delim_match:
+        extracted = delim_match.group(1).strip()
+        if extracted == str_exp or extracted.lower() == str_exp.lower():
+            return True
+        try:
+            if abs(float(extracted) - float(str_exp)) < 0.0001:
+                return True
+        except ValueError:
+            pass
+
+    # 3. Substring match for meaningful string values (length >= 3)
+    if len(str_exp) >= 3 and str_exp.lower() in str_actual.lower():
+        return True
+
+    # 4. Number token check
+    try:
+        num_exp = float(str_exp)
+        tokens = re.split(r'[\\s,;:=-]+', str_actual)
+        for token in tokens:
+            try:
+                if abs(float(token) - num_exp) < 0.0001:
+                    return True
+            except ValueError:
+                pass
+    except ValueError:
+        pass
+
+    # 5. Boolean token check
+    if str_exp.lower() in ('true', 'false'):
+        tokens = [t.lower() for t in re.split(r'[\\s,;:=-]+', str_actual)]
+        if str_exp.lower() in tokens:
+            return True
+
+    return False
+
+# ==============================================================================
+# 1. SCRIPT MODE EVALUATION
+# ==============================================================================
+if evaluation_mode == 'script':
+    try:
+        with open(target_rel, 'r', encoding='utf-8') as f:
+            code = f.read()
+
+        # Check if test_cases provides per-case inputs/expected
+        if test_cases and len(test_cases) > 0 and any('input' in tc or 'inputs' in tc for tc in test_cases):
+            script_results = []
+            for tc in test_cases:
+                tc_inputs = tc.get('inputs') or (tc.get('input') if isinstance(tc.get('input'), list) else ([tc.get('input')] if tc.get('input') is not None else []))
+                input_queue = [str(x) for x in tc_inputs]
+                
+                stdout_buf = io.StringIO()
+                old_stdout = sys.stdout
+                sys.stdout = stdout_buf
+                run_err = None
+                try:
+                    ns = {'__name__': '__main__', '__file__': target_rel}
+                    exec(code, ns)
+                except Exception as ex:
+                    run_err = str(ex)
+                finally:
+                    sys.stdout = old_stdout
+
+                captured = [line.strip() for line in stdout_buf.getvalue().splitlines() if line.strip()]
+                tc_expected = tc.get('expected') or tc.get('expectedLogs') or []
+                if not isinstance(tc_expected, list):
+                    tc_expected = [tc_expected]
+
+                passed = False
+                if run_err:
+                    script_results.append({'passed': False, 'input': tc.get('input'), 'expected': tc_expected, 'error': run_err, 'captured': captured})
+                elif not tc_expected:
+                    script_results.append({'passed': True, 'input': tc.get('input'), 'captured': captured})
+                else:
+                    match_ok = any(is_value_match(c, tc_expected[0]) for c in captured) if len(tc_expected) == 1 else all(any(is_value_match(c, exp) for c in captured) for exp in tc_expected)
+                    script_results.append({'passed': match_ok, 'input': tc.get('input'), 'expected': tc_expected, 'captured': captured})
+
+            passed_count = sum(1 for r in script_results if r.get('passed'))
+            total_count = len(script_results)
+            score = round((passed_count / total_count) * 100) if total_count > 0 else 0
+            output_result({
+                'results': script_results,
+                'score': score,
+                'passedCount': passed_count,
+                'totalCount': total_count,
+                'passed': score == 100
+            })
+            sys.exit(0)
+
+        # Standard expectedLogs evaluation
+        stdout_buf = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = stdout_buf
+        run_err = None
+        try:
+            ns = {'__name__': '__main__', '__file__': target_rel}
+            exec(code, ns)
+        except Exception as ex:
+            run_err = str(ex)
+        finally:
+            sys.stdout = old_stdout
+
+        captured_lines = [line.strip() for line in stdout_buf.getvalue().splitlines() if line.strip()]
+
+        if run_err:
+            output_result({
+                'results': [{'passed': False, 'error': run_err}],
+                'score': 0,
+                'passedCount': 0,
+                'totalCount': len(expected_logs) if expected_logs else 1,
+                'passed': False,
+                'feedback': f'Runtime error: {run_err}',
+                'capturedLogs': captured_lines
+            })
+            sys.exit(0)
+
+        if not expected_logs:
+            output_result({
+                'results': [{'passed': True, 'captured': captured_lines}],
+                'score': 100,
+                'passedCount': 1,
+                'totalCount': 1,
+                'passed': True,
+                'feedback': 'Script executed successfully.',
+                'capturedLogs': captured_lines
+            })
+            sys.exit(0)
+
+        used_indices = set()
+        match_map = {}
+        for exp_idx, exp in enumerate(expected_logs):
+            if exp_idx < len(captured_lines) and is_value_match(captured_lines[exp_idx], exp):
+                used_indices.add(exp_idx)
+                match_map[exp_idx] = exp_idx
+
+        for exp_idx, exp in enumerate(expected_logs):
+            if exp_idx not in match_map:
+                for act_idx, act_line in enumerate(captured_lines):
+                    if act_idx not in used_indices and is_value_match(act_line, exp):
+                        used_indices.add(act_idx)
+                        match_map[exp_idx] = act_idx
+                        break
+
+        details = []
+        passed_count = 0
+        for exp_idx, exp in enumerate(expected_logs):
+            if exp_idx in match_map:
+                act = captured_lines[match_map[exp_idx]]
+                details.append({'passed': True, 'expected': exp, 'actual': act})
+                passed_count += 1
+            else:
+                act = captured_lines[exp_idx] if exp_idx < len(captured_lines) else None
+                details.append({'passed': False, 'expected': exp, 'actual': act, 'error': f'Expected "{exp}" not found in output'})
+
+        total_count = len(expected_logs)
+        score = round((passed_count / total_count) * 100) if total_count > 0 else 0
+        output_result({
+            'results': details,
+            'score': score,
+            'passedCount': passed_count,
+            'totalCount': total_count,
+            'passed': score == 100,
+            'feedback': f'Passed {passed_count} of {total_count} tests',
+            'capturedLogs': captured_lines
+        })
+        sys.exit(0)
+    except Exception as e:
+        output_result({'error': 'Script execution failed: ' + str(e), 'results': [], 'score': 0})
+        sys.exit(0)
+
+# ==============================================================================
+# 2. FUNCTION & MULTI-FUNCTION MODES
+# ==============================================================================
+student_ns = {}
+try:
+    with open(target_rel, 'r', encoding='utf-8') as f:
+        student_code_text = f.read()
+    exec(student_code_text, student_ns)
+except Exception as e:
+    output_result({
+        'error': 'Failed to compile student Python file: ' + str(e),
+        'results': [{'passed': False, 'error': str(e)}],
+        'score': 0,
+        'passedCount': 0,
+        'totalCount': len(test_cases) if test_cases else 1,
+        'passed': False
+    })
+    sys.exit(0)
+
+def resolve_function(name):
+    if not name:
+        return None
+    val = student_ns.get(name)
+    if callable(val):
+        return val
+    # Fallback to case-insensitive lookup
+    for k, v in student_ns.items():
+        if k.lower() == name.lower() and callable(v):
+            return v
+    return None
+
+def evaluate_test_cases(fn, tc_list):
+    try:
+        sig = inspect.signature(fn)
+        num_params = len(sig.parameters)
+    except Exception:
+        num_params = 1
+
+    case_results = []
+    for tc in tc_list:
+        try:
+            inp = tc.get('input')
+            expected = tc.get('expected')
+            if isinstance(inp, list) and num_params > 1:
+                actual = fn(*inp)
+            elif inp is not None:
+                actual = fn(inp)
+            else:
+                actual = fn()
+
+            passed = False
+            if actual == expected:
+                passed = True
+            elif isinstance(actual, (int, float)) and isinstance(expected, (int, float)) and abs(actual - expected) < 0.0001:
+                passed = True
+            elif str(actual).strip() == str(expected).strip():
+                passed = True
+            else:
+                try:
+                    passed = json.dumps(actual, sort_keys=True) == json.dumps(expected, sort_keys=True)
+                except Exception:
+                    pass
+
+            case_results.append({'passed': passed, 'input': inp, 'expected': expected, 'actual': actual})
+        except Exception as err:
+            case_results.append({'passed': False, 'input': tc.get('input'), 'expected': tc.get('expected'), 'error': str(err)})
+    return case_results
+
+# Multi-function mode
+func_list = config.get('functions')
+if func_list and isinstance(func_list, list):
+    all_results = []
+    for fn_obj in func_list:
+        f_name = fn_obj.get('name')
+        f_cases = fn_obj.get('testCases') or []
+        target_fn = resolve_function(f_name)
+        if not target_fn:
+            all_results.extend([{'passed': False, 'input': tc.get('input'), 'expected': tc.get('expected'), 'error': f'Function {f_name} not found'} for tc in f_cases])
+        else:
+            all_results.extend(evaluate_test_cases(target_fn, f_cases))
+
+    passed_count = sum(1 for r in all_results if r.get('passed'))
+    total_count = len(all_results)
+    score = round((passed_count / total_count) * 100) if total_count > 0 else 0
+    output_result({
+        'results': all_results,
+        'score': score,
+        'passedCount': passed_count,
+        'totalCount': total_count,
+        'passed': score == 100,
+        'feedback': f'Passed {passed_count} of {total_count} tests'
+    })
+    sys.exit(0)
+
+# Single function mode
+entry_fn_name = config.get('entryFunction') or 'solution'
+fn = resolve_function(entry_fn_name)
+
+# If not found by entryFunction, fallback to first defined user function in student_ns
+if not fn:
+    user_callables = [v for k, v in student_ns.items() if callable(v) and not k.startswith('_') and getattr(v, '__module__', None) in (None, '__main__')]
+    if len(user_callables) == 1:
+        fn = user_callables[0]
+
+if not fn or not callable(fn):
+    output_result({
+        'error': f'Function {entry_fn_name} not found in student submission',
+        'results': [],
+        'score': 0,
+        'passedCount': 0,
+        'totalCount': len(test_cases) if test_cases else 1,
+        'passed': False
+    })
+    sys.exit(0)
+
+fn_results = evaluate_test_cases(fn, test_cases)
+passed_count = sum(1 for r in fn_results if r.get('passed'))
+total_count = len(fn_results)
+score = round((passed_count / total_count) * 100) if total_count > 0 else 0
+output_result({
+    'results': fn_results,
+    'score': score,
+    'passedCount': passed_count,
+    'totalCount': total_count,
+    'passed': score == 100,
+    'feedback': f'Passed {passed_count} of {total_count} tests'
+})
 `;
 
   fs.writeFileSync(harnessFilePath, harnessPython, "utf-8");
   const containerName = `eval-py-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-  const dockerCmd = `docker run --name ${containerName} --rm --memory="512m" --cpus="1.0" -v "${normalizedPath}:/app" -w /app python:3.11-alpine python ${harnessFileName}`;
+  // Hardened Docker execution flags: --network none, memory 512m, cpu 1.0, pids-limit 64
+  const dockerCmd = `docker run --name ${containerName} --rm --network none --memory="512m" --cpus="1.0" --pids-limit=64 -v "${normalizedPath}:/app" -w /app python:3.11-alpine python ${harnessFileName}`;
 
   try {
-    const { stdout } = await execPromise(dockerCmd, { timeout: 15000 });
+    const canDocker = await isDockerAvailable();
+    let stdout;
+    if (canDocker) {
+      const execRes = await execPromise(dockerCmd, { timeout: 15000 });
+      stdout = execRes.stdout;
+    } else {
+      logger.info('Docker not running, executing Python test harness via local python3 process with AST safety check...');
+      const pythonBin = process.platform === 'win32' ? 'python' : 'python3';
+      const execRes = await execPromise(`"${pythonBin}" "${harnessFileName}"`, {
+        cwd: repoPath,
+        timeout: 15000,
+        maxBuffer: 5 * 1024 * 1024
+      });
+      stdout = execRes.stdout;
+    }
+
     const match = stdout.match(/__EVAL_RESULT_START__([\s\S]*?)__EVAL_RESULT_END__/);
     const rawJson = match ? match[1].trim() : stdout.trim();
     const parsed = JSON.parse(rawJson);
-    return parsed.results || [];
+    return { ...parsed, studentCode };
   } catch (err) {
     execPromise(`docker rm -f ${containerName}`).catch(() => {});
-    logger.error(`Docker Python test runner infrastructure error: ${err.message}`);
-    throw new Error(`Docker Python execution failed: ${err.message}`);
+    const isTimeout = err.killed || (err.message && err.message.toLowerCase().includes('timed out'));
+    if (isTimeout) {
+      logger.warn(`Python execution timed out in ${containerName} (infinite loop detected).`);
+      return {
+        results: [{
+          passed: false,
+          error: "Execution timed out (possible infinite loop or excessive computation). Ensure all loops have valid termination conditions."
+        }],
+        score: 0,
+        passedCount: 0,
+        totalCount: 1,
+        passed: false,
+        feedback: "Execution timed out after exceeding the 15-second time limit. Check for infinite loops (e.g. while loops without exit conditions or non-terminating recursion).",
+        error: "Execution timed out (possible infinite loop).",
+        studentCode
+      };
+    }
+    logger.error(`Python test runner error: ${err.message}`);
+    throw new Error(`Python execution failed: ${err.message}`);
   } finally {
     try { fs.unlinkSync(harnessFilePath); } catch {}
     try { fs.unlinkSync(testCasesFilePath); } catch {}
+  }
+}
+
+/**
+ * Runs Excel workbook recalculation & assertion evaluation inside Docker sandbox.
+ */
+export async function runExcelInDocker(workspaceDir, options = {}) {
+  const timeoutMs = options.timeoutMs || 45000;
+  const normalizedPath = path.resolve(workspaceDir).replace(/\\/g, "/");
+  const containerName = `eval-excel-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const dockerImage = process.env.EXCEL_SANDBOX_IMAGE || "eval-excel-sandbox";
+  const reportFilePath = path.join(workspaceDir, "report.json");
+  const scriptFilePath = path.join(workspaceDir, "run_excel.sh");
+
+  const runScriptContent = `#!/bin/sh
+set -e
+RECALC=/sandbox/recalculate.py
+[ -f /workspace/recalculate.py ] && RECALC=/workspace/recalculate.py
+RUNNER=/sandbox/excel_runner.py
+[ -f /workspace/excel_runner.py ] && RUNNER=/workspace/excel_runner.py
+python3 "$RECALC" --input /workspace/original_submission.xlsx --output /workspace/recalculated_submission.xlsx --profile-dir /tmp/lo_prof > /dev/null
+python3 "$RUNNER" --original /workspace/original_submission.xlsx --recalculated /workspace/recalculated_submission.xlsx --spec /workspace/test_spec.json > /workspace/report.json
+`;
+
+  try {
+    fs.writeFileSync(scriptFilePath, runScriptContent.replace(/\r\n/g, "\n"), "utf-8");
+  } catch (writeErr) {
+    logger.warn(`Failed to write run_excel.sh: ${writeErr.message}`);
+  }
+
+  // Execute using runner script inside container - avoids OS shell quoting incompatibilities
+  const dockerCmd = `docker run --name ${containerName} --entrypoint "" --rm --network none --memory="768m" --cpus="1.0" -v "${normalizedPath}:/workspace" -w /workspace ${dockerImage} sh /workspace/run_excel.sh`;
+
+  logger.info(`🐳 Starting Excel Docker sandbox execution in ${containerName}`);
+  try {
+    const { stdout } = await execPromise(dockerCmd, { timeout: timeoutMs });
+    if (fs.existsSync(reportFilePath)) {
+      const content = fs.readFileSync(reportFilePath, 'utf8');
+      return JSON.parse(content.trim());
+    }
+    return JSON.parse(stdout.trim());
+  } catch (err) {
+    execPromise(`docker rm -f ${containerName}`).catch(() => {});
+    throw new Error(`Docker Excel execution failed: ${err.message}`);
+  } finally {
+    try {
+      if (fs.existsSync(reportFilePath)) fs.unlinkSync(reportFilePath);
+      if (fs.existsSync(scriptFilePath)) fs.unlinkSync(scriptFilePath);
+    } catch {}
   }
 }

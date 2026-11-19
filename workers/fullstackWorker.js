@@ -112,9 +112,9 @@ export async function initializeFullstackWorker() {
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,
-          stalledInterval: 10000,
-          lockDuration: 60000,
-          lockRenewTime: 20000
+          stalledInterval: 30000,
+          lockDuration: 300000,
+          lockRenewTime: 30000
         }
       }
     );

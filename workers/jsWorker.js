@@ -37,9 +37,10 @@ export async function initializeJsWorker() {
           const canUseDocker = sandboxMode === "docker" && (await isDockerAvailable());
 
           let results;
+          const repoUrl = submission?.repoUrl || submission?.fileUrl || job.data?.fileUrl || job.data?.repoUrl;
           if (canUseDocker) {
             logger.info(`🐳 JS Job ${job.id}: Using local Docker sandbox. Skipping GitHub Actions.`);
-            const repoPath = await cloneRepo(submission.repoUrl);
+            const repoPath = await cloneRepo(repoUrl);
             try {
               results = await runJsInDocker(repoPath, { testCases, entryFunction, entryFile, evaluationMode, expectedLogs, functions });
             } finally {
@@ -51,7 +52,6 @@ export async function initializeJsWorker() {
               (async () => {
                 const webhookPromise = webhookPubSub.waitForWebhook(job.id, config.timeout);
                 const webhookUrl = `${process.env.BASE_URL}/api/webhook/github`;
-                const repoUrl = submission.repoUrl;
                 const extraPayload = {
                   testCases,
                   entryFunction,
@@ -209,9 +209,9 @@ export async function initializeJsWorker() {
         drainDelay: 5,
         settings: {
           maxStalledCount: 3,
-          stalledInterval: 10000,
-          lockDuration: 60000,
-          lockRenewTime: 20000
+          stalledInterval: 30000,
+          lockDuration: 180000,
+          lockRenewTime: 30000
         }
       }
     );

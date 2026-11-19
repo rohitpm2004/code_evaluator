@@ -28,14 +28,17 @@ const MAX_SOURCE_CHARS = 40000;
 
 /** Concatenate the student's HTML/CSS/JS source into one labeled string. */
 export async function readSourceText(student) {
-  const files = [student.html, ...(student.css || []), ...(student.js || [])].filter(Boolean);
+  const allHtml = (student.htmlFiles && student.htmlFiles.length > 0) ? student.htmlFiles : (student.html ? [student.html] : []);
+  const files = [...allHtml, ...(student.css || []), ...(student.js || [])].filter(Boolean);
   const normalizedBasePath = (student.basePath || "").replace(/\\/g, "/").replace(/\/+$/, "");
 
   let combined = "";
   for (const file of files) {
     if (combined.length >= MAX_SOURCE_CHARS) break;
     try {
-      const content = await fs.readFile(file, "utf8");
+      let content = await fs.readFile(file, "utf8");
+      // Strip large base64 data URIs so they don't consume the token budget
+      content = content.replace(/data:image\/[a-zA-Z0-9.+_-]+;base64,[a-zA-Z0-9+/=]{100,}/gi, 'data:image/...[base64-omitted]');
       const normalizedFile = file.replace(/\\/g, "/");
       let relPath = normalizedFile.startsWith(normalizedBasePath)
         ? normalizedFile.slice(normalizedBasePath.length)
@@ -187,13 +190,150 @@ export async function computeCodeScore(rubric, sourceText) {
     const passedCount = results.filter(r => r.passed).length;
     const awarded = (passedCount / results.length) * max;
     score += awarded;
+    const failedPatterns = results.filter(r => !r.passed).map(r => r.pattern);
+    const reason = failedPatterns.length === 0
+      ? "All required source patterns and linked files verified."
+      : `Missing or unverified source patterns: ${failedPatterns.join(", ")}`;
+
     breakdown.push({
       item: item.description,
       awarded: Math.round(awarded * 100) / 100,
       max,
-      checks: results
+      checks: results,
+      reason
     });
   }
 
   return { score, breakdown };
+}
+
+/**
+ * Deterministic syntax and structural diagnostics for HTML, CSS, and JS files.
+ * Surfaces real syntax errors, unclosed tags, dead links, and accessibility gaps.
+ */
+export async function analyzeCodeSyntaxAndStructure(student) {
+  const diagnostics = {
+    syntaxErrors: [],
+    brokenLinks: [],
+    accessibilityIssues: [],
+    structureHighlights: [],
+    detectedTier: 'html-only', // 'html-only' | 'html-css' | 'html-css-js'
+    hasFlexbox: false,
+    hasGrid: false,
+    hasMediaQueries: false,
+    hasEventListeners: false,
+    hasDomQueries: false,
+    hasTimersOrDate: false
+  };
+
+  const allHtml = (student.htmlFiles && student.htmlFiles.length > 0) ? student.htmlFiles : (student.html ? [student.html] : []);
+  const allCss = student.css || [];
+  const allJs = student.js || [];
+
+  if (allJs.length > 0) {
+    diagnostics.detectedTier = 'html-css-js';
+  } else if (allCss.length > 0) {
+    diagnostics.detectedTier = 'html-css';
+  }
+
+  // 1. HTML Syntax & Link Verification
+  const existingFiles = new Set(
+    [...allHtml, ...allCss, ...allJs].map(f => path.basename(f).toLowerCase())
+  );
+
+  for (const htmlPath of allHtml) {
+    try {
+      const content = await fs.readFile(htmlPath, "utf8");
+      const fileName = path.basename(htmlPath);
+
+      // Check DOCTYPE
+      if (!/<!DOCTYPE\s+html/i.test(content)) {
+        diagnostics.syntaxErrors.push(`${fileName}: Missing <!DOCTYPE html> declaration at top of file.`);
+      }
+
+      // Check Title
+      if (!/<title>[^<]+<\/title>/i.test(content)) {
+        diagnostics.syntaxErrors.push(`${fileName}: Missing or empty <title> tag inside <head>.`);
+      }
+
+      // Check for unclosed major paired tags
+      const pairedTags = ['table', 'form', 'nav', 'main', 'header', 'footer', 'article', 'section', 'ul', 'ol'];
+      for (const tag of pairedTags) {
+        const openMatches = content.match(new RegExp(`<${tag}\\b[^>]*>`, 'gi')) || [];
+        const closeMatches = content.match(new RegExp(`</${tag}>`, 'gi')) || [];
+        if (openMatches.length > closeMatches.length) {
+          diagnostics.syntaxErrors.push(`${fileName}: Unclosed <${tag}> tag (found ${openMatches.length} opening, ${closeMatches.length} closing).`);
+        }
+      }
+
+      // Check <img> alt attributes
+      const imgTags = content.match(/<img\b[^>]*>/gi) || [];
+      for (const img of imgTags) {
+        if (!/alt\s*=\s*["'][^"']*["']/i.test(img)) {
+          diagnostics.accessibilityIssues.push(`${fileName}: <img> tag missing required 'alt' attribute.`);
+        }
+      }
+
+      // Check relative <a href="..."> links
+      const anchorHrefs = [...content.matchAll(/<a\b[^>]*\bhref\s*=\s*["']([^"']+)["']/gi)];
+      for (const match of anchorHrefs) {
+        const href = (match[1] || "").trim();
+        if (/^(https?:|\/\/|#|mailto:|tel:)/i.test(href)) continue;
+        const targetBase = href.split(/[?#]/)[0].split('/').pop().toLowerCase();
+        if (targetBase && targetBase.endsWith('.html') && !existingFiles.has(targetBase)) {
+          diagnostics.brokenLinks.push(`${fileName}: Broken navigation link <a href="${href}"> — target file '${targetBase}' was not found in the project.`);
+        }
+      }
+
+      // Check for inline flexbox or internal styles
+      if (/display\s*:\s*flex/i.test(content)) diagnostics.hasFlexbox = true;
+      if (/display\s*:\s*grid/i.test(content)) diagnostics.hasGrid = true;
+      if (/@media\b/i.test(content)) diagnostics.hasMediaQueries = true;
+
+      // Check for inline JS
+      if (/addEventListener\b/i.test(content)) diagnostics.hasEventListeners = true;
+      if (/(querySelector|getElementById)\b/i.test(content)) diagnostics.hasDomQueries = true;
+      if (/(setInterval|setTimeout|new\s+Date\b)/i.test(content)) diagnostics.hasTimersOrDate = true;
+    } catch {}
+  }
+
+  // 2. CSS Syntax & Rule Verification
+  for (const cssPath of allCss) {
+    try {
+      const content = await fs.readFile(cssPath, "utf8");
+      const fileName = path.basename(cssPath);
+
+      // Check unbalanced braces
+      const openBraces = (content.match(/\{/g) || []).length;
+      const closeBraces = (content.match(/\}/g) || []).length;
+      if (openBraces !== closeBraces) {
+        diagnostics.syntaxErrors.push(`${fileName}: Unbalanced CSS braces (found ${openBraces} '{' vs ${closeBraces} '}').`);
+      }
+
+      if (/display\s*:\s*flex/i.test(content)) diagnostics.hasFlexbox = true;
+      if (/display\s*:\s*grid/i.test(content)) diagnostics.hasGrid = true;
+      if (/@media\b/i.test(content)) diagnostics.hasMediaQueries = true;
+    } catch {}
+  }
+
+  // 3. JS Syntax & DOM API Verification
+  for (const jsPath of allJs) {
+    try {
+      const content = await fs.readFile(jsPath, "utf8");
+      const fileName = path.basename(jsPath);
+
+      // Check JS syntax
+      try {
+        new Function(content);
+      } catch (jsErr) {
+        diagnostics.syntaxErrors.push(`${fileName}: JavaScript syntax error (${jsErr.message}).`);
+      }
+
+      if (/addEventListener\b/i.test(content)) diagnostics.hasEventListeners = true;
+      if (/(querySelector|getElementById)\b/i.test(content)) diagnostics.hasDomQueries = true;
+      if (/(setInterval|setTimeout|new\s+Date\b)/i.test(content)) diagnostics.hasTimersOrDate = true;
+    } catch {}
+  }
+
+  return diagnostics;
 }

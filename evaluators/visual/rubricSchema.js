@@ -32,7 +32,7 @@ export const VALID_TYPES = new Set(["dom", "behavior", "visual", "code", "manual
  *   - an object wrapping the array under items / rubric / criteria
  * Throws RubricParseError on anything unusable — never returns [].
  */
-export function normalizeRubric(parsed) {
+export function normalizeRubric(parsed, targetTotal = null) {
   let arr = parsed;
   if (!Array.isArray(arr) && arr && typeof arr === "object") {
     arr = arr.items || arr.rubric || arr.criteria || null;
@@ -44,7 +44,7 @@ export function normalizeRubric(parsed) {
     throw new RubricParseError("Rubric is empty");
   }
 
-  return arr.map((item, i) => {
+  const items = arr.map((item, i) => {
     if (!item || typeof item !== "object") {
       throw new RubricParseError(`Rubric item ${i} is not an object`);
     }
@@ -60,9 +60,28 @@ export function normalizeRubric(parsed) {
     }
     return {
       description: description.trim(),
-      weight,
+      weight: Math.max(0, weight),
       type,
       checks: Array.isArray(item.checks) ? item.checks : []
     };
   });
+
+  // If targetTotal is specified, or if parsed weights sum to > 100, normalize to target/100
+  const currentTotal = items.reduce((sum, it) => sum + it.weight, 0);
+  const target = targetTotal && targetTotal > 0 ? targetTotal : (currentTotal > 100 ? 100 : null);
+
+  if (target && currentTotal > 0 && Math.abs(currentTotal - target) > 0.01) {
+    const scale = target / currentTotal;
+    let runningSum = 0;
+    items.forEach((it, idx) => {
+      if (idx === items.length - 1) {
+        it.weight = Math.round((target - runningSum) * 100) / 100;
+      } else {
+        it.weight = Math.round((it.weight * scale) * 100) / 100;
+        runningSum += it.weight;
+      }
+    });
+  }
+
+  return items;
 }

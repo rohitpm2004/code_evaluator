@@ -78,10 +78,9 @@ export async function generateVisualAIFeedback({
   const truncatedLogs = execution_logs ? execution_logs.slice(0, 1500) : '';
 
   const prompt = `
-You are a senior frontend instructor evaluating a student's Vanilla Web project (HTML5, CSS3, and JavaScript DOM manipulation).
+You are a senior frontend instructor evaluating a student's web development project.
 
 ## Student Result Summary:
-- Assignment Type: HTML, CSS & JavaScript DOM
 - Total Score: ${score}/${finalMax} (${percentage}%)
 - Rubric Breakdown & Evaluation Findings:
 ${criteriaDetails || 'No specific criteria breakdown available.'}
@@ -92,9 +91,9 @@ ${truncatedCode ? `## Student Code Excerpt:\n\`\`\`\n${truncatedCode}\n\`\`\`\n`
 
 ## Instructions:
 1. Write 2 to 4 concise, informative, and encouraging sentences directly addressing the student's actual results.
-2. Directly reference specific HTML tags/elements, CSS selectors/layouts (Flexbox, Grid, media queries), and JavaScript DOM methods (e.g. querySelector, addEventListener, innerText/innerHTML, classList) that worked or caused failures.
-3. Pay special attention to whether HTML properly links to CSS (<link rel="stylesheet">) and JS (<script src="...">), and whether event handlers actually trigger state changes.
-4. If the score is low (< 60%) or there are failing criteria, explain the root cause and provide ONE actionable, concrete suggestion to fix it.
+2. Only reference technologies specified in the rubric. For HTML-only or HTML/CSS assignments, DO NOT mention or penalize for missing JavaScript!
+3. If JavaScript is in the rubric, reference specific DOM methods (e.g. querySelector, addEventListener, innerText/innerHTML, classList) that worked or caused failures.
+4. If the score is low (< 60%) or there are failing criteria, explain the root cause based ONLY on the rubric and provide ONE actionable, concrete suggestion to fix it.
 5. CRITICAL: Never contradict the score. If the student received a low score or failed criteria, do NOT say "Great work! All criteria passed successfully" or "fully functional".
 6. Return plain text only. Do NOT use markdown headers, bullet points, or quotation marks around the entire response.
 `.trim();

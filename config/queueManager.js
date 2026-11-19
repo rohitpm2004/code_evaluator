@@ -8,6 +8,7 @@
  * - Redis connection
  */
 
+import os from 'os';
 import crypto from 'crypto';
 import { Queue } from 'bullmq';
 import redisConnection, { redisConfig } from '../config/redis.js';
@@ -27,46 +28,63 @@ import logger from './logger.js';
 const QUEUE_CONFIG = {
   react: {
     jobName: 'react-job',
-    concurrency: 5,
-    timeout: 120000,      // 2 minutes
+    concurrency: 2,
+    timeout: 45000,       // 45s hard ceiling
     description: 'React Component Evaluation'
   },
   
   backend: {
     jobName: 'backend-job',
-    concurrency: 3,
-    timeout: 180000,      // 3 minutes
+    concurrency: 2,
+    timeout: 45000,       // 45s hard ceiling
     description: 'Backend API Evaluation'
   },
   
   visual: {
     jobName: 'visual-job',
-    // Visual is heavy - browsers consume memory. Free-tier deploys run with
-    // BROWSER_POOL_SIZE=1, so keep concurrency modest by default.
     concurrency: parseInt(process.env.VISUAL_CONCURRENCY) || 2,
-    timeout: 300000,      // 5 minutes (screenshot + browser + AI)
+    timeout: 90000,       // 90s ceiling (covers git clone + multi-page Playwright DOM + AI reconciliation)
     description: 'Visual/UI Evaluation'
   },
   
   javascript: {
     jobName: 'javascript-job',
     concurrency: parseInt(process.env.JS_CONCURRENCY) || 4,
-    timeout: 180000,      // 3 minutes (accounts for Render cold-start ~50s + GitHub Actions ~13s + AI feedback)
+    timeout: 30000,
     description: 'JavaScript Evaluation'
   },
   
   python: {
     jobName: 'python-job',
-    concurrency: 5,
-    timeout: 120000,
+    concurrency: parseInt(process.env.PYTHON_CONCURRENCY) || 4,
+    timeout: 25000,       // 25s Python execution ceiling
     description: 'Python Evaluation'
   },
   
   fullstack: {
     jobName: 'fullstack-job',
-    concurrency: 2,       // Combines multiple evaluations
-    timeout: 300000,      // 5 minutes
+    concurrency: 2,
+    timeout: 45000,
     description: 'Full Stack Evaluation'
+  },
+
+  excel: {
+    jobName: 'excel-job',
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 2), 3),
+    timeout: 180000,       // 180s ceiling (covers Google/OneDrive download + LibreOffice recalculation + openpyxl/DuckDB inspection)
+    limiter: {
+      max: 30,
+      duration: 5000
+    },
+    attempts: 2,
+    description: 'Excel Spreadsheet Evaluation'
+  },
+
+  sql: {
+    jobName: 'sql-job',
+    concurrency: parseInt(process.env.SQL_CONCURRENCY, 10) || 5,
+    timeout: 60000,       // 60s SQL ceiling to accommodate Python sandbox + AI feedback
+    description: 'SQL Database Evaluation'
   }
 };
 
@@ -94,40 +112,51 @@ class QueueManager {
     try {
       logger.info('Initializing Queue Manager...');
 
-      // Create each queue using redisConfig for robust isolated connections
+      // Use shared Redis connection across all queues to minimize client connections
+      const sharedConnection = redisConnection.connect();
+
       for (const [type, config] of Object.entries(QUEUE_CONFIG)) {
-        this.queues[type] = new Queue(type + '-evaluation', {
-          connection: redisConfig,
+        const queueOpts = {
+          connection: sharedConnection,
           prefix: process.env.QUEUE_PREFIX || 'local',
           
-          // Default job options
+          // Default job options: strictly cap retained jobs to prevent Redis Cloud 30MB OOM
           defaultJobOptions: {
-            // Retry failed jobs
-            attempts: 3,
+            attempts: config.attempts || 1,
             backoff: {
               type: 'exponential',
-              delay: 2000  // Start with 2 sec, exponential increase
+              delay: 3000
             },
-
-            // NOTE (V-08): BullMQ v5 removed the per-job `timeout` option — it was
-            // a no-op. Real timeouts are now enforced inside the worker via
-            // withTimeout(config.timeout).
-
-            // Remove completed jobs after 1 hour
             removeOnComplete: {
-              age: 3600
+              count: 50,
+              age: 3600 // 1 hour
             },
-            
-            // Keep failed jobs for debugging (remove after 7 days)
-            removeOnFail: false
+            removeOnFail: {
+              count: 50,
+              age: 7200 // 2 hours
+            }
           }
-        });
+        };
 
-        // Add event listeners
+        if (config.limiter) {
+          queueOpts.limiter = config.limiter;
+        }
+
+        this.queues[type] = new Queue(type + '-evaluation', queueOpts);
+
+        // Add error listener
         this.setupQueueListeners(type);
 
         logger.info(`Queue created: ${type}-evaluation (concurrency: ${config.concurrency})`);
       }
+
+      // Run proactive cleanup to immediately free Redis memory from previous runs
+      await this.pruneStaleRedisJobs();
+
+      // Run periodic cleanup every 3 minutes
+      setInterval(() => {
+        this.pruneStaleRedisJobs().catch(() => {});
+      }, 3 * 60 * 1000);
 
       this.isInitialized = true;
       logger.info('All queues initialized successfully');
@@ -135,6 +164,112 @@ class QueueManager {
     } catch (err) {
       logger.error('Failed to initialize queues:', err);
       throw err;
+    }
+  }
+
+  /**
+   * Proactively unlinks stale completed and failed job data from Redis to stay within memory limits.
+   */
+  async pruneStaleRedisJobs() {
+    const conn = redisConnection.connect();
+    const prefix = process.env.QUEUE_PREFIX || 'local';
+    logger.info('🧹 Running Redis memory cleanup to prevent OOM...');
+
+    try {
+      // Log current memory usage
+      try {
+        const memInfo = await conn.info('memory');
+        const usedMatch = memInfo.match(/used_memory_human:([^\r\n]+)/);
+        const maxMatch = memInfo.match(/maxmemory_human:([^\r\n]+)/);
+        if (usedMatch) {
+          logger.info(`📊 Redis Memory Usage: ${usedMatch[1]} (Max limit: ${maxMatch ? maxMatch[1] : 'unlimited'})`);
+        }
+      } catch {}
+
+      for (const type of Object.keys(QUEUE_CONFIG)) {
+        const queueName = `${type}-evaluation`;
+        const completedKey = `${prefix}:${queueName}:completed`;
+        const failedKey = `${prefix}:${queueName}:failed`;
+        const eventsKey = `${prefix}:${queueName}:events`;
+
+        // 1. Remove completed jobs keeping at most 50 (prevents Redis Cloud 30MB exhaustion)
+        try {
+          const completedJobIds = await conn.zrange(completedKey, 0, -51);
+          if (completedJobIds.length > 0) {
+            const keysToDelete = [];
+            for (const id of completedJobIds) {
+              keysToDelete.push(prefix + ':' + queueName + ':' + id);
+              keysToDelete.push(prefix + ':' + queueName + ':' + id + ':logs');
+            }
+            await conn.unlink(...keysToDelete).catch(() => {});
+            await conn.zremrangebyrank(completedKey, 0, -51).catch(() => {});
+          }
+        } catch {}
+
+        // 2. Remove failed jobs keeping at most 50
+        try {
+          const failedJobIds = await conn.zrange(failedKey, 0, -51);
+          if (failedJobIds.length > 0) {
+            const keysToDelete = [];
+            for (const id of failedJobIds) {
+              keysToDelete.push(prefix + ':' + queueName + ':' + id);
+              keysToDelete.push(prefix + ':' + queueName + ':' + id + ':logs');
+            }
+            await conn.unlink(...keysToDelete).catch(() => {});
+            await conn.zremrangebyrank(failedKey, 0, -51).catch(() => {});
+          }
+        } catch {}
+
+        // 3. Trim events stream to last 10 entries
+        try {
+          await conn.xtrim(eventsKey, 'MAXLEN', '~', 10);
+        } catch {}
+      }
+
+      // Proactive High Memory Guard: if used memory > 18MB (out of 30MB free tier), aggressively prune to 10
+      try {
+        const memInfo = await conn.info('memory');
+        const usedMatch = memInfo.match(/used_memory:(\d+)/);
+        const usedBytes = usedMatch ? parseInt(usedMatch[1], 10) : 0;
+        if (usedBytes > 18 * 1024 * 1024) {
+          logger.warn(`⚠️ High Redis memory (${(usedBytes / 1024 / 1024).toFixed(1)}MB). Running aggressive queue cleanup...`);
+          for (const type of Object.keys(QUEUE_CONFIG)) {
+            const qName = `${type}-evaluation`;
+            const compKey = `${prefix}:${qName}:completed`;
+            const failKey = `${prefix}:${qName}:failed`;
+            const extraComp = await conn.zrange(compKey, 0, -11);
+            const extraFail = await conn.zrange(failKey, 0, -11);
+            const toDel = [...extraComp, ...extraFail].flatMap(id => [
+              `${prefix}:${qName}:${id}`,
+              `${prefix}:${qName}:${id}:logs`
+            ]);
+            if (toDel.length > 0) await conn.unlink(...toDel).catch(() => {});
+            if (extraComp.length > 0) await conn.zrem(compKey, ...extraComp).catch(() => {});
+            if (extraFail.length > 0) await conn.zrem(failKey, ...extraFail).catch(() => {});
+          }
+        }
+      } catch {}
+
+      // Also unlink any orphaned logs or legacy keys if Redis is tight on memory using non-blocking SCAN
+      try {
+        const legacyKeys = [];
+        let cursor = '0';
+        do {
+          const [nextCursor, keys] = await conn.scan(cursor, 'MATCH', `${prefix}:*:logs`, 'COUNT', 100);
+          cursor = nextCursor;
+          if (Array.isArray(keys) && keys.length > 0) {
+            legacyKeys.push(...keys);
+          }
+        } while (cursor !== '0' && legacyKeys.length < 500);
+
+        if (legacyKeys.length > 20) {
+          await conn.unlink(...legacyKeys.slice(0, legacyKeys.length - 10)).catch(() => {});
+        }
+      } catch {}
+
+      logger.info('✅ Redis memory cleanup complete.');
+    } catch (err) {
+      logger.warn(`Redis memory cleanup warning: ${err.message}`);
     }
   }
 
@@ -147,16 +282,6 @@ class QueueManager {
     // Error handling
     queue.on('error', (err) => {
       logger.error(`Queue error (${type}):`, err);
-    });
-
-    // Stalled job (took too long)
-    queue.on('stalled', (jobId) => {
-      logger.warn(`Job stalled: ${type}/${jobId}`);
-    });
-
-    // Job waiting
-    queue.on('waiting', (job) => {
-      logger.info(`Job waiting: ${type}/${job.id}`);
     });
   }
 
@@ -214,11 +339,16 @@ class QueueManager {
         jobId = `${type}-${Date.now()}-${rand}-${hash}`;
       }
 
-      // Add job to queue with deterministic jobId for deduplication
+      // Add job to queue with deterministic jobId for deduplication and retry resilience
       const jobOptions = {
         jobId: String(jobId),
-        removeOnComplete: { count: 100 },
-        removeOnFail: { count: 100 }
+        attempts: config.attempts || 2,
+        backoff: {
+          type: 'exponential',
+          delay: 5000,
+        },
+        removeOnComplete: { count: 100, age: 7200 },
+        removeOnFail: { count: 50, age: 7200 }
       };
 
       // Only assign explicit positive numeric priority if explicitly requested.
@@ -228,11 +358,26 @@ class QueueManager {
         jobOptions.priority = payload.priority;
       }
 
-      const job = await queue.add(
-        config.jobName,
-        payload,
-        jobOptions
-      );
+      let job;
+      try {
+        job = await queue.add(
+          config.jobName,
+          payload,
+          jobOptions
+        );
+      } catch (addErr) {
+        if (addErr.message && (addErr.message.includes('OOM') || addErr.message.includes('maxmemory'))) {
+          logger.warn(`Redis memory limit reached during addEvaluation for ${type}. Performing emergency prune and retrying...`);
+          await this.pruneStaleRedisJobs();
+          job = await queue.add(
+            config.jobName,
+            payload,
+            jobOptions
+          );
+        } else {
+          throw addErr;
+        }
+      }
 
       logger.info(`Job added: ${type}/${job.id}`, {
         evaluator: type,
@@ -267,13 +412,82 @@ class QueueManager {
         data: job.data,
         result: job.returnvalue,
         failedReason: job.failedReason,
-        stacktrace: job.stacktrace
+        stacktrace: job.stacktrace,
+        processedOn: job.processedOn || null,
+        timestamp: job.timestamp || null
       };
 
     } catch (err) {
       logger.error(`Failed to get job status: ${type}/${jobId}`, err);
       return null;
     }
+  }
+
+  /**
+   * Get statuses for a batch of jobs in parallel using a single batch request.
+   * @param {string} [type] - Optional evaluator queue type
+   * @param {string[]} jobIds - Array of job ID strings
+   * @returns {Promise<Array<object>>}
+   */
+  async getBatchJobStatus(type, jobIds) {
+    if (!Array.isArray(jobIds) || jobIds.length === 0) return [];
+
+    return Promise.all(
+      jobIds.map(async (id) => {
+        try {
+          // Priority 1: If job ID has an explicit queue prefix (e.g. 'visual-123' -> 'visual', 'excel-123' -> 'excel'),
+          // trust the ID prefix over any mismatched type passed by caller!
+          let targetQueue = null;
+          if (typeof id === 'string' && id.includes('-')) {
+            const prefix = id.split('-')[0].toLowerCase();
+            const normalized = prefix === 'js' ? 'javascript' : prefix;
+            targetQueue = this.queues[normalized];
+          }
+          if (!targetQueue && type) {
+            targetQueue = this.queues[type];
+          }
+
+          if (targetQueue) {
+            const job = await targetQueue.getJob(id);
+            if (job) {
+              return {
+                id: job.id,
+                state: await job.getState(),
+                progress: job.progress ?? 0,
+                result: job.returnvalue,
+                failedReason: job.failedReason,
+                processedOn: job.processedOn || null,
+                timestamp: job.timestamp || null
+              };
+            }
+          }
+
+          // Fallback: search all queues
+          for (const [qType, q] of Object.entries(this.queues)) {
+            if (q === targetQueue) continue;
+            try {
+              const job = await q.getJob(id);
+              if (job) {
+                return {
+                  id: job.id,
+                  type: qType,
+                  state: await job.getState(),
+                  progress: job.progress ?? 0,
+                  result: job.returnvalue,
+                  failedReason: job.failedReason,
+                  processedOn: job.processedOn || null,
+                  timestamp: job.timestamp || null
+                };
+              }
+            } catch {}
+          }
+
+          return { id, state: 'not_found' };
+        } catch (e) {
+          return { id, state: 'error', error: e.message };
+        }
+      })
+    );
   }
 
   /**
@@ -296,6 +510,76 @@ class QueueManager {
       logger.error(`Failed to remove job: ${type}/${jobId}`, err);
       throw err;
     }
+  }
+
+  /**
+   * Cancel and remove pending/waiting jobs for an assignment, specific job IDs, or an evaluation.
+   */
+  async cancelEvaluationJobs({ type, assignmentId, evaluationId, jobIds = [] }) {
+    let cancelledCount = 0;
+    let waitingCancelled = 0;
+    let activeCancelled = 0;
+    const targetTypes = type && this.queues[type] ? [type] : Object.keys(this.queues);
+
+    for (const qType of targetTypes) {
+      const queue = this.queues[qType];
+      if (!queue) continue;
+
+      // 1. If explicit jobIds provided, cancel them directly
+      if (Array.isArray(jobIds) && jobIds.length > 0) {
+        for (const jId of jobIds) {
+          try {
+            const job = await queue.getJob(jId);
+            if (job) {
+              const state = await job.getState();
+              if (state === 'waiting' || state === 'delayed') {
+                await job.remove();
+                cancelledCount++;
+                waitingCancelled++;
+              } else if (state === 'active') {
+                await job.discard();
+                cancelledCount++;
+                activeCancelled++;
+                logger.warn(`[QueueManager] Active job ${jId} discarded; running container process will terminate at execution timeout.`);
+              }
+            }
+          } catch (err) {
+            logger.warn(`Failed cancelling job ${jId}: ${err.message}`);
+          }
+        }
+      }
+
+      // 2. Scan waiting and delayed jobs in the queue for matching assignmentId or evaluationId
+      if (assignmentId || evaluationId) {
+        try {
+          const jobs = await queue.getJobs(['waiting', 'delayed']);
+          for (const job of jobs) {
+            const data = job.data || {};
+            const matchAssignment = assignmentId && (
+              data.assignmentId === assignmentId ||
+              data.submission?.assignment_id === assignmentId ||
+              data.submission?.assignmentId === assignmentId
+            );
+            const matchEvaluation = evaluationId && (
+              data.evaluationId === evaluationId ||
+              data.submission?.evaluation_id === evaluationId ||
+              data.submission?.evaluationId === evaluationId
+            );
+
+            if (matchAssignment || matchEvaluation) {
+              await job.remove().catch(() => {});
+              cancelledCount++;
+              waitingCancelled++;
+            }
+          }
+        } catch (err) {
+          logger.warn(`Failed scanning ${qType} jobs for cancellation: ${err.message}`);
+        }
+      }
+    }
+
+    logger.info(`Cancelled ${cancelledCount} jobs across queues (waiting: ${waitingCancelled}, active: ${activeCancelled})`, { type, assignmentId, evaluationId });
+    return { cancelledCount, waitingCancelled, activeCancelled };
   }
 
   /**
