@@ -706,6 +706,58 @@ def normalize_field_name(raw_name: str) -> List[str]:
         variants.append(clean.replace('_', ' '))
     return list(dict.fromkeys(v for v in variants if v))
 
+def is_single_edit_typo(val: str, exp: str) -> bool:
+    """Checks if val and exp differ by at most one single edit (insertion, deletion, substitution, or adjacent swap).
+    Strictly restricted to entity/name strings:
+    - Never applied if either contains digits (prevents 'Q1 2024' vs 'Q1 2025' or 'Product A12' vs 'Product A21').
+    - Never applied to short strings (< 4 chars).
+    - Prevents opposite compass directions like 'North-East' vs 'North-West'.
+    """
+    if not val or not exp:
+        return False
+    s1 = str(val).strip().lower()
+    s2 = str(exp).strip().lower()
+    if s1 == s2:
+        return True
+    c1 = re.sub(r'[^a-z0-9]', '', s1)
+    c2 = re.sub(r'[^a-z0-9]', '', s2)
+    if c1 == c2:
+        return True
+    # Never apply if digits are present in either string
+    if any(c.isdigit() for c in c1) or any(c.isdigit() for c in c2):
+        return False
+    # Never apply to short strings
+    if len(c1) < 4 or len(c2) < 4:
+        return False
+    # Length difference must be <= 1
+    if abs(len(c1) - len(c2)) > 1:
+        return False
+
+    # Check for adjacent transposition or single substitution
+    if len(c1) == len(c2):
+        diffs = [i for i in range(len(c1)) if c1[i] != c2[i]]
+        if len(diffs) == 1:
+            return True  # 1 substitution (e.g. "smith" vs "smyth")
+        if len(diffs) == 2 and diffs[1] == diffs[0] + 1:
+            if c1[diffs[0]] == c2[diffs[1]] and c1[diffs[1]] == c2[diffs[0]]:
+                return True  # Single adjacent transposition (e.g. "acmecrop" vs "acmecorp")
+        return False
+
+    # Check for single insertion / deletion
+    short, long_ = (c1, c2) if len(c1) < len(c2) else (c2, c1)
+    i = j = 0
+    mismatches = 0
+    while i < len(short) and j < len(long_):
+        if short[i] == long_[j]:
+            i += 1
+            j += 1
+        else:
+            mismatches += 1
+            j += 1
+            if mismatches > 1:
+                return False
+    return True
+
 def detect_cell_based_pivots(wb) -> List[Dict[str, Any]]:
     """Detects pivot tables rendered directly into worksheet cells (e.g. Google Sheets / LibreOffice / Web Excel exports)."""
     detected = []
@@ -867,15 +919,6 @@ def detect_cell_based_pivots(wb) -> List[Dict[str, Any]]:
                 ))
                 all_fields = list(dict.fromkeys(active_fields + source_fields))
 
-                concept_additions = []
-                for f in all_fields:
-                    f_low = f.lower()
-                    for c_name, kws in TABLE_CONCEPTS.items():
-                        if any(kw == f_low or kw in f_low for kw in kws):
-                            concept_additions.extend(kws)
-                all_fields = list(dict.fromkeys(all_fields + concept_additions))
-                active_fields = list(dict.fromkeys(active_fields + concept_additions))
-
                 loc_start = f"A{row_labels_coord[0] if row_labels_coord else 1}"
                 pivot_dict = {
                     "name": f"PivotTable_{s_name}",
@@ -883,13 +926,9 @@ def detect_cell_based_pivots(wb) -> List[Dict[str, Any]]:
                     "location": f"{loc_start}:Z{ws.max_row}",
                     "location_ref": f"{loc_start}:Z{ws.max_row}",
                     "rowFields": row_fields,
-                    "row_fields": row_fields,
                     "colFields": col_fields,
-                    "col_fields": col_fields,
                     "dataFields": data_fields,
-                    "data_fields": data_fields,
                     "activeFields": active_fields,
-                    "active_fields": active_fields,
                     "fields": all_fields,
                     "source_sheet": source_sheet or "Source",
                     "is_cell_rendered": True
@@ -908,7 +947,7 @@ def detect_cell_based_pivots(wb) -> List[Dict[str, Any]]:
         pass
     return detected
 
-def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
+def inspect_openxml_pivots(xlsx_path: str, detection_errors: Optional[List[str]] = None) -> List[Dict[str, Any]]:
     """Inspects native Excel Pivot Tables and PivotCaches with per-pivot sheet and field resolution."""
     pivots = []
     try:
@@ -929,8 +968,9 @@ def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
                             if tgt:
                                 norm_tgt = 'xl/' + tgt.lstrip('/').replace('\\', '/')
                                 sheet_file_to_name[norm_tgt] = s.attrib.get('name')
-                except Exception:
-                    pass
+                except Exception as e:
+                    if detection_errors is not None:
+                        detection_errors.append(f"Pivot workbook rels inspection: {type(e).__name__}: {e}")
 
             # 2. Map sheet files to their pivot tables
             pt_to_sheet = {}
@@ -1084,20 +1124,23 @@ def inspect_openxml_pivots(xlsx_path: str) -> List[Dict[str, Any]]:
                             "activeFields": active_fields,
                             "fields": all_fields
                         })
-                    except Exception:
-                        pass
-    except Exception:
-        pass
+                    except Exception as e:
+                        if detection_errors is not None:
+                            detection_errors.append(f"Pivot parse error on {fname}: {type(e).__name__}: {e}")
+    except Exception as e:
+        if detection_errors is not None:
+            detection_errors.append(f"Zip extraction error for pivots: {type(e).__name__}: {e}")
     try:
         wb_lazy = safe_load_workbook(xlsx_path, data_only=True)
         cell_pivots = detect_cell_based_pivots(wb_lazy)
         if cell_pivots:
             existing_sheets = {p.get("sheet") for p in pivots if p.get("sheet")}
             for cp in cell_pivots:
-                if cp.get("sheet") not in existing_sheets or len(pivots) < len(cell_pivots):
+                if cp.get("sheet") not in existing_sheets:
                     pivots.append(cp)
-    except Exception:
-        pass
+    except Exception as e:
+        if detection_errors is not None:
+            detection_errors.append(f"Cell-based pivot detection error: {type(e).__name__}: {e}")
     return pivots
 
 def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
@@ -1228,6 +1271,28 @@ def inspect_openxml_macros_and_queries(xlsx_path: str) -> Dict[str, Any]:
     except Exception:
         pass
     return info
+
+def merge_macro_info(base_info: Dict[str, Any], registry_info: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Cleanly merges macro and Power Query detection facts from OpenXML inspection and WorkbookObjectRegistry."""
+    merged = dict(base_info or {})
+    if not registry_info:
+        return merged
+    for k, v in registry_info.items():
+        if v and not merged.get(k):
+            merged[k] = v
+    if registry_info.get("has_power_query"):
+        merged["has_power_query"] = True
+    if registry_info.get("has_macros"):
+        merged["has_macros"] = True
+    if registry_info.get("has_data_model"):
+        merged["has_data_model"] = True
+    for q in registry_info.get("query_names", []):
+        if q not in merged.setdefault("query_names", []):
+            merged["query_names"].append(q)
+    for qt in registry_info.get("query_tables", []):
+        if not any(t.get("name") == qt.get("name") for t in merged.setdefault("query_tables", [])):
+            merged.setdefault("query_tables", []).append(qt)
+    return merged
 
 def inspect_openxml_charts_from_zip(xlsx_path: str) -> List[Dict[str, Any]]:
     """
@@ -1391,6 +1456,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
     criterion_passes = {crit.get("name"): {"total": 0, "passed": 0} for crit in criteria}
     detected_formulas = set()
     calculation_warnings = []
+    detection_errors = []
     needs_review = False
 
     default_sheet_name = wb_orig.sheetnames[0]
@@ -1404,27 +1470,16 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             calculation_warnings.append(f"Registry notice: {str(reg_err)}")
 
     # Global inspections for Pivots, Macros, and Power Query
-    detected_pivots = registry.pivot_tables if registry else inspect_openxml_pivots(original_path)
+    detected_pivots = registry.pivot_tables if registry else inspect_openxml_pivots(original_path, detection_errors)
     if not detected_pivots:
         try:
             detected_pivots = detect_cell_based_pivots(wb_cached or wb_orig)
             if registry:
                 registry.pivot_tables = detected_pivots
-        except Exception:
-            pass
-    macro_info = inspect_openxml_macros_and_queries(original_path)
-    if registry and registry.macro_info:
-        for k, v in registry.macro_info.items():
-            if v and not macro_info.get(k):
-                macro_info[k] = v
-        if registry.macro_info.get("has_power_query"):
-            macro_info["has_power_query"] = True
-        for q in registry.macro_info.get("query_names", []):
-            if q not in macro_info.setdefault("query_names", []):
-                macro_info["query_names"].append(q)
-        for qt in registry.macro_info.get("query_tables", []):
-            if not any(t.get("name") == qt.get("name") for t in macro_info.setdefault("query_tables", [])):
-                macro_info["query_tables"].append(qt)
+        except Exception as e:
+            detection_errors.append(f"Fallback cell pivot detection error: {type(e).__name__}: {e}")
+    raw_macro_info = inspect_openxml_macros_and_queries(original_path)
+    macro_info = merge_macro_info(raw_macro_info, registry.macro_info if registry else None)
     detected_charts = [dict(c) for c in registry.charts] if (registry and registry.charts) else []
 
     # Global formula and content scan across all sheets
@@ -1638,31 +1693,47 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 target_cell_coord = f"{get_column_letter(c_target)}{r_target}"
 
             if not target_cell_coord:
-                # If Power Query assignment, verify via Power Query M-code / connections / query tables
-                is_pq_crit = any(k in crit_name.lower() for k in ["power query", "data type", "header cleaning", "query merge", "column expansion", "close & load", "automation"])
-                has_pq = (registry is not None and registry.macro_info.get("has_power_query")) or macro_info.get("has_power_query")
-                if (is_pq_crit or has_pq) and registry and (registry.macro_info.get("has_power_query") or len(registry.power_queries) > 0 or registry.tables):
-                    criterion_passes[crit_name]["passed"] += 1
-                    assertion_results.append({
-                        "id": tc_id,
-                        "criterion": crit_name,
-                        "type": tc_type,
-                        "passed": True,
-                        "status": "VERIFIED_PASS",
-                        "weight": tc_weight,
-                        "is_critical": tc_is_critical,
-                        "score_cap": tc_score_cap,
-                        "depends_on": tc_depends_on,
-                        "dependency_mode": tc_dep_mode,
-                        "reason": f"Verified Power Query pipeline execution for '{crit_name}' via Power Query M-code and data connections."
-                    })
-                    continue
+                # If Power Query assignment, verify via genuine Power Query M-code / connections / query tables
+                is_pq_crit = any(k in crit_name.lower() for k in ["power query", "query merge", "column expansion", "close & load"])
+                has_actual_pq = bool(
+                    (registry is not None and (registry.macro_info.get("has_power_query") or len(registry.power_queries) > 0))
+                    or macro_info.get("has_power_query")
+                )
+                if is_pq_crit and has_actual_pq:
+                    # Require actual matching Power Query M-code or loaded query table
+                    matched_pq = False
+                    if registry and registry.power_queries:
+                        for pq in registry.power_queries:
+                            q_name = str(pq.get("name", "")).lower()
+                            q_code = str(pq.get("m_code", "")).lower()
+                            if any(k in q_name or k in q_code for k in ["merge", "expand", "clean", "type", "transform", "table"]):
+                                matched_pq = True
+                                break
+                    elif has_actual_pq:
+                        matched_pq = True
+
+                    if matched_pq:
+                        criterion_passes[crit_name]["passed"] += 1
+                        assertion_results.append({
+                            "id": tc_id,
+                            "criterion": crit_name,
+                            "type": tc_type,
+                            "passed": True,
+                            "status": "VERIFIED_PASS",
+                            "weight": tc_weight,
+                            "is_critical": tc_is_critical,
+                            "score_cap": tc_score_cap,
+                            "depends_on": tc_depends_on,
+                            "dependency_mode": tc_dep_mode,
+                            "reason": f"Verified Power Query transformation pipeline for '{crit_name}'."
+                        })
+                        continue
 
                 assertion_results.append({
                     "criterion": crit_name,
                     "type": tc_type,
                     "passed": False,
-                    "reason": "Neither explicit cell nor anchor specified in test case."
+                    "reason": "Neither explicit cell nor anchor specified in test case, and no matching Power Query pipeline verified."
                 })
                 continue
 
@@ -1693,8 +1764,10 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             passed = False
             reason = ""
             search_coord = target_cell_coord
+            typo_tolerated = False
 
             def _check_val(v, exp):
+                nonlocal typo_tolerated
                 n = parse_number(v)
                 e = parse_number(exp) if exp is not None else None
                 if n is not None and e is not None:
@@ -1709,16 +1782,16 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 str_e = str(exp or "").strip().lower()
                 if str_v == str_e:
                     return True
-                # Fuzzy text matching (e.g. "Cloud Tech" in "Cloud Tech_Texas" or "Cloud Tech - Texas")
                 v_clean = re.sub(r'[^a-z0-9]', '', str_v)
                 e_clean = re.sub(r'[^a-z0-9]', '', str_e)
-                if v_clean and e_clean and (v_clean in e_clean or e_clean in v_clean):
+                if v_clean and e_clean and v_clean == e_clean:
                     return True
-                # Typo tolerance for entity names (e.g. "Acme Crop" vs "Acme Corp")
-                if v_clean and e_clean and len(e_clean) >= 5:
-                    import difflib
-                    if difflib.SequenceMatcher(None, v_clean, e_clean).ratio() >= 0.8:
-                        return True
+                if v_clean and e_clean and (v_clean in e_clean or e_clean in v_clean) and min(len(v_clean), len(e_clean)) >= 6:
+                    return True
+                # Strict single-edit typo tolerance for entity/name strings only (never numbers, codes, SKUs, or dates)
+                if is_single_edit_typo(str_v, str_e):
+                    typo_tolerated = True
+                    return True
                 return False
 
             if actual_num is not None and expected_num is not None:
@@ -1788,7 +1861,10 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
             if passed:
                 criterion_passes[crit_name]["passed"] += 1
                 if not reason:
-                    reason = f"Cell {search_coord} matched expected value {tc.get('expectedValue')} within tolerance."
+                    if typo_tolerated:
+                        reason = f"Cell {search_coord} matched expected value '{tc.get('expectedValue')}' with typo tolerance (student: '{cell_val}')."
+                    else:
+                        reason = f"Cell {search_coord} matched expected value {tc.get('expectedValue')} within tolerance."
             else:
                 if not reason:
                     reason = f"Cell {target_cell_coord} value '{cell_val}' did not match expected '{tc.get('expectedValue')}'. Scanned surrounding region — no match found."
@@ -1803,6 +1879,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 "formula": formula_expr if isinstance(formula_expr, str) and formula_expr.startswith("=") else None,
                 "expected": tc.get("expectedValue"),
                 "passed": passed,
+                "typo_tolerated": typo_tolerated,
                 "status": "VERIFIED_PASS" if passed else "VERIFIED_FAIL",
                 "weight": tc_weight,
                 "is_critical": tc_is_critical,
@@ -2075,16 +2152,15 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
                 score_factor = 1.0
                 reason = f"Verified {total_cells}/{total_cells} cells via dynamic array/spill formula in {range_str}."
             else:
-                tc_passed = (total_cells > 0 and (passed_cells == total_cells or (passed_cells >= total_cells * 0.85 and total_cells >= 4)))
+                score_factor = round(passed_cells / total_cells, 4) if total_cells > 0 else 0.0
+                tc_passed = (total_cells > 0 and passed_cells == total_cells)
                 if tc_passed:
-                    score_factor = 1.0
                     reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} successfully."
-                elif total_cells > 0 and passed_cells > 0:
-                    score_factor = round(passed_cells / total_cells, 4)
-                    reason = f"{total_cells - passed_cells}/{total_cells} cells failed formula checks ({passed_cells}/{total_cells} passed). First issues: {'; '.join(failures[:3])}"
+                elif passed_cells > 0:
+                    pct = round(score_factor * 100, 1)
+                    reason = f"Verified {passed_cells}/{total_cells} cells in {range_str} ({pct}% proportional credit). First issues: {'; '.join(failures[:3])}"
                 else:
-                    score_factor = 0.0
-                    reason = f"{total_cells - passed_cells}/{total_cells} cells failed formula checks. First issues: {'; '.join(failures[:3])}"
+                    reason = f"{total_cells}/{total_cells} cells failed formula checks. First issues: {'; '.join(failures[:3])}"
 
             if tc_passed:
                 criterion_passes[crit_name]["passed"] += 1
@@ -3966,6 +4042,7 @@ def inspect_and_evaluate(original_path: str, recalculated_path: str, spec: Dict[
         "detected_pivots": detected_pivots,
         "detected_macros": macro_info.get("macro_names", []),
         "calculation_warnings": calculation_warnings,
+        "detection_errors": detection_errors,
         "assertion_results": assertion_results
     }
 

@@ -70,7 +70,7 @@ const QUEUE_CONFIG = {
 
   excel: {
     jobName: 'excel-job',
-    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 4), 6),
+    concurrency: Math.min(Math.max(1, parseInt(process.env.EXCEL_CONCURRENCY, 10) || 2), 3),
     timeout: 180000,       // 180s ceiling (covers Google/OneDrive download + LibreOffice recalculation + openpyxl/DuckDB inspection)
     limiter: {
       max: 30,
@@ -250,9 +250,18 @@ class QueueManager {
         }
       } catch {}
 
-      // Also unlink any orphaned logs or legacy keys if Redis is tight on memory
+      // Also unlink any orphaned logs or legacy keys if Redis is tight on memory using non-blocking SCAN
       try {
-        const legacyKeys = await conn.keys(`${prefix}:*:logs`);
+        const legacyKeys = [];
+        let cursor = '0';
+        do {
+          const [nextCursor, keys] = await conn.scan(cursor, 'MATCH', `${prefix}:*:logs`, 'COUNT', 100);
+          cursor = nextCursor;
+          if (Array.isArray(keys) && keys.length > 0) {
+            legacyKeys.push(...keys);
+          }
+        } while (cursor !== '0' && legacyKeys.length < 500);
+
         if (legacyKeys.length > 20) {
           await conn.unlink(...legacyKeys.slice(0, legacyKeys.length - 10)).catch(() => {});
         }
@@ -338,8 +347,8 @@ class QueueManager {
           type: 'exponential',
           delay: 5000,
         },
-        removeOnComplete: { count: 2000, age: 86400 },
-        removeOnFail: { count: 1000, age: 86400 }
+        removeOnComplete: { count: 100, age: 7200 },
+        removeOnFail: { count: 50, age: 7200 }
       };
 
       // Only assign explicit positive numeric priority if explicitly requested.
@@ -508,6 +517,8 @@ class QueueManager {
    */
   async cancelEvaluationJobs({ type, assignmentId, evaluationId, jobIds = [] }) {
     let cancelledCount = 0;
+    let waitingCancelled = 0;
+    let activeCancelled = 0;
     const targetTypes = type && this.queues[type] ? [type] : Object.keys(this.queues);
 
     for (const qType of targetTypes) {
@@ -524,43 +535,51 @@ class QueueManager {
               if (state === 'waiting' || state === 'delayed') {
                 await job.remove();
                 cancelledCount++;
+                waitingCancelled++;
               } else if (state === 'active') {
                 await job.discard();
                 cancelledCount++;
+                activeCancelled++;
+                logger.warn(`[QueueManager] Active job ${jId} discarded; running container process will terminate at execution timeout.`);
               }
             }
-          } catch {}
+          } catch (err) {
+            logger.warn(`Failed cancelling job ${jId}: ${err.message}`);
+          }
         }
       }
 
       // 2. Scan waiting and delayed jobs in the queue for matching assignmentId or evaluationId
-      try {
-        const jobs = await queue.getJobs(['waiting', 'delayed']);
-        for (const job of jobs) {
-          const data = job.data || {};
-          const matchAssignment = assignmentId && (
-            data.assignmentId === assignmentId ||
-            data.submission?.assignment_id === assignmentId ||
-            data.submission?.assignmentId === assignmentId
-          );
-          const matchEvaluation = evaluationId && (
-            data.evaluationId === evaluationId ||
-            data.submission?.evaluation_id === evaluationId ||
-            data.submission?.evaluationId === evaluationId
-          );
+      if (assignmentId || evaluationId) {
+        try {
+          const jobs = await queue.getJobs(['waiting', 'delayed']);
+          for (const job of jobs) {
+            const data = job.data || {};
+            const matchAssignment = assignmentId && (
+              data.assignmentId === assignmentId ||
+              data.submission?.assignment_id === assignmentId ||
+              data.submission?.assignmentId === assignmentId
+            );
+            const matchEvaluation = evaluationId && (
+              data.evaluationId === evaluationId ||
+              data.submission?.evaluation_id === evaluationId ||
+              data.submission?.evaluationId === evaluationId
+            );
 
-          if (matchAssignment || matchEvaluation) {
-            await job.remove().catch(() => {});
-            cancelledCount++;
+            if (matchAssignment || matchEvaluation) {
+              await job.remove().catch(() => {});
+              cancelledCount++;
+              waitingCancelled++;
+            }
           }
+        } catch (err) {
+          logger.warn(`Failed scanning ${qType} jobs for cancellation: ${err.message}`);
         }
-      } catch (err) {
-        logger.warn(`Failed scanning ${qType} jobs for cancellation: ${err.message}`);
       }
     }
 
-    logger.info(`Cancelled ${cancelledCount} jobs across queues`, { type, assignmentId, evaluationId });
-    return cancelledCount;
+    logger.info(`Cancelled ${cancelledCount} jobs across queues (waiting: ${waitingCancelled}, active: ${activeCancelled})`, { type, assignmentId, evaluationId });
+    return { cancelledCount, waitingCancelled, activeCancelled };
   }
 
   /**

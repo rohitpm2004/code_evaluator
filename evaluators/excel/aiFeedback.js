@@ -248,10 +248,8 @@ Strictly return valid JSON conforming to this schema:
       }
     }
 
-    const verifiedFinalScore =
-      typeof parsed.final_score === "number" && !isNaN(parsed.final_score)
-        ? Math.min(100, Math.max(0, Math.round(parsed.final_score * 100) / 100))
-        : Math.min(100, Math.max(0, Math.round(calculatedSum * 100) / 100));
+    // Senior Review Item 4: Final score must strictly equal the sum of the individual clamped rubric criteria breakdown
+    const verifiedFinalScore = Math.min(100, Math.max(0, Math.round(calculatedSum * 100) / 100));
 
     logger.info(
       `[ExcelArbitration] Arbitration completed. Final Score: ${verifiedFinalScore} (Engine draft: ${score})`

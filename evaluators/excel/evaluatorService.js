@@ -261,22 +261,20 @@ export async function evaluateExcelSubmission(jobData, jobId) {
   const specFile = path.join(tempWorkspace, "test_spec.json");
   const profileDir = path.join(tempWorkspace, "lo_profile");
 
-  // Ensure Docker sandbox runs latest host engine scripts without requiring image rebuild
-  try {
-    const engineRunnerSrc = path.resolve(__dirname, "engine/excel_runner.py");
-    const engineRecalcSrc = path.resolve(__dirname, "engine/recalculate.py");
-    const engineRegistrySrc = path.resolve(__dirname, "engine/workbook_registry.py");
-    if (fs.existsSync(engineRunnerSrc)) {
-      await fsp.copyFile(engineRunnerSrc, path.join(tempWorkspace, "excel_runner.py"));
+  // Ensure engine scripts are verified and present in temp workspace
+  const engineRunnerSrc = path.resolve(__dirname, "engine/excel_runner.py");
+  const engineRecalcSrc = path.resolve(__dirname, "engine/recalculate.py");
+  const engineRegistrySrc = path.resolve(__dirname, "engine/workbook_registry.py");
+
+  for (const [src, filename] of [
+    [engineRunnerSrc, "excel_runner.py"],
+    [engineRecalcSrc, "recalculate.py"],
+    [engineRegistrySrc, "workbook_registry.py"]
+  ]) {
+    if (!fs.existsSync(src)) {
+      throw new Error(`Critical Excel engine script missing: ${src}`);
     }
-    if (fs.existsSync(engineRecalcSrc)) {
-      await fsp.copyFile(engineRecalcSrc, path.join(tempWorkspace, "recalculate.py"));
-    }
-    if (fs.existsSync(engineRegistrySrc)) {
-      await fsp.copyFile(engineRegistrySrc, path.join(tempWorkspace, "workbook_registry.py"));
-    }
-  } catch (copyErr) {
-    logger.warn(`Failed to copy engine scripts to temp workspace: ${copyErr.message}`);
+    await fsp.copyFile(src, path.join(tempWorkspace, filename));
   }
 
   try {
@@ -403,31 +401,58 @@ export async function evaluateExcelSubmission(jobData, jobId) {
     }
 
     // Phase 5: Generate AI Explanatory Feedback & Academic Arbitration
+    const isAiArbitrationEnabled = process.env.EXCEL_AI_ARBITRATION_ENABLED !== "false";
     const feedback = await generateExcelFeedback(report, rubric, spec);
 
-    // Apply arbitrated final score and breakdown if validated by the AI layer
-    const finalScore = (typeof feedback?.final_score === "number" && !isNaN(feedback.final_score))
-      ? feedback.final_score
-      : (report.score ?? 0);
+    const engineScore = report.score ?? 0;
+    let finalScore = engineScore;
+    let aiAdjustment = 0;
+    let flaggedForReview = report.evaluation_status === "MANUAL_REVIEW_REQUIRED";
+    let finalBreakdown = report.rubric_breakdown || {};
 
-    const finalBreakdown = (feedback?.rubric_breakdown && typeof feedback.rubric_breakdown === "object" && Object.keys(feedback.rubric_breakdown).length > 0)
-      ? feedback.rubric_breakdown
-      : (report.rubric_breakdown || {});
+    if (isAiArbitrationEnabled && feedback) {
+      const candidateScore = (typeof feedback.final_score === "number" && !isNaN(feedback.final_score))
+        ? feedback.final_score
+        : engineScore;
+
+      const rawAdjustment = Math.round((candidateScore - engineScore) * 100) / 100;
+      if (Math.abs(rawAdjustment) > 10) {
+        aiAdjustment = Math.sign(rawAdjustment) * 10;
+        flaggedForReview = true;
+        logger.warn(
+          `[ExcelEvaluator] Job ${jobId}: AI adjustment of ${rawAdjustment} exceeded ±10 limit; clamped to ${aiAdjustment} and flagged for teacher review.`
+        );
+      } else {
+        aiAdjustment = rawAdjustment;
+      }
+
+      finalScore = Math.min(100, Math.max(0, Math.round((engineScore + aiAdjustment) * 100) / 100));
+
+      if (feedback.rubric_breakdown && typeof feedback.rubric_breakdown === "object" && Object.keys(feedback.rubric_breakdown).length > 0) {
+        finalBreakdown = feedback.rubric_breakdown;
+      }
+    } else {
+      logger.info(`[ExcelEvaluator] Job ${jobId}: AI arbitration is disabled via EXCEL_AI_ARBITRATION_ENABLED=false. Using deterministic engine score.`);
+    }
 
     const durationMs = Date.now() - startTime;
-    logger.info(`[ExcelEvaluator] Completed Job ${jobId} in ${durationMs}ms with final arbitrated score: ${finalScore} (Engine draft: ${report.score ?? 0})`);
+    logger.info(`[ExcelEvaluator] Completed Job ${jobId} in ${durationMs}ms with final score: ${finalScore} (Engine draft: ${engineScore}, AI adjustment: ${aiAdjustment})`);
 
     return {
       score: finalScore,
+      engine_score: engineScore,
+      ai_adjustment: aiAdjustment,
+      flagged_for_review: flaggedForReview,
       rubric_breakdown: finalBreakdown,
       arbitration_adjustments: feedback?.arbitration_adjustments || [],
       feedback,
-      evaluation_status: report.evaluation_status || "COMPLETED",
+      evaluation_status: flaggedForReview ? "MANUAL_REVIEW_REQUIRED" : (report.evaluation_status || "COMPLETED"),
       detected_formulas: report.detected_formulas || [],
       detected_charts: report.detected_charts || [],
       detected_pivots: report.detected_pivots || [],
       detected_macros: report.detected_macros || [],
       calculation_warnings: report.calculation_warnings || [],
+      detection_errors: report.detection_errors || [],
       assertion_results: report.assertion_results || [],
       durationMs
     };

@@ -210,16 +210,31 @@ async function startServer() {
     app.post('/jobs/cancel', requireApiKey, async (req, res) => {
       try {
         const { type, assignmentId, evaluationId, jobIds } = req.body || {};
-        const cancelledCount = await queueManager.cancelEvaluationJobs({
+
+        if (jobIds !== undefined && (!Array.isArray(jobIds) || jobIds.some(id => typeof id !== 'string' || !id.trim()))) {
+          return res.status(400).json({ success: false, error: 'jobIds must be an array of non-empty strings' });
+        }
+        if (type && typeof type !== 'string') {
+          return res.status(400).json({ success: false, error: 'type must be a valid queue type string' });
+        }
+
+        const result = await queueManager.cancelEvaluationJobs({
           type,
-          assignmentId,
-          evaluationId,
-          jobIds
+          assignmentId: typeof assignmentId === 'string' ? assignmentId.trim() : undefined,
+          evaluationId: typeof evaluationId === 'string' ? evaluationId.trim() : undefined,
+          jobIds: Array.isArray(jobIds) ? jobIds.map(id => id.trim()) : []
         });
-        res.json({ success: true, message: `Cancelled ${cancelledCount} jobs`, cancelledCount });
+
+        const count = typeof result === 'object' ? result.cancelledCount : result;
+        res.json({
+          success: true,
+          message: `Cancelled ${count} jobs`,
+          cancelledCount: count,
+          details: typeof result === 'object' ? result : { cancelledCount: count }
+        });
       } catch (err) {
         logger.error(`Error cancelling jobs: ${err.message}`);
-        res.status(500).json({ success: false, error: err.message });
+        res.status(500).json({ success: false, error: 'Failed to cancel evaluation jobs' });
       }
     });
 
